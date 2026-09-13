@@ -14240,7 +14240,11 @@ static uint32_t ds4_gpu_stream_expert_decode_slots_for_budget(uint64_t budget) {
 static uint32_t ds4_gpu_stream_expert_decode_target_slots(uint64_t dense_bytes,
                                                           uint64_t context_bytes) {
     if (!g_ssd_streaming_mode) return 0;
-    const uint32_t cur = g_stream_expert_cache_slab_total_slots;
+    /* Gate on the CONFIGURED bank, not the slabs allocated so far: the bank
+     * grows lazily, so a short prompt leaves total_slots far below the budget
+     * even though decode will happily grow it to the full size. */
+    uint32_t cur = ds4_gpu_stream_expert_cache_configured_budget();
+    if (cur == 0) cur = g_stream_expert_cache_slab_total_slots;
     if (cur == 0 || g_stream_expert_cache_slab_slot_bytes == 0) return 0;
 
     const char *slots_env = getenv("DS4_STREAM_EXPERT_DECODE_SLOTS");
@@ -14285,7 +14289,16 @@ static uint32_t ds4_gpu_stream_expert_decode_target_slots(uint64_t dense_bytes,
     const uint64_t reserved = dense_bytes + context_bytes;
     if (ram <= reserved) return 0;
 
-    uint32_t pct = 20u;
+    /*
+     * The fork's sidecar reads go through the OS page cache, so it can drop to
+     * 20% and let the file cache serve decode misses at RAM speed. Upstream
+     * V4.1 reads Engram rows (and streamed experts) with F_NOCACHE, so there is
+     * no page cache to fall back on: shrinking that far trades resident-expert
+     * hits for true SSD reads and costs ~20% decode on an M5 Max. Keep enough
+     * bank to hold the decode working set while still freeing the wired pages
+     * that were starving prefill.
+     */
+    uint32_t pct = 50u;
     const char *pct_env = getenv("DS4_SSD_CACHE_AUTO_PCT");
     if (pct_env && pct_env[0]) {
         char *end = NULL;
@@ -14308,7 +14321,27 @@ void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes) {
 
     const uint32_t target =
         ds4_gpu_stream_expert_decode_target_slots(dense_bytes, context_bytes);
-    if (target == 0) return;
+    if (target == 0) {
+        if (getenv("DS4_STREAM_EXPERT_DECODE_DEBUG")) {
+            fprintf(stderr,
+                    "ds4: decode-bank shrink declined: auto=%u budget=%u slots=%u "
+                    "slot_bytes=%llu model=%.2f GiB ram=%.2f GiB dense=%.2f GiB ctx=%.2f GiB\n",
+                    (unsigned)g_stream_expert_cache_auto_sized,
+                    ds4_gpu_stream_expert_cache_configured_budget(),
+                    g_stream_expert_cache_slab_total_slots,
+                    (unsigned long long)g_stream_expert_cache_slab_slot_bytes,
+                    ds4_gpu_gib(g_stream_model_total_bytes),
+                    ds4_gpu_gib(ds4_gpu_system_memory_bytes()),
+                    ds4_gpu_gib(dense_bytes),
+                    ds4_gpu_gib(context_bytes));
+        }
+        return;
+    }
+
+    /* Cap the budget first: even if few slabs are allocated right now, decode
+     * must not be allowed to grow the bank back past the decode target. */
+    g_stream_expert_cache_mlock_budget_cap = target;
+    g_stream_expert_cache_decode_shrunk = 1;
 
     /* Round the target down to a whole-slab boundary: keep the leading slabs
      * whose cumulative slot count still fits under `target`. */
@@ -14421,7 +14454,6 @@ void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes) {
     /* The budget cap must follow the bank down, or the allocator will simply
      * grow the slabs straight back on the next decode miss. */
     g_stream_expert_cache_mlock_budget_cap = keep_slots;
-    g_stream_expert_cache_decode_shrunk = 1;
 
     fprintf(stderr,
             "ds4: streaming expert cache shrunk for decode: slots=%u slabs=%u "
