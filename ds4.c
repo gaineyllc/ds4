@@ -40279,6 +40279,11 @@ typedef struct {
     ds4_gpu_tensor *dspark_dbg_hc;   /* DS4_V41_DSPARK_CHECK only */
     ds4_gpu_tensor *dspark_logits;   /* block_size rows of the vocabulary */
     ds4_gpu_tensor *dspark_markov_emb, *dspark_markov_bias;
+    ds4_gpu_tensor *dspark_carry_kv[4], *dspark_carry_score[4];
+    int dspark_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1];
+    uint32_t dspark_hist_len, dspark_hist_pos0;
+    ds4_engram_history dspark_hist_history0;
+    uint64_t dspark_verify_rows, dspark_verify_agree;
     int dspark_draft[DS4_DSPARK_MAX_BLOCK_SIZE];
     int dspark_pending[DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t dspark_draft_len, dspark_pending_len, dspark_pending_seen;
@@ -40346,6 +40351,10 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_tensor_free(g->dspark_logits);
     ds4_gpu_tensor_free(g->dspark_markov_emb);
     ds4_gpu_tensor_free(g->dspark_markov_bias);
+    for (uint32_t i = 0; i < 4; i++) {
+        ds4_gpu_tensor_free(g->dspark_carry_kv[i]);
+        ds4_gpu_tensor_free(g->dspark_carry_score[i]);
+    }
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
 }
@@ -41715,6 +41724,11 @@ static bool ds41_dspark_configure(ds41_gpu_graph *g, const ds4_model *dm,
     g->dspark_markov_bias = ds4_gpu_tensor_alloc(
         (uint64_t)DS4_N_VOCAB * sizeof(float));
     if (!g->dspark_logits || !g->dspark_markov_emb || !g->dspark_markov_bias) return false;
+    for (uint32_t i = 0; i < 4; i++) {
+        g->dspark_carry_kv[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
+        g->dspark_carry_score[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
+        if (!g->dspark_carry_kv[i] || !g->dspark_carry_score[i]) return false;
+    }
     g->dspark_ready = true;
     ds41_dspark_capture_begin(g);
     fprintf(stderr,
@@ -41767,6 +41781,99 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
         ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
 }
 #endif
+/* =========================================================================
+ * DSpark verifier.
+ *
+ * A proposal is checked by running the target over the whole block at once
+ * and reading every row's logits, not just the last. Row i predicts the token
+ * after draft[i], so the accepted prefix is the longest run where the target
+ * agrees with what the drafter proposed next.
+ *
+ * The batch writes key/value state for all of its rows. Everything the V4.1
+ * graph keeps is indexed by position and is overwritten by the next write, so
+ * a rejected suffix needs no cleanup -- except the pooled carry the ratio-2
+ * compressor threads from one position to the next, which is snapshotted here
+ * and restored on rollback along with the position and the Engram history.
+ * ========================================================================= */
+
+static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_weights *w, const int *tokens, uint32_t count,
+                              ds4_session_progress_fn progress, void *progress_ud,
+                              int total, ds4_session_cancel_fn cancel, void *cancel_ud);
+
+typedef struct {
+    uint32_t pos;
+    ds4_engram_history history;
+    bool valid;
+} ds41_verify_state;
+
+static bool ds41_verify_snapshot(ds41_gpu_graph *g, ds41_verify_state *st) {
+    if (!g || !st) return false;
+    st->pos = g->pos;
+    st->history = g->history;
+    st->valid = g->valid;
+    if (!ds4_gpu_begin_commands()) return false;
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < 4; i++) {
+        ok = ds4_gpu_tensor_copy(g->dspark_carry_kv[i], 0, g->previous_kv[i], 0,
+                                 512u * sizeof(float)) &&
+             ds4_gpu_tensor_copy(g->dspark_carry_score[i], 0, g->previous_score[i], 0,
+                                 512u * sizeof(float));
+    }
+    return ds4_gpu_end_commands() && ok;
+}
+
+static bool ds41_verify_rollback(ds41_gpu_graph *g, const ds41_verify_state *st) {
+    if (!g || !st) return false;
+    g->pos = st->pos;
+    g->history = st->history;
+    g->valid = st->valid;
+    if (!ds4_gpu_begin_commands()) return false;
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < 4; i++) {
+        ok = ds4_gpu_tensor_copy(g->previous_kv[i], 0, g->dspark_carry_kv[i], 0,
+                                 512u * sizeof(float)) &&
+             ds4_gpu_tensor_copy(g->previous_score[i], 0, g->dspark_carry_score[i], 0,
+                                 512u * sizeof(float));
+    }
+    return ds4_gpu_end_commands() && ok;
+}
+
+/* Run the target over tokens[0..n) as one batch and report each row's greedy
+ * continuation. On success the graph has advanced by n positions. */
+static bool ds41_verify_suffix_tops(ds41_gpu_graph *g, const ds4_model *m,
+                                    const ds4_weights *w, const int *tokens,
+                                    uint32_t n_tokens, int *row_tops,
+                                    float *last_logits) {
+    if (!g || !g->valid || !tokens || !n_tokens || !g->dspark_logits) return false;
+    if (n_tokens > g->prefill_cap || n_tokens > g->ctx - g->pos) return false;
+    if (!ds41_graph_prefill(g, m, w, tokens, n_tokens, NULL, NULL, 0, NULL, NULL))
+        return false;
+    ds41_prefill_row *b = &g->batch;
+    if (!ds4_gpu_begin_commands() ||
+        !ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split,
+                                              DS4_N_EMBD, DS4_N_HC) ||
+        !ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, n_tokens, DS4_V41_BF16) ||
+        !ds41_norm_batch(b->norm, b->x, m, w->output_norm, n_tokens) ||
+        !ds41_output_projection(g, g->dspark_logits, m, w, b->norm, n_tokens) ||
+        !ds4_gpu_end_commands())
+        return false;
+    float *rows = malloc((size_t)n_tokens * DS4_N_VOCAB * sizeof(float));
+    if (!rows) return false;
+    bool ok = ds4_gpu_tensor_read(g->dspark_logits, 0, rows,
+        (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(float)) != 0;
+    if (ok) {
+        if (row_tops)
+            for (uint32_t i = 0; i < n_tokens; i++)
+                row_tops[i] = (int)ds41_dspark_argmax(rows + (size_t)i * DS4_N_VOCAB);
+        if (last_logits)
+            memcpy(last_logits, rows + (size_t)(n_tokens - 1u) * DS4_N_VOCAB,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    free(rows);
+    return ok;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
@@ -41775,6 +41882,51 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
     for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
+    }
+    /* Replaying prompt tokens proves nothing: the target's greedy continuation
+     * of a prompt position is not the next prompt token. Set the variable to
+     * the first generated position so the check runs on the model's own
+     * output, where every row must agree. */
+    const char *verify_check = getenv("DS4_V41_VERIFY_CHECK");
+    if (g->dspark_ready && verify_check && g->pos >= (uint32_t)atoi(verify_check)) {
+        if (!g->dspark_hist_len) {
+            g->dspark_hist_pos0 = g->pos;
+            g->dspark_hist_history0 = g->history;
+        }
+        if (g->dspark_hist_len < g->dspark_w->block_size + 1u)
+            g->dspark_hist[g->dspark_hist_len++] = token;
+        if (g->dspark_hist_len == g->dspark_w->block_size + 1u) {
+            ds41_verify_state st;
+            int tops[DS4_DSPARK_MAX_BLOCK_SIZE + 1];
+            const uint32_t len = g->dspark_hist_len - 1u;
+            fprintf(stderr, "ds4: verify replay attempt pos0=%u len=%u cur_pos=%u\n",
+                    g->dspark_hist_pos0, len, g->pos);
+            if (!ds41_verify_snapshot(g, &st)) {
+                fprintf(stderr, "ds4: verify snapshot failed\n");
+            } else {
+                g->pos = g->dspark_hist_pos0;
+                g->history = g->dspark_hist_history0;
+                if (!ds41_verify_suffix_tops(g, m, w, g->dspark_hist, len, tops, NULL)) {
+                    fprintf(stderr, "ds4: verify suffix failed (valid=%d cap=%u ctx=%u pos=%u)\n",
+                            g->valid, g->prefill_cap, g->ctx, g->pos);
+                } else {
+                    uint32_t agree = 0;
+                    for (uint32_t i = 0; i < len; i++)
+                        if (tops[i] == g->dspark_hist[i + 1u]) agree++;
+                    g->dspark_verify_rows += len;
+                    g->dspark_verify_agree += agree;
+                    fprintf(stderr, "ds4: verify replay pos=%u rows=%u agree=%u/%u "
+                                    "(cumulative %llu/%llu = %.1f%%)\n",
+                            g->dspark_hist_pos0, len, agree, len,
+                            (unsigned long long)g->dspark_verify_agree,
+                            (unsigned long long)g->dspark_verify_rows,
+                            100.0 * (double)g->dspark_verify_agree /
+                                (double)g->dspark_verify_rows);
+                }
+                (void)ds41_verify_rollback(g, &st);
+            }
+            g->dspark_hist_len = 0;
+        }
     }
     const float initial_pre[] = {1, 0, 0, 0};
 #ifndef DS4_NO_GPU
@@ -41787,6 +41939,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
         !ds4_gpu_begin_commands()) return false;
     ds41_dspark_capture_begin(g);
+    /* Replay the last committed tokens through the batched verifier and check
+     * it reproduces the target's own greedy continuation. The tokens are the
+     * ones the target already chose, so every row must agree. */
     bool ok = ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
