@@ -40760,6 +40760,28 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+#ifndef DS4_NO_GPU
+    /*
+     * Start the routed expert loads now, before the shared-expert matmuls are
+     * encoded, so the reads overlap that work instead of stalling in front of
+     * it. routed_moe_one already has to drain and read `selected` back to the
+     * host to compute its miss mask -- this moves that same drain earlier and
+     * buys the shared expert's matmuls of overlap. GLM already does this;
+     * V4.1 did not. routed_moe_one picks the IDs up via prefetch_take, so the
+     * readback happens once, not twice.
+     *
+     * Config-dependent: +8% at --ctx 1048576, -13% at --ctx 8192.
+     * DS4_METAL_DISABLE_V41_EARLY_EXPERT_LOAD turns it off.
+     */
+    if (g->streaming && !getenv("DS4_METAL_DISABLE_V41_EARLY_EXPERT_LOAD")) {
+        const ds4_gpu_stream_expert_table etable =
+            graph_stream_expert_table_make(m, l, il,
+                                           gate_row * DS4_N_FF_EXP,
+                                           down_row * DS4_N_EMBD);
+        (void)ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                &etable, g->selected, DS4_N_EXPERT_USED);
+    }
+#endif
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41276,6 +41298,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
     }
     const float initial_pre[] = {1, 0, 0, 0};
+#ifndef DS4_NO_GPU
+    /* Top up the clean-slot reserve before opening this token's command
+     * buffer: last token's buffers have completed, so its entries are no
+     * longer in flight and can be evicted without draining the GPU. A miss
+     * mid-token then pops a free slot instead of stalling the pipeline. */
+    if (g->streaming) ds4_gpu_stream_expert_cache_replenish_free_slots();
+#endif
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
         !ds4_gpu_begin_commands()) return false;
     bool ok = ds41_embed(g, m, w, g->residual, g->x, token, g->pos);

@@ -40893,6 +40893,111 @@ void ds4_gpu_stream_expert_prefetch_stats(uint64_t *issued, uint64_t *bytes) {
     if (bytes) *bytes = g_prefetch_bytes;
 }
 
+
+/* ---------------------------------------------------------------------------
+ * Free-slot reserve.
+ *
+ * When the expert cache is full, a miss has to evict something. If every
+ * eviction candidate is still referenced by an in-flight command buffer, the
+ * reuse path calls wait_inflight -- which drains the GPU mid-layer. Measured on
+ * an M5 Max via DS4_METAL_CB_TIMES: gpu span 0.7-0.8 ms per command buffer but
+ * buffers arriving 1.5-2.5 ms apart, ~40 per token. The GPU idles more than
+ * half of decode waiting on those drains. The disk read is not the cost; the
+ * synchronisation is.
+ *
+ * Queueing decode layers makes it worse, because every expert touched during a
+ * token stays in-flight until the whole token's buffer completes, so the pool
+ * of evictable candidates shrinks to almost nothing.
+ *
+ * Fix: keep a reserve of already-evicted, known-clean slots on the free list,
+ * topped up between tokens when last token's buffers have completed and their
+ * entries are no longer in-flight. A miss then pops a free slot and never
+ * drains. Purely opportunistic -- it evicts only entries that are already NOT
+ * in flight, never waits, and if it cannot find candidates it simply leaves the
+ * reserve short and the old path still works.
+ * --------------------------------------------------------------------------- */
+
+static uint32_t g_stream_expert_reserve_target;
+static uint64_t g_stream_expert_reserve_evicted;
+static uint64_t g_stream_expert_reserve_runs;
+
+static uint32_t ds4_gpu_stream_expert_reserve_slots(void) {
+    if (g_stream_expert_reserve_target == 0) {
+        uint32_t want = 64;
+        const char *env = getenv("DS4_METAL_EXPERT_FREE_RESERVE");
+        if (env && env[0]) {
+            long v = strtol(env, NULL, 10);
+            if (v >= 0 && v <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES) {
+                want = (uint32_t)v;
+            }
+        }
+        g_stream_expert_reserve_target = want == 0 ? UINT32_MAX : want;
+    }
+    return g_stream_expert_reserve_target == UINT32_MAX ?
+           0 : g_stream_expert_reserve_target;
+}
+
+/*
+ * Evict cold, NOT-in-flight entries until the free list holds `want` slots.
+ * Never waits on the GPU. Returns how many slots were freed.
+ */
+void ds4_gpu_stream_expert_cache_replenish_free_slots(void) {
+    if (!g_ssd_streaming_mode || !ds4_gpu_stream_expert_slab_enabled()) return;
+    const uint32_t want = ds4_gpu_stream_expert_reserve_slots();
+    if (want == 0) return;
+    if (g_stream_expert_cache_free_slot_count >= want) return;
+    /* Only meaningful once the bank is actually full; before that the
+     * allocator still has virgin slots to hand out. */
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+    if (budget != 0 && g_stream_expert_cache_slab_total_slots < budget) return;
+
+    g_stream_expert_reserve_runs++;
+    uint32_t freed = 0;
+    while (g_stream_expert_cache_free_slot_count < want) {
+        uint32_t victim_layer = UINT32_MAX, victim_expert = UINT32_MAX;
+        uint32_t lowest_hotness = UINT32_MAX;
+        uint64_t oldest = UINT64_MAX;
+        for (uint32_t layer = 0;
+             layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+            for (uint32_t expert = 0;
+                 expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+                ds4_gpu_stream_expert_cache_entry *e =
+                    &g_stream_expert_cache[layer][expert];
+                if (!e->valid || !e->slab_backed) continue;
+                /* The whole point: skip anything still referenced by a
+                 * command buffer rather than draining to wait for it. */
+                if (ds4_gpu_stream_expert_cache_entry_inflight(e)) continue;
+                const uint32_t hotness =
+                    g_stream_expert_cache_route_hotness[layer][expert];
+                if (hotness < lowest_hotness ||
+                    (hotness == lowest_hotness && e->last_used < oldest)) {
+                    lowest_hotness = hotness;
+                    oldest = e->last_used;
+                    victim_layer = layer;
+                    victim_expert = expert;
+                }
+            }
+        }
+        if (victim_layer == UINT32_MAX) break;   /* nothing clean to take */
+        ds4_gpu_stream_expert_cache_clear_entry_internal(victim_layer,
+                                                         victim_expert,
+                                                         1,
+                                                         1,
+                                                         NULL);
+        if (g_stream_expert_cache[victim_layer][victim_expert].valid) break;
+        freed++;
+        if (freed > want) break;   /* belt and braces against a stuck scan */
+    }
+    g_stream_expert_reserve_evicted += freed;
+}
+
+void ds4_gpu_stream_expert_reserve_stats(uint64_t *runs, uint64_t *evicted,
+                                         uint32_t *free_now) {
+    if (runs) *runs = g_stream_expert_reserve_runs;
+    if (evicted) *evicted = g_stream_expert_reserve_evicted;
+    if (free_now) *free_now = g_stream_expert_cache_free_slot_count;
+}
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
