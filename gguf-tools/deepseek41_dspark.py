@@ -52,10 +52,11 @@ PRECISION = {
     # quantization -- every weight keeps its exact released value -- and it is
     # a routed-expert type ds4's Metal MoE kernels already execute. Dense
     # tensors are FP8 E4M3, which F16 holds exactly.
-    "native": dict(att=QTYPE_F16, shared=QTYPE_F16, exp_gate=QTYPE_MXFP4,
-                   exp_up=QTYPE_MXFP4, exp_down=QTYPE_MXFP4, head=QTYPE_F32,
-                   hcfn=QTYPE_F32,
-                   note="native: MXFP4 experts repacked bit-exact, F16 dense"),
+    "native": dict(att=QTYPE_F16, att_out=QTYPE_Q8_0, shared=QTYPE_F16,
+                   exp_gate=QTYPE_MXFP4, exp_up=QTYPE_MXFP4, exp_down=QTYPE_MXFP4,
+                   head=QTYPE_F32, hcfn=QTYPE_F32,
+                   note="native: MXFP4 experts repacked bit-exact, F16 dense, "
+                        "Q8_0 attention output (the grouped kernel's only type)"),
     "bf16": dict(att=QTYPE_BF16, shared=QTYPE_BF16, exp_gate=QTYPE_BF16,
                  exp_up=QTYPE_BF16, exp_down=QTYPE_BF16, head=QTYPE_BF16,
                  hcfn=QTYPE_F32,
@@ -145,10 +146,13 @@ def dspark_config(hf_dir):
     return config, c
 
 
-def build_plan(db, c, quant="bf16"):
+def build_plan(db, c, quant="native"):
     if quant not in PRECISION:
         raise ValueError(f"unknown precision recipe: {quant}")
     qt_of = PRECISION[quant]
+    # The grouped attention-output kernel reads Q8_0 only; every other dense
+    # projection goes through a plain matmul that takes F16/F32 directly.
+    qt_out = qt_of.get("att_out", qt_of["att"])
     dim, inter = c["hidden_size"], c["moe_intermediate_size"]
     heads, hd = c["num_attention_heads"], c["head_dim"]
     qrank, orank, groups = c["q_lora_rank"], c["o_lora_rank"], c["o_groups"]
@@ -186,8 +190,8 @@ def build_plan(db, c, quant="bf16"):
             ("attn_q_b.weight", "wq_b.weight", (heads * hd, qrank), qt_of["att"]),
             ("attn_kv.weight", "wkv.weight", (hd, dim), qt_of["att"]),
             ("attn_kv_a_norm.weight", "kv_norm.weight", (hd,), QTYPE_F32),
-            ("attn_output_a.weight", "wo_a.weight", (groups * orank, heads * hd // groups), qt_of["att"]),
-            ("attn_output_b.weight", "wo_b.weight", (dim, groups * orank), qt_of["att"]),
+            ("attn_output_a.weight", "wo_a.weight", (groups * orank, heads * hd // groups), qt_out),
+            ("attn_output_b.weight", "wo_b.weight", (dim, groups * orank), qt_out),
         ):
             regular(f"{dst}.{target}", f"{src}.attn.{source}", shape, qt, "attention")
         regular(f"{dst}.ffn_gate_inp.weight", f"{src}.ffn.gate.weight", (experts, dim), QTYPE_F32, "router")
