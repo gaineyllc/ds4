@@ -41298,7 +41298,12 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
-            il, count, &mid_f16, true)) &&
+            /* force_resident must follow the mode: with streaming on, the
+             * resident path cannot resolve experts for a multi-row decode and
+             * routed_moe_batch_tensor fails at layer 0. !streaming lets
+             * use_iq2_batch_selected_addr (which requires !force_resident)
+             * drive the batched address-table path. */
+            il, count, &mid_f16, !g->streaming) &&
         (!shared_owner || g->tp_rank != (il & 1u) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, count);
@@ -78222,8 +78227,15 @@ static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
-        if (!s || s->engine != e || !s->ds41_graph_ready || !s->checkpoint_valid || s->distributed ||
-            (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) : s->ds41_graph.streaming) ||
+        /* SSD streaming was excluded here, which forced every streamed V4.1
+         * session into the ordered (serial) fallback: measured 3-5x cost for a
+         * 4-row step and ~46 command buffers per token whether 1 or 4 sessions.
+         * DS4_METAL_DISABLE_V41_STREAMING_SESSION_BATCH restores the exclusion. */
+        if (!s || s->engine != e || !s->ds41_graph_ready || !s->checkpoint_valid ||
+            s->distributed ||
+            (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights)
+                  : (s->ds41_graph.streaming &&
+                     getenv("DS4_METAL_DISABLE_V41_STREAMING_SESSION_BATCH"))) ||
             s->ds41_graph.imatrix || s->ds41_graph.quality ||
             !s->ds41_graph.valid || s->ds41_graph.image_count ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return false;
