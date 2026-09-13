@@ -1030,6 +1030,10 @@ static uint64_t g_stream_expert_cache_mlock_failures;
 static double g_stream_expert_cache_mlock_ms;
 static int g_stream_expert_cache_mlock_warned;
 static uint64_t g_stream_expert_cache_slab_slot_bytes;
+static uint8_t  g_stream_expert_cache_decode_shrunk;
+static uint8_t  g_stream_expert_cache_auto_sized;
+static uint64_t g_stream_model_total_bytes;
+static uint64_t g_stream_dense_bytes;
 static uint64_t g_stream_expert_cache_cb_seq;
 static uint64_t g_stream_expert_cache_done_seq;
 static uint64_t g_stream_expert_cache_batch_seq;
@@ -14171,6 +14175,268 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
                                                    gate_inner,
                                                    up_inner,
                                                    down_inner);
+}
+
+
+/*
+ * ---------------------------------------------------------------------------
+ * Decode-bank shrink (OS page-cache cliff fix).
+ *
+ * On a RAM-limited machine -- model materially larger than physical RAM, which
+ * is the normal V4.1 Flash case on a 128 GiB Mac -- a large wired expert slab
+ * bank evicts the OS file cache that serves decode-miss preads at RAM speed,
+ * and decode collapses to true SSD reads. The bank still earns its keep during
+ * prefill, where reads are wide and batched, so the fix is to keep the full
+ * bank for prefill and shrink it to a small decode bank afterwards, returning
+ * the wired pages to the OS so the file cache can repopulate.
+ *
+ * Ported from the ds4-ssd fork (Anemll/ds4-ssd), which measured ~13x decode
+ * collapse on a 96 GiB M3 Ultra at a 48 GiB bank and fixed it this way.
+ *
+ * Shrink is whole-slab granular: only trailing slabs are released, so there is
+ * no partial-slab bookkeeping. The GPU is drained first, so no in-flight
+ * command buffer can reference a slab that is about to be freed.
+ * ---------------------------------------------------------------------------
+ */
+
+/* 44 GiB: the bank size at which the cliff becomes measurable. Smaller banks
+ * already coexist with a useful file cache and are left exactly as configured. */
+static void ds4_gpu_stream_expert_cache_zero_addr_slot(uint32_t layer, uint32_t expert);
+
+#define DS4_STREAM_EXPERT_DECODE_CLIFF_BYTES (44ull * 1024ull * 1024ull * 1024ull)
+
+/* Accepts a plain byte count or a GB/GiB/MB/MiB suffix, e.g. "20GB". */
+static uint64_t ds4_gpu_stream_expert_parse_size(const char *s) {
+    if (!s || !s[0]) return 0;
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno != 0 || end == s || v <= 0.0) return 0;
+    while (*end == ' ' || *end == '\t') end++;
+    double mul = 1.0;
+    if (!strncasecmp(end, "g", 1))      mul = 1073741824.0;
+    else if (!strncasecmp(end, "m", 1)) mul = 1048576.0;
+    else if (!strncasecmp(end, "k", 1)) mul = 1024.0;
+    else if (*end != '\0')             return 0;
+    double bytes = v * mul;
+    if (bytes < 0.0 || bytes > 1.8e19) return 0;
+    return (uint64_t)bytes;
+}
+
+static uint32_t ds4_gpu_stream_expert_decode_slots_for_budget(uint64_t budget) {
+    const uint64_t slot_bytes = g_stream_expert_cache_slab_slot_bytes;
+    if (slot_bytes == 0 || budget < slot_bytes) return 0;
+    uint64_t slots = budget / slot_bytes;
+    if (slots > UINT32_MAX) slots = UINT32_MAX;
+    return (uint32_t)slots;
+}
+
+/*
+ * Desired decode slot count, or 0 for "no shrink". Honors:
+ *   DS4_STREAM_EXPERT_DECODE_SLOTS=<slots>  explicit slot count (0 = opt out)
+ *   DS4_STREAM_EXPERT_DECODE_CACHE=<bytes>  explicit byte budget
+ * The slot form wins if both are set.
+ */
+static uint32_t ds4_gpu_stream_expert_decode_target_slots(uint64_t dense_bytes,
+                                                          uint64_t context_bytes) {
+    if (!g_ssd_streaming_mode) return 0;
+    const uint32_t cur = g_stream_expert_cache_slab_total_slots;
+    if (cur == 0 || g_stream_expert_cache_slab_slot_bytes == 0) return 0;
+
+    const char *slots_env = getenv("DS4_STREAM_EXPERT_DECODE_SLOTS");
+    if (slots_env && slots_env[0]) {
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(slots_env, &end, 10);
+        if (errno == 0 && end != slots_env && v >= 0) {
+            if (v == 0) return 0;               /* explicit opt-out */
+            uint32_t t = (uint32_t)v;
+            return (t >= cur) ? 0 : t;
+        }
+    }
+
+    const char *bytes_env = getenv("DS4_STREAM_EXPERT_DECODE_CACHE");
+    if (bytes_env && bytes_env[0]) {
+        uint64_t budget = ds4_gpu_stream_expert_parse_size(bytes_env);
+        if (budget != 0) {
+            uint32_t t = ds4_gpu_stream_expert_decode_slots_for_budget(budget);
+            return (t == 0 || t >= cur) ? 0 : t;
+        }
+    }
+
+    /*
+     * Automatic shrink, RAM-limited regime only. An explicitly sized cache
+     * (--ssd-streaming-cache-experts) is honored literally through decode: the
+     * user said what they meant. Only an auto-sized bank is rescued.
+     */
+    if (!g_stream_expert_cache_auto_sized) return 0;
+
+    const uint64_t ram = ds4_gpu_system_memory_bytes();
+    if (ram == 0) return 0;
+
+    /* Only when the model genuinely does not fit: otherwise the bank and the
+     * file cache coexist and shrinking only loses hits. */
+    if (g_stream_model_total_bytes == 0 || g_stream_model_total_bytes <= ram) return 0;
+
+    const uint64_t cur_bytes =
+        (uint64_t)cur * g_stream_expert_cache_slab_slot_bytes;
+    if (cur_bytes < DS4_STREAM_EXPERT_DECODE_CLIFF_BYTES) return 0;
+
+    const uint64_t reserved = dense_bytes + context_bytes;
+    if (ram <= reserved) return 0;
+
+    uint32_t pct = 20u;
+    const char *pct_env = getenv("DS4_SSD_CACHE_AUTO_PCT");
+    if (pct_env && pct_env[0]) {
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(pct_env, &end, 10);
+        if (errno == 0 && end != pct_env && v >= 1 && v <= 100) pct = (uint32_t)v;
+    }
+
+    const uint64_t remaining = ram - reserved;
+    const uint64_t budget =
+        (remaining / 100ull) * pct + (remaining % 100ull) * pct / 100ull;
+    uint32_t target = ds4_gpu_stream_expert_decode_slots_for_budget(budget);
+    return (target == 0 || target >= cur) ? 0 : target;
+}
+
+void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes) {
+    const uint64_t dense_bytes = g_stream_dense_bytes;
+    if (g_stream_expert_cache_decode_shrunk) return;
+    if (!ds4_gpu_stream_expert_slab_enabled()) return;
+
+    const uint32_t target =
+        ds4_gpu_stream_expert_decode_target_slots(dense_bytes, context_bytes);
+    if (target == 0) return;
+
+    /* Round the target down to a whole-slab boundary: keep the leading slabs
+     * whose cumulative slot count still fits under `target`. */
+    uint32_t keep_slabs = 0, keep_slots = 0;
+    for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        const uint32_t next = keep_slots + g_stream_expert_cache_slab_slot_count[i];
+        if (next > target) break;
+        keep_slots = next;
+        keep_slabs = i + 1;
+    }
+    /* Never shrink to nothing: one slab is the floor. */
+    if (keep_slabs == 0) {
+        if (g_stream_expert_cache_slab_count == 0) return;
+        keep_slabs = 1;
+        keep_slots = g_stream_expert_cache_slab_slot_count[0];
+    }
+    if (keep_slabs >= g_stream_expert_cache_slab_count) return;
+
+    const uint32_t from_slots = g_stream_expert_cache_slab_total_slots;
+    const uint64_t freed_bytes =
+        (uint64_t)(from_slots - keep_slots) * g_stream_expert_cache_slab_slot_bytes;
+
+    fprintf(stderr,
+            "ds4: streaming expert cache shrinking for decode: slots %u->%u "
+            "(%u->%u slabs, frees %.2f GiB of wired pages so the OS file cache "
+            "can serve decode-miss reads)\n",
+            from_slots, keep_slots,
+            g_stream_expert_cache_slab_count, keep_slabs,
+            ds4_gpu_gib(freed_bytes));
+
+    /* Drain: nothing in flight may reference a slab we are about to release. */
+    if (!ds4_gpu_stream_expert_cache_wait_inflight("decode-bank shrink")) {
+        fprintf(stderr,
+                "ds4: streaming expert cache shrink aborted (inflight drain failed)\n");
+        return;
+    }
+
+    /* Invalidate every entry whose slot lives in a slab being released. */
+    uint32_t dropped = 0;
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+            ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+            if (!e->valid || !e->slab_backed) continue;
+            if (e->slab_slot < keep_slots) continue;
+            /* Critical: drop the GPU-visible address first. Leaving it set
+             * would point the shader at a slab whose pages we return below. */
+            ds4_gpu_stream_expert_cache_zero_addr_slot(layer, expert);
+            const uint64_t logical = e->logical_bytes;
+            e->gate_buffer = nil;
+            e->up_buffer = nil;
+            e->down_buffer = nil;
+            e->model_map = NULL;
+            e->model_size = 0;
+            e->gate_abs_offset = 0;
+            e->up_abs_offset = 0;
+            e->down_abs_offset = 0;
+            e->gate_expert_bytes = 0;
+            e->down_expert_bytes = 0;
+            e->logical_bytes = 0;
+            e->gate_inner = 0;
+            e->up_inner = 0;
+            e->down_inner = 0;
+            e->inflight_seq = 0;
+            e->last_used = 0;
+            e->use_count = 0;
+            e->slab_slot = 0;
+            e->valid = 0;
+            e->slab_backed = 0;
+            if (g_stream_expert_cache_layer_count[layer] > 0) {
+                g_stream_expert_cache_layer_count[layer]--;
+            }
+            if (g_stream_expert_cache_entry_count > 0) {
+                g_stream_expert_cache_entry_count--;
+            }
+            if (g_stream_expert_cache_bytes >= logical) {
+                g_stream_expert_cache_bytes -= logical;
+            } else {
+                g_stream_expert_cache_bytes = 0;
+            }
+            dropped++;
+        }
+    }
+
+    /* Release the trailing slabs. Dropping the last strong reference returns
+     * the wired pages to the OS, which is the entire point of the exercise. */
+    for (uint32_t i = keep_slabs; i < g_stream_expert_cache_slab_count; i++) {
+        g_stream_expert_cache_slabs[i] = nil;
+        g_stream_expert_cache_slab_start_slot[i] = 0;
+        g_stream_expert_cache_slab_slot_count[i] = 0;
+        g_stream_expert_cache_slab_slots_used[i] = 0;
+    }
+    g_stream_expert_cache_slab_count = keep_slabs;
+    g_stream_expert_cache_slab_total_slots = keep_slots;
+
+    /* Purge freed slots from the free list and unlock their pins. */
+    uint32_t kept_free = 0;
+    for (uint32_t i = 0; i < g_stream_expert_cache_free_slot_count; i++) {
+        const uint32_t slot = g_stream_expert_cache_free_slots[i];
+        if (slot < keep_slots) {
+            g_stream_expert_cache_free_slots[kept_free++] = slot;
+        }
+    }
+    g_stream_expert_cache_free_slot_count = kept_free;
+    for (uint32_t slot = keep_slots;
+         slot < DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES;
+         slot++) {
+        g_stream_expert_cache_slab_slot_locked[slot] = 0;
+    }
+
+    /* The budget cap must follow the bank down, or the allocator will simply
+     * grow the slabs straight back on the next decode miss. */
+    g_stream_expert_cache_mlock_budget_cap = keep_slots;
+    g_stream_expert_cache_decode_shrunk = 1;
+
+    fprintf(stderr,
+            "ds4: streaming expert cache shrunk for decode: slots=%u slabs=%u "
+            "bank=%.2f GiB (dropped %u cached experts)\n",
+            keep_slots, keep_slabs,
+            ds4_gpu_gib((uint64_t)keep_slots * g_stream_expert_cache_slab_slot_bytes),
+            dropped);
+}
+
+void ds4_gpu_set_streaming_decode_shrink_hint(bool auto_sized,
+                                              uint64_t model_bytes,
+                                              uint64_t dense_bytes) {
+    g_stream_expert_cache_auto_sized = auto_sized ? 1 : 0;
+    g_stream_model_total_bytes = model_bytes;
+    g_stream_dense_bytes = dense_bytes;
 }
 
 static uint64_t ds4_gpu_stream_expert_buffer_object_count(

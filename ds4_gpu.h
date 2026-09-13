@@ -371,6 +371,10 @@ void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
 void ds4_gpu_stream_expert_cache_release_resident(void);
+void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes);
+void ds4_gpu_set_streaming_decode_shrink_hint(bool auto_sized,
+                                              uint64_t model_bytes,
+                                              uint64_t dense_bytes);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes);

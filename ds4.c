@@ -68246,6 +68246,19 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
 
     e->ssd_streaming_cache_experts = cache_experts;
     e->ssd_streaming_cache_bytes = effective_cache_bytes;
+#ifndef DS4_NO_GPU
+    /* Tell the backend this bank was auto-sized, and how big the model really
+     * is, so the decode-bank shrink can decide whether this machine is in the
+     * RAM-limited regime where a big wired bank starves the OS file cache. */
+    {
+        uint64_t model_total = non_routed_bytes;
+        if (per_expert_bytes != 0 && max_model_experts != 0 &&
+            per_expert_bytes <= (UINT64_MAX - model_total) / max_model_experts) {
+            model_total += per_expert_bytes * (uint64_t)max_model_experts;
+        }
+        ds4_gpu_set_streaming_decode_shrink_hint(true, model_total, non_routed_bytes);
+    }
+#endif
     fprintf(stderr,
             "ds4: SSD streaming auto cache budget\n");
     fprintf(stderr,
@@ -75074,6 +75087,13 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         ds4_session_sync_lockstep(s, prompt, err, errlen) :
         ds4_session_sync_internal(s, prompt, err, errlen);
 #ifndef DS4_NO_GPU
+    /* Prefill is done and decode is next: hand the wired expert bank back to
+     * the OS if this machine is in the RAM-limited regime, so the file cache
+     * can serve decode-miss expert reads at RAM speed instead of SSD speed. */
+    if (rc == 0 && s && s->engine && s->engine->ssd_streaming) {
+        ds4_gpu_stream_expert_cache_shrink_for_decode(
+                s->ds41_graph.allocation_bytes);
+    }
     if (rc == 0) glm_debug_dump_prefill_logits(s->logits);
     if (rc == 0) {
         const char *kvp = getenv("DS4_GLM_KV_DUMP");
