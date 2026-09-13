@@ -2954,6 +2954,12 @@ typedef struct {
     bool has_markov_rank;
     bool has_noise_token_id;
     bool has_target_layers;
+    /* V4.1 Flash keeps DSpark in the main checkpoint and gives each stage a
+     * 128-expert router with no hypercomplex output head. The 0731 support
+     * file has neither field, so both default to the target's own shape. */
+    uint32_t expert_count;
+    uint32_t expert_used;
+    bool v41;
 } ds4_dspark_summary;
 
 typedef enum {
@@ -3035,7 +3041,31 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
         "dspark.target_layer_ids",
     };
 
+    static const char *const expert_keys[] = {
+        "deepseek4.dspark.expert_count",
+        "dspark.expert_count",
+    };
+    static const char *const expert_used_keys[] = {
+        "deepseek4.dspark.expert_used_count",
+        "dspark.expert_used_count",
+    };
+
     ds4_dspark_summary s = {0};
+    s.expert_count = DS4_N_EXPERT;
+    s.expert_used = DS4_N_EXPERT_USED;
+    model_get_u32_any(m, expert_keys, sizeof(expert_keys) / sizeof(expert_keys[0]),
+                      &s.expert_count);
+    model_get_u32_any(m, expert_used_keys,
+                      sizeof(expert_used_keys) / sizeof(expert_used_keys[0]),
+                      &s.expert_used);
+    {
+        ds4_str variant = {0};
+        if ((model_get_string(m, "dspark.checkpoint_variant", &variant) ||
+             model_get_string(m, "deepseek4.checkpoint_variant", &variant)) &&
+            ds4_streq(variant, "v4.1-flash")) {
+            s.v41 = true;
+        }
+    }
     if (model_get_u32_any(m, block_keys, sizeof(block_keys) / sizeof(block_keys[0]),
                           &s.block_size)) {
         s.has_metadata = true;
@@ -3255,6 +3285,19 @@ static const char *support_kind_name(ds4_support_kind kind) {
     case DS4_SUPPORT_NONE:       return "none";
     }
     return "unknown";
+}
+
+/* The V4.1 gate below runs before the support model is opened, so peek at
+ * the file's own metadata. Reads the header only; no payload is touched. */
+static bool dspark_support_file_is_v41(const char *path) {
+    if (!path || !path[0]) return false;
+    ds4_model probe;
+    model_open(&probe, path, false, false);
+    const ds4_dspark_summary s = model_dspark_summary(&probe);
+    const bool ok = s.v41 && s.stages >= 3 && s.has_main_proj &&
+                    s.has_markov_head && s.has_confidence_head;
+    model_close(&probe);
+    return ok;
 }
 
 static ds4_support_kind support_model_detect(
@@ -4764,6 +4807,9 @@ typedef struct {
     bool has_markov_rank;
     bool has_noise_token_id;
     bool has_target_layers;
+    uint32_t expert_count;
+    uint32_t expert_used;
+    bool v41;
     ds4_dspark_stage_weights stage[DS4_DSPARK_MAX_STAGES];
 } ds4_dspark_weights;
 
@@ -6085,9 +6131,9 @@ typedef enum {
 static const char *dspark_layout_kind_name(ds4_dspark_layout_kind kind) {
     switch (kind) {
     case DS4_DSPARK_LAYOUT_F32:    return "F32";
-    case DS4_DSPARK_LAYOUT_PLAIN:  return "F16 or F32";
-    case DS4_DSPARK_LAYOUT_DENSE:  return "F16, F32, or Q8_0";
-    case DS4_DSPARK_LAYOUT_ROUTED: return "routed expert quant";
+    case DS4_DSPARK_LAYOUT_PLAIN:  return "F16, BF16, or F32";
+    case DS4_DSPARK_LAYOUT_DENSE:  return "F16, BF16, F32, or Q8_0";
+    case DS4_DSPARK_LAYOUT_ROUTED: return "routed expert quant or BF16";
     }
     return "unknown";
 }
@@ -6098,13 +6144,17 @@ static bool dspark_tensor_type_matches(uint32_t type,
     case DS4_DSPARK_LAYOUT_F32:
         return type == DS4_TENSOR_F32;
     case DS4_DSPARK_LAYOUT_PLAIN:
-        return type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32;
+        return type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
+               type == DS4_TENSOR_BF16;
     case DS4_DSPARK_LAYOUT_DENSE:
         return type == DS4_TENSOR_F16 ||
                type == DS4_TENSOR_F32 ||
+               type == DS4_TENSOR_BF16 ||
                type == DS4_TENSOR_Q8_0;
     case DS4_DSPARK_LAYOUT_ROUTED:
-        return tensor_is_routed_expert_type(type);
+        /* An unquantized drafter keeps the released weights in BF16; draft
+         * quality is what sets the accepted prefix length. */
+        return tensor_is_routed_expert_type(type) || type == DS4_TENSOR_BF16;
     }
     return false;
 }
@@ -6202,6 +6252,7 @@ static void dspark_weights_validate_metadata(ds4_dspark_weights *dw) {
 static void dspark_weights_validate_block_layout(
         ds4_dspark_weights *dw,
         const ds4_layer_weights *l) {
+    const uint64_t n_expert = dw && dw->expert_count ? dw->expert_count : DS4_N_EXPERT;
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -6257,19 +6308,19 @@ static void dspark_weights_validate_block_layout(
                                   DS4_N_EMBD, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_inp, "ffn_gate_inp",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
-                                  DS4_N_EMBD, DS4_N_EXPERT, 0);
+                                  DS4_N_EMBD, n_expert, 0);
     dspark_validate_tensor_layout(dw, l->ffn_exp_probs_b, "exp_probs_b",
                                   DS4_DSPARK_LAYOUT_F32, 1,
-                                  DS4_N_EXPERT, 0, 0);
+                                  n_expert, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_exps, "ffn_gate_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
     dspark_validate_tensor_layout(dw, l->ffn_up_exps, "ffn_up_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
     dspark_validate_tensor_layout(dw, l->ffn_down_exps, "ffn_down_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+                                  DS4_N_FF_EXP, DS4_N_EMBD, n_expert);
     if (l->ffn_gate_exps &&
         l->ffn_up_exps &&
         l->ffn_gate_exps->type != l->ffn_up_exps->type) {
@@ -8800,6 +8851,9 @@ static void dspark_weights_bind_optional(
     dw->has_markov_rank = summary->has_markov_rank;
     dw->has_noise_token_id = summary->has_noise_token_id;
     dw->has_target_layers = summary->has_target_layers;
+    dw->expert_count = summary->expert_count ? summary->expert_count : DS4_N_EXPERT;
+    dw->expert_used = summary->expert_used ? summary->expert_used : DS4_N_EXPERT_USED;
+    dw->v41 = summary->v41;
     memcpy(dw->target_layers,
            summary->target_layers,
            (size_t)dw->target_layer_count * sizeof(dw->target_layers[0]));
@@ -8818,12 +8872,15 @@ static void dspark_weights_bind_optional(
         const uint32_t final_stage = dw->n_stages - 1u;
         ds4_dspark_stage_weights *sw = &dw->stage[final_stage];
         sw->norm = dspark_bind_tensor(dw, m, final_stage, "norm.weight", true);
+        /* 0731 ends the draft with its own hypercomplex head. V4.1 collapses
+         * the streams with the final stage's own FFN mix and reuses the
+         * target's output head, so these three do not exist there. */
         sw->hc_head_base =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", !dw->v41);
         sw->hc_head_fn =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", !dw->v41);
         sw->hc_head_scale =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", !dw->v41);
         sw->markov_w1 =
             dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w1.weight", true);
         sw->markov_w2 =
@@ -70670,14 +70727,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
                  false) &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
-            !load_slice && !opt->dspark && !opt->glm_mtp &&
+            !load_slice && !opt->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&
-            (!opt->mtp_path || !opt->mtp_path[0]) &&
+            (!opt->mtp_path || !opt->mtp_path[0] ||
+             dspark_support_file_is_v41(opt->mtp_path)) &&
+            (!opt->dspark ||
+             (opt->mtp_path && opt->mtp_path[0] &&
+              dspark_support_file_is_v41(opt->mtp_path))) &&
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
             fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (optional network tensor parallelism); "
-                            "DSpark, steering and legacy diagnostics are not supported (maximum context 1048576)\n");
+                            "steering, legacy MTP and legacy diagnostics are not supported "
+                            "(maximum context 1048576). --dspark needs a V4.1 DSpark support "
+                            "model built by gguf-tools/deepseek41_dspark.py\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -71162,7 +71225,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
+        /* The V4.1 drafter is its own resident file: the target still streams
+         * its experts from SSD while the three draft stages stay in memory. */
+        if (e->ssd_streaming && !dspark_support_file_is_v41(opt->mtp_path)) {
             fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp-model yet\n");
             ds4_engine_close(e);
             *out = NULL;
