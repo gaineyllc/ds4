@@ -41303,7 +41303,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
              * routed_moe_batch_tensor fails at layer 0. !streaming lets
              * use_iq2_batch_selected_addr (which requires !force_resident)
              * drive the batched address-table path. */
-            il, count, &mid_f16, !g->streaming) &&
+            il, count, &mid_f16, !g->streaming)) &&
         (!shared_owner || g->tp_rank != (il & 1u) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, count);
