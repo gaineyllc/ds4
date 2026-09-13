@@ -40272,6 +40272,13 @@ typedef struct {
     ds4_gpu_tensor *dspark_target_hidden; /* target_count rows of N_EMBD */
     ds4_gpu_tensor *dspark_main_x;        /* N_EMBD after main_proj/main_norm */
     ds4_gpu_tensor *dspark_proj;          /* N_EMBD before main_norm */
+    /* One sliding key window per stage, seeded from the target hidden: 128
+     * committed rows plus room for the draft block itself. */
+    ds4_gpu_tensor *dspark_ring[DS4_DSPARK_MAX_STAGES];
+    uint32_t dspark_ring_cap, dspark_stages;
+    ds4_gpu_tensor *dspark_dbg_hc;   /* DS4_V41_DSPARK_CHECK only */
+    const ds4_model *dspark_model;
+    const ds4_dspark_weights *dspark_w;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -40325,6 +40332,9 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_tensor_free(g->dspark_target_hidden);
     ds4_gpu_tensor_free(g->dspark_main_x);
     ds4_gpu_tensor_free(g->dspark_proj);
+    for (uint32_t i = 0; i < DS4_DSPARK_MAX_STAGES; i++)
+        ds4_gpu_tensor_free(g->dspark_ring[i]);
+    ds4_gpu_tensor_free(g->dspark_dbg_hc);
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
 }
@@ -41306,8 +41316,70 @@ static bool ds41_dspark_capture_layer(ds41_gpu_graph *g, uint32_t il) {
     g->dspark_capture_mask |= 1u << slot;
     if (g->dspark_capture_mask == ds41_dspark_complete_mask(g)) {
         g->dspark_capture_valid = true;
+        if (g->dspark_dbg_hc && !ds4_gpu_tensor_copy(g->dspark_dbg_hc, 0, g->residual, 0,
+                (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float))) return false;
     }
     return true;
+}
+
+/* main_proj consumes the captured rows as one flat vector, in target-layer
+ * order, and main_norm produces the embedding every stage's key window is
+ * seeded from. */
+static bool ds41_dspark_stage0(ds41_gpu_graph *g, const ds4_model *dm,
+                               const ds4_dspark_weights *dw) {
+    if (!g || !g->dspark_capture_valid || !dw->n_stages) return false;
+    const ds4_dspark_stage_weights *s0 = &dw->stage[0];
+    if (!s0->main_proj || !s0->main_norm) return false;
+    const uint64_t in_dim = (uint64_t)g->dspark_target_count * DS4_N_EMBD;
+    if (s0->main_proj->dim[0] != in_dim || s0->main_proj->dim[1] != DS4_N_EMBD) {
+        fprintf(stderr, "ds4: DSpark main_proj is %" PRIu64 "x%" PRIu64
+                        ", expected %" PRIu64 "x%u\n",
+                s0->main_proj->dim[0], s0->main_proj->dim[1], in_dim, DS4_N_EMBD);
+        return false;
+    }
+    return metal_graph_matmul_plain_tensor(g->dspark_proj, dm, s0->main_proj,
+                                           in_dim, DS4_N_EMBD,
+                                           g->dspark_target_hidden, 1) &&
+           ds4_gpu_rms_norm_weight_tensor(g->dspark_main_x, g->dspark_proj,
+                                          dm->map, dm->size,
+                                          s0->main_norm->abs_offset,
+                                          DS4_N_EMBD, DS4_RMS_EPS) != 0;
+}
+
+/* Recompute the capture on the CPU from the residual the target left behind
+ * and compare, so the collapse weights and the row order are checked against
+ * the reference rather than assumed. */
+static void ds41_dspark_capture_selfcheck(ds41_gpu_graph *g, uint32_t pos) {
+    if (!getenv("DS4_V41_DSPARK_CHECK") || !g->dspark_capture_valid) return;
+    const uint32_t slot = g->dspark_target_count - 1u;
+    float *hc = malloc((size_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
+    float *got = malloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *mx = malloc((size_t)DS4_N_EMBD * sizeof(float));
+    if (!hc || !got || !mx) { free(hc); free(got); free(mx); return; }
+    double worst = 0.0, mag = 0.0;
+    if (g->dspark_dbg_hc && ds4_gpu_tensor_read(g->dspark_dbg_hc, 0, hc,
+            (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
+        ds4_gpu_tensor_read(g->dspark_target_hidden,
+            (uint64_t)slot * DS4_N_EMBD * sizeof(float), got,
+            (uint64_t)DS4_N_EMBD * sizeof(float)) &&
+        ds4_gpu_tensor_read(g->dspark_main_x, 0, mx,
+            (uint64_t)DS4_N_EMBD * sizeof(float))) {
+        double mxsum = 0.0;
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+            double mean = 0.0;
+            for (uint32_t h = 0; h < DS4_N_HC; h++)
+                mean += hc[(size_t)h * DS4_N_EMBD + i];
+            mean /= (double)DS4_N_HC;
+            const double d = fabs(mean - (double)got[i]);
+            if (d > worst) worst = d;
+            if (fabs(mean) > mag) mag = fabs(mean);
+            mxsum += (double)mx[i] * mx[i];
+        }
+        fprintf(stderr, "ds4: dspark check pos=%u slot=%u max|hc_mean-captured|=%.3e "
+                        "peak=%.3e main_x_rms=%.4f\n",
+                pos, slot, worst, mag, sqrt(mxsum / (double)DS4_N_EMBD));
+    }
+    free(hc); free(got); free(mx);
 }
 
 static void ds41_dspark_capture_begin(ds41_gpu_graph *g) {
@@ -41316,8 +41388,11 @@ static void ds41_dspark_capture_begin(ds41_gpu_graph *g) {
     g->dspark_capture_valid = false;
 }
 
-static bool ds41_dspark_configure(ds41_gpu_graph *g, const ds4_dspark_weights *dw) {
-    if (!g || !dw || !dw->n_stages || !dw->target_layer_count) return true;
+static bool ds41_dspark_configure(ds41_gpu_graph *g, const ds4_model *dm,
+                                  const ds4_dspark_weights *dw) {
+    if (!g || !dm || !dw || !dw->n_stages || !dw->target_layer_count) return true;
+    g->dspark_model = dm;
+    g->dspark_w = dw;
     g->dspark_block_size = dw->block_size;
     g->dspark_target_count = dw->target_layer_count < DS4_DSPARK_MAX_TARGET_LAYERS ?
         dw->target_layer_count : DS4_DSPARK_MAX_TARGET_LAYERS;
@@ -41334,6 +41409,19 @@ static bool ds41_dspark_configure(ds41_gpu_graph *g, const ds4_dspark_weights *d
     for (uint32_t i = 0; i < DS4_N_HC; i++) mean[i] = 1.0f / (float)DS4_N_HC;
     if (!ds4_gpu_tensor_write(g->dspark_hc_mean, 0, mean, DS4_N_HC * sizeof(float)))
         return false;
+    g->dspark_stages = dw->n_stages < DS4_DSPARK_MAX_STAGES ?
+        dw->n_stages : DS4_DSPARK_MAX_STAGES;
+    g->dspark_ring_cap = 128u + dw->block_size + 1u;
+    for (uint32_t i = 0; i < g->dspark_stages; i++) {
+        g->dspark_ring[i] = ds4_gpu_tensor_alloc(
+            (uint64_t)g->dspark_ring_cap * DS4_N_HEAD_DIM * sizeof(float));
+        if (!g->dspark_ring[i]) return false;
+    }
+    if (getenv("DS4_V41_DSPARK_CHECK")) {
+        g->dspark_dbg_hc = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
+        if (!g->dspark_dbg_hc) return false;
+    }
     g->dspark_ready = true;
     ds41_dspark_capture_begin(g);
     fprintf(stderr,
@@ -41538,6 +41626,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds4_gpu_begin_commands() != 0;
     }
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (ok && g->dspark_ready && g->dspark_capture_valid) {
+        if (!ds4_gpu_begin_commands() ||
+            !ds41_dspark_stage0(g, g->dspark_model, g->dspark_w) ||
+            !ds4_gpu_end_commands()) {
+            fprintf(stderr, "ds4: V4.1 DSpark stage 0 failed at position %u\n", g->pos);
+            ok = false;
+        } else {
+            ds41_dspark_capture_selfcheck(g, g->pos);
+        }
+    }
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
@@ -73075,7 +73173,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->ds41_graph_ready = true;
         s->ds41_graph.quality = e->quality;
         if (e->support_kind == DS4_SUPPORT_DSPARK &&
-            !ds41_dspark_configure(&s->ds41_graph, &e->dspark_weights)) {
+            !ds41_dspark_configure(&s->ds41_graph, &e->mtp_model, &e->dspark_weights)) {
             fprintf(stderr, "ds4: failed to arm V4.1 DSpark target capture\n");
             ds41_graph_free(&s->ds41_graph);
             free(s);
