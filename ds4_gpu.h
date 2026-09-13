@@ -372,6 +372,8 @@ void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
 void ds4_gpu_stream_expert_cache_release_resident(void);
 void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes);
+void ds4_gpu_stream_expert_prefetch_layer(uint32_t layer);
+void ds4_gpu_stream_expert_prefetch_stats(uint64_t *issued, uint64_t *bytes);
 void ds4_gpu_set_streaming_decode_shrink_hint(bool auto_sized,
                                               uint64_t model_bytes,
                                               uint64_t dense_bytes);

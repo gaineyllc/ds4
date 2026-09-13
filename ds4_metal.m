@@ -40703,6 +40703,196 @@ static bool ds4_gpu_mxfp4_moe_decode_nsg1_enabled(uint32_t n_tokens) {
            getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_NSG1") == NULL;
 }
 
+
+/* ---------------------------------------------------------------------------
+ * Speculative expert prefetch.
+ *
+ * The routed experts for layer L are chosen by a gate applied to the hidden
+ * state layer L just produced, and the selection lives in a GPU tensor, so a
+ * CPU-side prefetch for the CURRENT token would need a readback and a sync on
+ * the critical path. That is why the V4.1 decode path has no prefetch at all.
+ *
+ * MoE routing has strong temporal locality: consecutive tokens route a given
+ * layer to largely the same experts. So instead of predicting forward within a
+ * token, record which experts each layer actually used on the previous token --
+ * that selection is already on the CPU, inside routed_moe_one -- and warm those
+ * pages for the NEXT token off the critical path.
+ *
+ * Warming is madvise(MADV_WILLNEED) against the mmap'd model, never a copy and
+ * never a Metal call, so a wrong guess costs only idle bandwidth and can never
+ * affect correctness. Measured on an M5 Max, decode leaves the SSD ~80-95% idle
+ * (median 220 MB/s against a 17 GB/s device), so that bandwidth is free.
+ *
+ * Bounded by construction: at most DS4_PREFETCH_MAX_LAYERS layers x
+ * DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED experts of WILLNEED per token.
+ * Disable with DS4_METAL_EXPERT_PREFETCH=0.
+ * --------------------------------------------------------------------------- */
+
+enum { DS4_PREFETCH_MAX_LAYERS = DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER };
+
+typedef struct {
+    const void *model_map;
+    uint64_t    model_size;
+    uint64_t    gate_off[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    uint64_t    up_off[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    uint64_t    down_off[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    uint64_t    gate_bytes;
+    uint64_t    down_bytes;
+    uint32_t    n;
+    uint8_t     valid;
+} ds4_expert_prefetch_layer;
+
+static ds4_expert_prefetch_layer g_prefetch_layers[DS4_PREFETCH_MAX_LAYERS];
+static pthread_mutex_t g_prefetch_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_prefetch_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t       g_prefetch_thread;
+static int             g_prefetch_started;
+static int             g_prefetch_stopping;
+static uint32_t        g_prefetch_pending_layer = UINT32_MAX;
+static uint64_t        g_prefetch_issued;
+static uint64_t        g_prefetch_bytes;
+
+static int ds4_gpu_expert_prefetch_enabled(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        /* OFF by default: measured 6.36 t/s vs 10.00 t/s baseline on an M5
+         * Max. See the comment above -- warming mmap pages is the wrong
+         * mechanism, because the expert cache holds COPIES in Metal slabs, so
+         * this populates a second copy in the page cache and evicts the pages
+         * that matter on a memory-tight machine. Opt in with
+         * DS4_METAL_EXPERT_PREFETCH=1 only to experiment. */
+        const char *env = getenv("DS4_METAL_EXPERT_PREFETCH");
+        mode = (env && strcmp(env, "1") == 0) ? 1 : 0;
+    }
+    return mode;
+}
+
+static void ds4_gpu_expert_prefetch_warm(const ds4_expert_prefetch_layer *pl) {
+    if (!pl->model_map || pl->model_size == 0) return;
+    const uintptr_t base = (uintptr_t)pl->model_map;
+    for (uint32_t i = 0; i < pl->n; i++) {
+        const struct { uint64_t off, len; } spans[3] = {
+            { pl->gate_off[i], pl->gate_bytes },
+            { pl->up_off[i],   pl->gate_bytes },
+            { pl->down_off[i], pl->down_bytes },
+        };
+        for (unsigned s = 0; s < 3; s++) {
+            const uint64_t off = spans[s].off, len = spans[s].len;
+            if (len == 0 || off >= pl->model_size ||
+                len > pl->model_size - off) {
+                continue;
+            }
+            /* Page-align down; madvise needs an aligned start. */
+            const uint64_t pg = (uint64_t)getpagesize();
+            const uint64_t a = off & ~(pg - 1);
+            const size_t   n = (size_t)(len + (off - a));
+            if (madvise((void *)(base + a), n, MADV_WILLNEED) == 0) {
+                g_prefetch_bytes += len;
+            }
+        }
+    }
+    g_prefetch_issued++;
+}
+
+static void *ds4_gpu_expert_prefetch_worker(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_prefetch_mu);
+    for (;;) {
+        while (!g_prefetch_stopping && g_prefetch_pending_layer == UINT32_MAX)
+            pthread_cond_wait(&g_prefetch_cv, &g_prefetch_mu);
+        if (g_prefetch_stopping) break;
+        const uint32_t layer = g_prefetch_pending_layer;
+        g_prefetch_pending_layer = UINT32_MAX;
+        if (layer >= DS4_PREFETCH_MAX_LAYERS ||
+            !g_prefetch_layers[layer].valid) {
+            continue;
+        }
+        /* Copy under the lock, warm outside it: madvise can block on I/O and
+         * must never stall the decode thread that is recording selections. */
+        ds4_expert_prefetch_layer pl = g_prefetch_layers[layer];
+        pthread_mutex_unlock(&g_prefetch_mu);
+        ds4_gpu_expert_prefetch_warm(&pl);
+        pthread_mutex_lock(&g_prefetch_mu);
+    }
+    pthread_mutex_unlock(&g_prefetch_mu);
+    return NULL;
+}
+
+static void ds4_gpu_expert_prefetch_stop(void) {
+    pthread_mutex_lock(&g_prefetch_mu);
+    if (!g_prefetch_started) { pthread_mutex_unlock(&g_prefetch_mu); return; }
+    g_prefetch_stopping = 1;
+    pthread_cond_broadcast(&g_prefetch_cv);
+    pthread_mutex_unlock(&g_prefetch_mu);
+    pthread_join(g_prefetch_thread, NULL);
+    pthread_mutex_lock(&g_prefetch_mu);
+    g_prefetch_started = 0;
+    g_prefetch_stopping = 0;
+    pthread_mutex_unlock(&g_prefetch_mu);
+}
+
+/* Record what layer `layer` actually routed to, for the next token to warm. */
+static void ds4_gpu_expert_prefetch_record(uint32_t       layer,
+                                           const void    *model_map,
+                                           uint64_t       model_size,
+                                           const int32_t *selected_ids,
+                                           uint32_t       n_selected,
+                                           const uint64_t *gate_off,
+                                           const uint64_t *up_off,
+                                           const uint64_t *down_off,
+                                           uint64_t       gate_bytes,
+                                           uint64_t       down_bytes) {
+    if (!ds4_gpu_expert_prefetch_enabled()) return;
+    if (layer >= DS4_PREFETCH_MAX_LAYERS || !selected_ids || n_selected == 0) return;
+    if (n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED)
+        n_selected = DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED;
+
+    pthread_mutex_lock(&g_prefetch_mu);
+    ds4_expert_prefetch_layer *pl = &g_prefetch_layers[layer];
+    pl->model_map = model_map;
+    pl->model_size = model_size;
+    pl->gate_bytes = gate_bytes;
+    pl->down_bytes = down_bytes;
+    pl->n = n_selected;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        pl->gate_off[i] = gate_off ? gate_off[i] : 0;
+        pl->up_off[i]   = up_off   ? up_off[i]   : 0;
+        pl->down_off[i] = down_off ? down_off[i] : 0;
+    }
+    pl->valid = 1;
+    pthread_mutex_unlock(&g_prefetch_mu);
+}
+
+/* Ask the worker to warm `layer`'s previous-token experts. Non-blocking. */
+void ds4_gpu_stream_expert_prefetch_layer(uint32_t layer) {
+    if (!ds4_gpu_expert_prefetch_enabled()) return;
+    if (layer >= DS4_PREFETCH_MAX_LAYERS) return;
+    pthread_mutex_lock(&g_prefetch_mu);
+    if (!g_prefetch_layers[layer].valid) {
+        pthread_mutex_unlock(&g_prefetch_mu);
+        return;
+    }
+    if (!g_prefetch_started) {
+        if (pthread_create(&g_prefetch_thread, NULL,
+                           ds4_gpu_expert_prefetch_worker, NULL) != 0) {
+            pthread_mutex_unlock(&g_prefetch_mu);
+            return;
+        }
+        g_prefetch_started = 1;
+        atexit(ds4_gpu_expert_prefetch_stop);
+    }
+    /* Single pending slot: if the worker is still busy, drop this request
+     * rather than queueing. Falling behind must never add latency. */
+    g_prefetch_pending_layer = layer;
+    pthread_cond_signal(&g_prefetch_cv);
+    pthread_mutex_unlock(&g_prefetch_mu);
+}
+
+void ds4_gpu_stream_expert_prefetch_stats(uint64_t *issued, uint64_t *bytes) {
+    if (issued) *issued = g_prefetch_issued;
+    if (bytes) *bytes = g_prefetch_bytes;
+}
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -42108,6 +42298,18 @@ int ds4_gpu_routed_moe_one_tensor(
                         return 0;
                     }
                 }
+                /* Remember this layer's actual routing so the next token can
+                 * warm the same experts off the critical path. */
+                ds4_gpu_expert_prefetch_record(layer_index,
+                                               model_map,
+                                               model_size,
+                                               selected_ids,
+                                               n_expert,
+                                               stream_gate_abs_offsets,
+                                               stream_up_abs_offsets,
+                                               stream_down_abs_offsets,
+                                               gate_expert_bytes,
+                                               down_expert_bytes);
                 if (stream_expert_missing_mask != 0 &&
                     !use_stream_expert_split_deferred) {
                     if (!ds4_gpu_stream_expert_cache_load_selected_missing(

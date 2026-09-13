@@ -40741,6 +40741,12 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
+#ifndef DS4_NO_GPU
+    /* Warm the next layer's experts -- the ones it routed to on the previous
+     * token -- while this layer computes. Non-blocking, advisory, and dropped
+     * if the warmer is still busy, so it can never add latency here. */
+    if (g->streaming) ds4_gpu_stream_expert_prefetch_layer(il + 1u);
+#endif
     uint64_t gate_row = 0, down_row = 0;
     if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
         !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
