@@ -13956,9 +13956,40 @@ static void ds4_gpu_stream_expert_slab_push_free_slot(uint32_t slot) {
         slot;
 }
 
+/*
+ * Expert slab wiring mode.
+ *
+ * macOS caps total wired memory at vm.global_user_wire_limit (108.8 GiB on a
+ * 128 GiB machine, shared with every other process). ds4 already wires the
+ * dense weights and context buffers, so mlock on the expert slabs starts
+ * failing partway through warmup -- and the failure path ratchets
+ * mlock_budget_cap down to however many experts happened to be resident at
+ * that instant, permanently, for the life of the process. Measured on an M5
+ * Max: a 7498-expert (69.5 GiB) budget collapsed to 1390 experts (~13 GiB),
+ * so ~half the routed traffic went to SSD and decode became bandwidth-bound.
+ *
+ * Mode 0 skips wiring entirely: the slabs stay pageable, which costs nothing
+ * while they are hot and lets the cache reach its actual budget.
+ * DS4_METAL_STREAMING_EXPERT_MLOCK=0 selects it.
+ */
+static int ds4_gpu_stream_expert_mlock_enabled(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *env = getenv("DS4_METAL_STREAMING_EXPERT_MLOCK");
+        mode = (env && strcmp(env, "0") == 0) ? 0 : 1;
+    }
+    return mode;
+}
+
 static int ds4_gpu_stream_expert_slab_lock_slot(uint32_t slot) {
     if (slot >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES ||
         g_stream_expert_cache_slab_slot_locked[slot]) {
+        return 1;
+    }
+    if (!ds4_gpu_stream_expert_mlock_enabled()) {
+        /* Accounted as held so eviction bookkeeping is unchanged; the pages
+         * are simply pageable and never touch the wire limit. */
+        g_stream_expert_cache_slab_slot_locked[slot] = 1;
         return 1;
     }
     uint32_t slab = UINT32_MAX;
@@ -14010,6 +14041,10 @@ static int ds4_gpu_stream_expert_slab_lock_slot(uint32_t slot) {
 static int ds4_gpu_stream_expert_slab_unlock_slot(uint32_t slot) {
     if (slot >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES ||
         !g_stream_expert_cache_slab_slot_locked[slot]) {
+        return 1;
+    }
+    if (!ds4_gpu_stream_expert_mlock_enabled()) {
+        g_stream_expert_cache_slab_slot_locked[slot] = 0;
         return 1;
     }
     uint32_t slab = UINT32_MAX;
@@ -14451,9 +14486,15 @@ void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes) {
         g_stream_expert_cache_slab_slot_locked[slot] = 0;
     }
 
-    /* The budget cap must follow the bank down, or the allocator will simply
-     * grow the slabs straight back on the next decode miss. */
-    g_stream_expert_cache_mlock_budget_cap = keep_slots;
+    /*
+     * Do NOT lower the cap to keep_slots here. The bank grows lazily, so after
+     * a short prefill only one slab exists and keep_slots is that slab's size;
+     * pinning the cap there strands the cache at ~13 GiB of a 69.5 GiB budget
+     * for the life of the process and makes decode SSD-bandwidth-bound. The
+     * cap was already set to `target` above, which is the decode budget we
+     * actually want; releasing trailing slabs is just returning pages we are
+     * not currently using, and the allocator may grow back up to `target`.
+     */
 
     fprintf(stderr,
             "ds4: streaming expert cache shrunk for decode: slots=%u slabs=%u "
