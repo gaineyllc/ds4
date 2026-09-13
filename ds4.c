@@ -41283,8 +41283,20 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    /*
+     * Queue layers into one command buffer instead of committing and WAITING
+     * on the GPU after every layer. finish_command_buffer does [cb commit]
+     * followed by wait_command_buffer, so a per-layer drain is 40 blocking
+     * round-trips per token -- which is why both the GPU and the SSD sit idle
+     * during decode. The drain was only ever needed for TP ordering; the two
+     * real barriers (layer 13's Engram input, and publishing the token) are
+     * kept below. Single-node queueing is opt-out via
+     * DS4_METAL_DISABLE_V41_DECODE_QUEUE.
+     */
+    const bool queue_layers = !g->imatrix && !layer_resident &&
+        !getenv("DS4_METAL_DISABLE_V41_DECODE_QUEUE") &&
+        (g->tp_world == 2 ?
+            !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE") : true);
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
