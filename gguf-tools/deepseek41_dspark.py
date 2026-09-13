@@ -23,9 +23,20 @@ from deepseek41_quantize import NativeQuantizer, scale_name, write_gguf  # noqa:
 from glm53_manifest import load_index, load_safetensors_header
 from glm53_quantize import (
     QTYPE_F32, QTYPE_F16, QTYPE_BF16, QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K,
-    QTYPE_IQ2_XXS, SourceDB, TensorPlan, align, fail, kv_string, kv_u32,
-    kv_u32_array, print_plan, qtype_nbytes,
+    QTYPE_IQ2_XXS, SourceDB, TensorPlan, align, conversion_signature, fail,
+    kv_string, kv_u32, kv_u32_array, load_resume_state, print_plan,
+    qtype_nbytes, save_resume_state, tensor_header,
 )
+
+QTYPE_MXFP4 = 39
+
+# The shared quantizer tables list every type the GLM and V4.1 recipes emit;
+# MXFP4 is a GGUF type neither of them produces, so register it here rather
+# than fork them. 32 values per 17-byte block: one E8M0 scale, then 16 bytes
+# of nibble pairs.
+import glm53_quantize as _shared
+_shared.QTYPE_LAYOUT.setdefault(QTYPE_MXFP4, (32, 17))
+_shared.QTYPE_NAMES.setdefault(QTYPE_MXFP4, "mxfp4")
 
 SOURCE_URL = "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash"
 ARCH = "deepseek4-dspark"
@@ -35,6 +46,16 @@ ARCH = "deepseek4-dspark"
 # and not requantized -- is the default. The quantized recipes exist for hosts
 # that cannot spare the resident bytes.
 PRECISION = {
+    # The released routed experts are already MXFP4: the same E2M1 value set
+    # (0, .5, 1, 1.5, 2, 3, 4, 6 and negatives) under one E8M0 scale per 32
+    # elements of a row. Storing them as MXFP4 is a repack, not a
+    # quantization -- every weight keeps its exact released value -- and it is
+    # a routed-expert type ds4's Metal MoE kernels already execute. Dense
+    # tensors are FP8 E4M3, which F16 holds exactly.
+    "native": dict(att=QTYPE_F16, shared=QTYPE_F16, exp_gate=QTYPE_MXFP4,
+                   exp_up=QTYPE_MXFP4, exp_down=QTYPE_MXFP4, head=QTYPE_F32,
+                   hcfn=QTYPE_F32,
+                   note="native: MXFP4 experts repacked bit-exact, F16 dense"),
     "bf16": dict(att=QTYPE_BF16, shared=QTYPE_BF16, exp_gate=QTYPE_BF16,
                  exp_up=QTYPE_BF16, exp_down=QTYPE_BF16, head=QTYPE_BF16,
                  hcfn=QTYPE_F32,
@@ -183,7 +204,8 @@ def build_plan(db, c, quant="bf16"):
             plan.append(TensorPlan(f"{dst}.ffn_{part}_exps.weight", (*reversed(shape), experts),
                                    qt,
                                    "experts", source=pattern, expert_layer=stage,
-                                   expert_part=part, expert_count=experts))
+                                   expert_part=part, expert_count=experts,
+                                   transform="mxfp4" if qt == QTYPE_MXFP4 else None))
         if stage == 0:
             regular(f"{dst}.main_proj.weight", f"{src}.main_proj.weight",
                     (dim, dim * len(targets)), qt_of["att"], "dspark_head")
@@ -206,6 +228,128 @@ def build_plan(db, c, quant="bf16"):
         item.nbytes = qtype_nbytes(item.qtype, item.shape)
         offset += align(item.nbytes, GGUF_ALIGNMENT)
     return plan
+
+
+def mxfp4_from_native(np, codes, scales):
+    """Repack one released FP4 expert row-block into ds4's MXFP4 blocks.
+
+    Source: one byte per weight pair, element 2i in the low nibble and 2i+1 in
+    the high nibble, with one E8M0 byte per 32 elements of a row.
+    MXFP4: 17-byte blocks of one E8M0 byte then 16 bytes holding element j in
+    the low nibble and element j+16 in the high nibble. Same value set, same
+    scale encoding, so this only moves nibbles.
+    """
+    rows, packed_cols = codes.shape
+    cols = packed_cols * 2
+    if cols % 32:
+        raise ValueError("expert row is not a whole number of MXFP4 blocks")
+    blocks = cols // 32
+    if scales.shape != (rows, blocks):
+        raise ValueError(f"expected {rows}x{blocks} block scales, found {scales.shape}")
+    if np.any(scales == 255):
+        raise ValueError("nonfinite E8M0 block scale")
+    if np.any(scales == 0):
+        # ds4 reads e == 0 as 2^-126 where the checkpoint means 2^-127. No
+        # released tensor uses it; refuse rather than shift a weight silently.
+        raise ValueError("E8M0 exponent 0 has no exact MXFP4 encoding")
+    nibbles = np.empty((rows, cols), dtype=np.uint8)
+    nibbles[:, 0::2] = codes & 0x0F
+    nibbles[:, 1::2] = codes >> 4
+    nibbles = nibbles.reshape(rows, blocks, 32)
+    out = np.empty((rows, blocks, 17), dtype=np.uint8)
+    out[:, :, 0] = scales
+    out[:, :, 1:] = nibbles[:, :, :16] | (nibbles[:, :, 16:] << 4)
+    return out.reshape(rows, blocks * 17)
+
+
+def read_native_expert(db, np, name):
+    codes = np.frombuffer(db.read(name), dtype=np.uint8)
+    info = db.info(name)
+    if info["dtype"] != "I8":
+        raise ValueError(f"{name}: expected packed FP4 (I8), found {info['dtype']}")
+    codes = codes.reshape(info["shape"])
+    sinfo = db.info(scale_name(name))
+    scales = np.frombuffer(db.read(scale_name(name)), dtype=np.uint8).reshape(sinfo["shape"])
+    return mxfp4_from_native(np, codes, scales)
+
+
+def write_native_gguf(args, plan, records, db):
+    """Same journal and fsync discipline as the backbone writer, with one
+    extra branch: MXFP4 experts are repacked from the release, not encoded."""
+    import concurrent.futures, hashlib, shutil, struct, time
+    quantizer = NativeQuantizer(args.quants_library)
+    np = quantizer.np
+    data_start, data_bytes = print_plan(plan, records, [], GGUF_ALIGNMENT)
+    partial, journal = args.out + ".partial", args.out + ".partial.json"
+    signature = conversion_signature(plan, records, [], None)
+    source_identity = [(name, db.info(name)) for name in sorted(db.tensors)]
+    signature = hashlib.sha256(
+        (signature + json.dumps(source_identity, sort_keys=True)).encode()).hexdigest()
+    if os.path.exists(args.out):
+        raise ValueError(f"refusing to overwrite {args.out}")
+    completed = 0
+    if os.path.exists(partial) or os.path.exists(journal):
+        if not args.resume or not (os.path.exists(partial) and os.path.exists(journal)):
+            raise ValueError("partial file and journal require --resume")
+        completed = load_resume_state(journal, signature, plan)
+    end = data_start + (plan[completed - 1].offset +
+                        align(plan[completed - 1].nbytes, GGUF_ALIGNMENT) if completed else 0)
+    free = shutil.disk_usage(os.path.dirname(os.path.abspath(args.out))).free
+    if free < data_start + data_bytes - end + (8 << 30):
+        raise ValueError("insufficient disk space for remaining output plus 8 GiB reserve")
+    header = b"GGUF" + struct.pack("<IQQ", 3, len(plan), len(records))
+    header += b"".join(records) + b"".join(tensor_header(item) for item in plan)
+    header += bytes(data_start - len(header))
+    if os.path.exists(partial):
+        with open(partial, "rb") as fp:
+            if fp.read(data_start) != header or os.fstat(fp.fileno()).st_size < end:
+                raise ValueError("partial GGUF is truncated or has a different header")
+    else:
+        with open(partial, "xb") as fp:
+            fp.write(header)
+            fp.flush()
+            os.fsync(fp.fileno())
+        save_resume_state(journal, signature, 0)
+    with open(partial, "r+b") as fp, \
+            concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as pool:
+        fp.truncate(end)
+        fp.seek(end)
+        for index in range(completed, len(plan)):
+            item = plan[index]
+            started = time.monotonic()
+            if fp.tell() != data_start + item.offset:
+                raise ValueError(f"incorrect offset for {item.name}")
+            if item.is_expert and item.transform == "mxfp4":
+                def repack(expert):
+                    return read_native_expert(db, np, item.source.format(expert=expert)).tobytes()
+                for first in range(0, item.expert_count, args.threads):
+                    last = min(first + args.threads, item.expert_count)
+                    for future in [pool.submit(repack, e) for e in range(first, last)]:
+                        data = future.result()
+                        if len(data) != item.nbytes // item.expert_count:
+                            raise ValueError(f"{item.name}: wrong repacked expert size")
+                        fp.write(data)
+            elif item.is_expert:
+                for first in range(0, item.expert_count, args.threads):
+                    last = min(first + args.threads, item.expert_count)
+                    futures = [pool.submit(lambda e: quantizer.encode(
+                        quantizer.to_f32(db, item.source.format(expert=e)), item.qtype), e)
+                        for e in range(first, last)]
+                    for future in futures:
+                        fp.write(future.result())
+            else:
+                fp.write(quantizer.encode(quantizer.to_f32(db, item.source), item.qtype))
+            if fp.tell() != data_start + item.offset + item.nbytes:
+                raise ValueError(f"incorrect payload size for {item.name}")
+            fp.write(bytes(align(item.nbytes, GGUF_ALIGNMENT) - item.nbytes))
+            fp.flush()
+            os.fsync(fp.fileno())
+            save_resume_state(journal, signature, index + 1)
+            print(f"[{index + 1}/{len(plan)}] {item.name}: "
+                  f"{item.nbytes / (1 << 30):.3f} GiB, {time.monotonic() - started:.1f}s",
+                  flush=True)
+    os.rename(partial, args.out)
+    os.unlink(journal)
 
 
 def records_for(c, revision, quant):
@@ -243,8 +387,8 @@ def main():
     parser.add_argument("--hf", required=True, help="V4.1 Flash snapshot (mtp shards suffice)")
     parser.add_argument("--out", help="write this DSpark support GGUF")
     parser.add_argument("--source-revision", required=True)
-    parser.add_argument("--quant", choices=PRECISION, default="bf16",
-                        help="drafter precision; bf16 keeps the released weights intact")
+    parser.add_argument("--quant", choices=PRECISION, default="native",
+                        help="drafter precision; native keeps every released weight bit-exact")
     parser.add_argument("--imatrix")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--resume", action="store_true")
@@ -268,6 +412,8 @@ def main():
             print_plan(plan, records, [], GGUF_ALIGNMENT)
             for item in plan:
                 print(f"{item.name}\t{item.shape}\t{item.role}\t{item.nbytes}")
+        elif args.quant == "native":
+            write_native_gguf(args, plan, records, db)
         else:
             write_gguf(args, plan, records, db)
     finally:
