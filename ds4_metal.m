@@ -40740,6 +40740,11 @@ typedef struct {
     uint64_t    down_bytes;
     uint32_t    n;
     uint8_t     valid;
+    /* Enough to rebuild the layer's table and re-issue the same selection as a
+     * real slab load for the next token. */
+    int32_t     ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    uint64_t    base_gate, base_up, base_down;
+    uint32_t    n_total_expert;
 } ds4_expert_prefetch_layer;
 
 static ds4_expert_prefetch_layer g_prefetch_layers[DS4_PREFETCH_MAX_LAYERS];
@@ -40841,8 +40846,11 @@ static void ds4_gpu_expert_prefetch_record(uint32_t       layer,
                                            const uint64_t *up_off,
                                            const uint64_t *down_off,
                                            uint64_t       gate_bytes,
-                                           uint64_t       down_bytes) {
-    if (!ds4_gpu_expert_prefetch_enabled()) return;
+                                           uint64_t       down_bytes,
+                                           uint64_t       base_gate,
+                                           uint64_t       base_up,
+                                           uint64_t       base_down,
+                                           uint32_t       n_total_expert) {
     if (layer >= DS4_PREFETCH_MAX_LAYERS || !selected_ids || n_selected == 0) return;
     if (n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED)
         n_selected = DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED;
@@ -40859,8 +40867,51 @@ static void ds4_gpu_expert_prefetch_record(uint32_t       layer,
         pl->up_off[i]   = up_off   ? up_off[i]   : 0;
         pl->down_off[i] = down_off ? down_off[i] : 0;
     }
+    for (uint32_t i = 0; i < n_selected; i++) {
+        pl->ids[i] = selected_ids[i];
+    }
+    pl->base_gate = base_gate;
+    pl->base_up = base_up;
+    pl->base_down = base_down;
+    pl->n_total_expert = n_total_expert;
     pl->valid = 1;
     pthread_mutex_unlock(&g_prefetch_mu);
+}
+
+/*
+ * Issue a REAL slab load for `layer` using the selection it made on the
+ * previous token. No readback: the ids are already on the host, so this costs
+ * no drain. If routing repeats -- which it largely does, token to token -- the
+ * experts are resident by the time that layer runs and the miss (and the
+ * pipeline stall it would have caused) never happens.
+ *
+ * Must be called only once the current layer has consumed its own pending
+ * load: there is a single pending-load slot and this overwrites it.
+ */
+int ds4_gpu_stream_expert_predicted_begin_load(uint32_t layer) {
+    if (!g_ssd_streaming_mode) return 1;
+    if (getenv("DS4_METAL_DISABLE_V41_PREDICTED_LOAD")) return 1;
+    if (layer >= DS4_PREFETCH_MAX_LAYERS) return 1;
+    pthread_mutex_lock(&g_prefetch_mu);
+    const ds4_expert_prefetch_layer pl = g_prefetch_layers[layer];
+    pthread_mutex_unlock(&g_prefetch_mu);
+    if (!pl.valid || pl.n == 0 || !pl.model_map) return 1;
+    ds4_gpu_stream_expert_table table;
+    memset(&table, 0, sizeof(table));
+    table.model_map = pl.model_map;
+    table.model_size = pl.model_size;
+    table.layer = layer;
+    table.n_total_expert = pl.n_total_expert;
+    table.gate_offset = pl.base_gate;
+    table.up_offset = pl.base_up;
+    table.down_offset = pl.base_down;
+    table.gate_expert_bytes = pl.gate_bytes;
+    table.down_expert_bytes = pl.down_bytes;
+    g_prefetch_issued++;
+    /* seed_selected actually populates slabs (cache_get per expert); the
+     * begin_selected_load variant only records a pending descriptor and moves
+     * no bytes, so it was a no-op here. */
+    return ds4_gpu_stream_expert_cache_seed_selected(&table, pl.ids, pl.n);
 }
 
 /* Ask the worker to warm `layer`'s previous-token experts. Non-blocking. */
@@ -42414,7 +42465,11 @@ int ds4_gpu_routed_moe_one_tensor(
                                                stream_up_abs_offsets,
                                                stream_down_abs_offsets,
                                                gate_expert_bytes,
-                                               down_expert_bytes);
+                                               down_expert_bytes,
+                                               gate_offset,
+                                               up_offset,
+                                               down_offset,
+                                               n_total_expert);
                 if (stream_expert_missing_mask != 0 &&
                     !use_stream_expert_split_deferred) {
                     if (!ds4_gpu_stream_expert_cache_load_selected_missing(

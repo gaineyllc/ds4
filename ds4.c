@@ -40773,6 +40773,11 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
      * Config-dependent: +8% at --ctx 1048576, -13% at --ctx 8192.
      * DS4_METAL_DISABLE_V41_EARLY_EXPERT_LOAD turns it off.
      */
+    /* Config-dependent: +8% at --ctx 1048576 (13.05 vs 12.07 t/s) where the
+     * cache is tight and hiding the load matters, but -13% at --ctx 8192
+     * (10.87 vs 12.31) where the cache is roomier and the extra per-layer
+     * drain dominates. On by default for the large-context case;
+     * DS4_METAL_DISABLE_V41_EARLY_EXPERT_LOAD turns it off. */
     if (g->streaming && !getenv("DS4_METAL_DISABLE_V41_EARLY_EXPERT_LOAD")) {
         const ds4_gpu_stream_expert_table etable =
             graph_stream_expert_table_make(m, l, il,
@@ -40828,6 +40833,17 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
     if (!routed_ok) return false;
+
+#ifndef DS4_NO_GPU
+    /* Predicted preload for the next layer using the experts it selected on the
+     * previous token. Measured a negative (-7% at --ctx 8192), so it is opt-in
+     * only via DS4_METAL_V41_PREDICTED_LOAD; the scaffold is kept because the
+     * per-layer selection recording it relies on is reusable. */
+    if (g->streaming && getenv("DS4_METAL_V41_PREDICTED_LOAD") &&
+        il + 1u < DS4_N_LAYER) {
+        (void)ds4_gpu_stream_expert_predicted_begin_load(il + 1u);
+    }
+#endif
     /* Keep the shared expert's BF16 boundary, then include it exactly once
      * in the existing F32 reduction. Alternate ownership across layers. */
     if (shared_owner && g->tp_rank == (il & 1u) &&
