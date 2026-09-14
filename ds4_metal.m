@@ -13289,13 +13289,28 @@ static int ds4_gpu_stream_expert_readahead_enabled(void) {
  * sides address the same physical pages. A no-copy view over the mapping skips
  * it. The trade is a Metal buffer per miss instead of one reused slab plus a
  * memcpy, which is why this is opt-in until it is measured on a given host. */
+static int g_stream_expert_nocopy_blocked;
+
+/* A no-copy view can only be taken over a mapping the Metal layer has
+ * registered views for, and it tracks one model at a time -- the per-map fd
+ * setter is still a stub. Loading a support model alongside the target
+ * therefore leaves the target's ranges uncovered, so the mode turns itself
+ * off rather than falling back to a read against the wrong descriptor. */
+void ds4_gpu_stream_expert_nocopy_block(void) {
+    g_stream_expert_nocopy_blocked = 1;
+}
+
 static int ds4_gpu_stream_expert_nocopy_enabled(void) {
     static int checked = 0, enabled = 0;
     if (!checked) {
         enabled = getenv("DS4_METAL_STREAM_EXPERT_NOCOPY") != NULL;
         checked = 1;
+        if (enabled) {
+            fprintf(stderr, "ds4: streaming experts stay in the model's own pages "
+                            "(no-copy expert cache)\n");
+        }
     }
-    return enabled;
+    return enabled && !g_stream_expert_nocopy_blocked;
 }
 
 static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len) {
