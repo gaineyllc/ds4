@@ -13280,6 +13280,24 @@ static int ds4_gpu_stream_expert_readahead_enabled(void) {
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
 }
 
+/* Fill a cache entry by pointing the GPU at the model's own pages instead of
+ * copying them into a wired slab.
+ *
+ * Under streaming the expert bytes the loader reads are usually already in the
+ * page cache -- the measured read rate is well above what the device can
+ * deliver -- so the copy is host memory to host memory on a machine where both
+ * sides address the same physical pages. A no-copy view over the mapping skips
+ * it. The trade is a Metal buffer per miss instead of one reused slab plus a
+ * memcpy, which is why this is opt-in until it is measured on a given host. */
+static int ds4_gpu_stream_expert_nocopy_enabled(void) {
+    static int checked = 0, enabled = 0;
+    if (!checked) {
+        enabled = getenv("DS4_METAL_STREAM_EXPERT_NOCOPY") != NULL;
+        checked = 1;
+    }
+    return enabled;
+}
+
 static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len) {
     if (!ds4_gpu_stream_expert_readahead_enabled() || g_model_fd < 0 || len == 0) {
         return;
@@ -14322,7 +14340,10 @@ static uint64_t ds4_gpu_stream_expert_parse_size(const char *s) {
 }
 
 static uint32_t ds4_gpu_stream_expert_decode_slots_for_budget(uint64_t budget) {
-    const uint64_t slot_bytes = g_stream_expert_cache_slab_slot_bytes;
+    const uint64_t slot_bytes =
+        g_stream_expert_cache_slab_slot_bytes != 0 ?
+            g_stream_expert_cache_slab_slot_bytes :
+            g_stream_expert_cache_expert_bytes;
     if (slot_bytes == 0 || budget < slot_bytes) return 0;
     uint64_t slots = budget / slot_bytes;
     if (slots > UINT32_MAX) slots = UINT32_MAX;
@@ -14343,7 +14364,14 @@ static uint32_t ds4_gpu_stream_expert_decode_target_slots(uint64_t dense_bytes,
      * even though decode will happily grow it to the full size. */
     uint32_t cur = ds4_gpu_stream_expert_cache_configured_budget();
     if (cur == 0) cur = g_stream_expert_cache_slab_total_slots;
-    if (cur == 0 || g_stream_expert_cache_slab_slot_bytes == 0) return 0;
+    /* No-copy entries hold no slab, but each one still pins an expert's worth
+     * of the model's pages, so the decode target has to be computed from the
+     * expert size instead of the slot size or the bank grows unbounded. */
+    const uint64_t slot_bytes =
+        g_stream_expert_cache_slab_slot_bytes != 0 ?
+            g_stream_expert_cache_slab_slot_bytes :
+            g_stream_expert_cache_expert_bytes;
+    if (cur == 0 || slot_bytes == 0) return 0;
 
     const char *slots_env = getenv("DS4_STREAM_EXPERT_DECODE_SLOTS");
     if (slots_env && slots_env[0]) {
@@ -14380,8 +14408,7 @@ static uint32_t ds4_gpu_stream_expert_decode_target_slots(uint64_t dense_bytes,
      * file cache coexist and shrinking only loses hits. */
     if (g_stream_model_total_bytes == 0 || g_stream_model_total_bytes <= ram) return 0;
 
-    const uint64_t cur_bytes =
-        (uint64_t)cur * g_stream_expert_cache_slab_slot_bytes;
+    const uint64_t cur_bytes = (uint64_t)cur * slot_bytes;
     if (cur_bytes < DS4_STREAM_EXPERT_DECODE_CLIFF_BYTES) return 0;
 
     const uint64_t reserved = dense_bytes + context_bytes;
@@ -14440,6 +14467,15 @@ void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes) {
      * must not be allowed to grow the bank back past the decode target. */
     g_stream_expert_cache_mlock_budget_cap = target;
     g_stream_expert_cache_decode_shrunk = 1;
+    /* No-copy entries own no slab, so the cap above is the whole mechanism. */
+    if (ds4_gpu_stream_expert_nocopy_enabled()) {
+        fprintf(stderr,
+                "ds4: streaming expert cache capped for decode: %u no-copy entries "
+                "(%.2f GiB of the model's own pages held resident)\n",
+                target,
+                ds4_gpu_gib((uint64_t)target * g_stream_expert_cache_expert_bytes));
+        return;
+    }
 
     /* Round the target down to a whole-slab boundary: keep the leading slabs
      * whose cumulative slot count still fits under `target`. */
@@ -16602,6 +16638,38 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
         return e;
     }
 
+    if (ds4_gpu_stream_expert_nocopy_enabled()) {
+        uint64_t nc_gate_inner = 0, nc_up_inner = 0, nc_down_inner = 0;
+        id<MTLBuffer> nc_gate =
+            ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
+                                                 gate_abs_offset, gate_expert_bytes,
+                                                 &nc_gate_inner);
+        id<MTLBuffer> nc_up =
+            ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
+                                                 up_abs_offset, gate_expert_bytes,
+                                                 &nc_up_inner);
+        id<MTLBuffer> nc_down =
+            ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
+                                                 down_abs_offset, down_expert_bytes,
+                                                 &nc_down_inner);
+        if (!nc_gate || !nc_up || !nc_down) return NULL;
+        return ds4_gpu_stream_expert_cache_install_loaded(model_map,
+                                                          model_size,
+                                                          layer,
+                                                          expert,
+                                                          gate_abs_offset,
+                                                          up_abs_offset,
+                                                          down_abs_offset,
+                                                          gate_expert_bytes,
+                                                          down_expert_bytes,
+                                                          nc_gate,
+                                                          nc_up,
+                                                          nc_down,
+                                                          (NSUInteger)nc_gate_inner,
+                                                          (NSUInteger)nc_up_inner,
+                                                          (NSUInteger)nc_down_inner);
+    }
+
     ds4_gpu_stream_expert_readahead_range(gate_abs_offset, gate_expert_bytes);
     ds4_gpu_stream_expert_readahead_range(up_abs_offset, gate_expert_bytes);
     ds4_gpu_stream_expert_readahead_range(down_abs_offset, down_expert_bytes);
@@ -17051,6 +17119,30 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const int force_reuse =
             cache_budget != 0 && reserved_entries >= cache_budget;
 
+        const int nocopy = ds4_gpu_stream_expert_nocopy_enabled();
+        if (nocopy) {
+            uint64_t gi = 0, ui = 0, di = 0;
+            p->gate_bufs[load_i] =
+                ds4_gpu_wrap_model_exact_range_owned(p->model_map, p->model_size,
+                                                     p->gate_abs_offsets[slot],
+                                                     gate_expert_bytes, &gi);
+            p->up_bufs[load_i] =
+                ds4_gpu_wrap_model_exact_range_owned(p->model_map, p->model_size,
+                                                     p->up_abs_offsets[slot],
+                                                     gate_expert_bytes, &ui);
+            p->down_bufs[load_i] =
+                ds4_gpu_wrap_model_exact_range_owned(p->model_map, p->model_size,
+                                                     p->down_abs_offsets[slot],
+                                                     down_expert_bytes, &di);
+            if (!p->gate_bufs[load_i] || !p->up_bufs[load_i] || !p->down_bufs[load_i]) {
+                ds4_gpu_stream_expert_pending_load_release_buffers(p);
+                return 0;
+            }
+            p->gate_inners[load_i] = (NSUInteger)gi;
+            p->up_inners[load_i] = (NSUInteger)ui;
+            p->down_inners[load_i] = (NSUInteger)di;
+            continue;
+        }
         ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot],
                                               gate_expert_bytes);
         ds4_gpu_stream_expert_readahead_range(p->up_abs_offsets[slot],
