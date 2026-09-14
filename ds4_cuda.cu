@@ -3786,6 +3786,13 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" void ds4_gpu_stream_expert_nocopy_block(void) {}
+extern "C" void ds4_gpu_stream_expert_defer_begin_token(int disabled) { (void)disabled; }
+extern "C" int ds4_gpu_stream_expert_defer_token_missed(void) { return 0; }
+extern "C" void ds4_gpu_stream_expert_defer_stats(uint64_t *t, uint64_t *r) {
+    if (t) *t = 0; if (r) *r = 0;
+}
+extern "C" uint64_t ds4_gpu_stream_expert_defer_layers(void) { return 0; }
+extern "C" int ds4_gpu_stream_expert_defer_in_flight(void) { return 0; }
 
 extern "C" int ds4_gpu_end_commands_async(void) {
     /* CUDA submits into a stream already; the synchronous path is the same. */

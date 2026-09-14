@@ -40280,6 +40280,12 @@ typedef struct {
     ds4_gpu_tensor *dspark_logits;   /* block_size rows of the vocabulary */
     ds4_gpu_tensor *dspark_markov_emb, *dspark_markov_bias;
     ds4_gpu_tensor *dspark_carry_kv[4], *dspark_carry_score[4];
+    /* Rollback copy of the compressor carry for a deferred token. The
+     * DSpark buffers above serve the same purpose for speculation, but
+     * they only exist when a DSpark module is loaded and deferral has to
+     * work without one. */
+    ds4_gpu_tensor *defer_carry_kv[4], *defer_carry_score[4];
+    bool defer_carry_ready;
     /* A verify batch commits several positions at once, so the capture the
      * next proposal needs has to come from inside the batch. Only blocks
      * small enough to be a proposal are captured. */
@@ -40366,6 +40372,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     for (uint32_t i = 0; i < 4; i++) {
         ds4_gpu_tensor_free(g->dspark_carry_kv[i]);
         ds4_gpu_tensor_free(g->dspark_carry_score[i]);
+        ds4_gpu_tensor_free(g->defer_carry_kv[i]);
+        ds4_gpu_tensor_free(g->defer_carry_score[i]);
     }
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
@@ -41875,17 +41883,31 @@ typedef struct {
     bool valid;
 } ds41_verify_state;
 
+static bool ds41_verify_carry_ready(ds41_gpu_graph *g) {
+    if (g->defer_carry_ready) return true;
+    for (uint32_t i = 0; i < 4; i++) {
+        if (!g->defer_carry_kv[i])
+            g->defer_carry_kv[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
+        if (!g->defer_carry_score[i])
+            g->defer_carry_score[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
+        if (!g->defer_carry_kv[i] || !g->defer_carry_score[i]) return false;
+    }
+    g->defer_carry_ready = true;
+    return true;
+}
+
 static bool ds41_verify_snapshot(ds41_gpu_graph *g, ds41_verify_state *st) {
     if (!g || !st) return false;
+    if (!ds41_verify_carry_ready(g)) return false;
     st->pos = g->pos;
     st->history = g->history;
     st->valid = g->valid;
     if (!ds4_gpu_begin_commands()) return false;
     bool ok = true;
     for (uint32_t i = 0; ok && i < 4; i++) {
-        ok = ds4_gpu_tensor_copy(g->dspark_carry_kv[i], 0, g->previous_kv[i], 0,
+        ok = ds4_gpu_tensor_copy(g->defer_carry_kv[i], 0, g->previous_kv[i], 0,
                                  512u * sizeof(float)) &&
-             ds4_gpu_tensor_copy(g->dspark_carry_score[i], 0, g->previous_score[i], 0,
+             ds4_gpu_tensor_copy(g->defer_carry_score[i], 0, g->previous_score[i], 0,
                                  512u * sizeof(float));
     }
     return ds4_gpu_end_commands() && ok;
@@ -41896,12 +41918,13 @@ static bool ds41_verify_rollback(ds41_gpu_graph *g, const ds41_verify_state *st)
     g->pos = st->pos;
     g->history = st->history;
     g->valid = st->valid;
+    if (!g->defer_carry_ready) return false;
     if (!ds4_gpu_begin_commands()) return false;
     bool ok = true;
     for (uint32_t i = 0; ok && i < 4; i++) {
-        ok = ds4_gpu_tensor_copy(g->previous_kv[i], 0, g->dspark_carry_kv[i], 0,
+        ok = ds4_gpu_tensor_copy(g->previous_kv[i], 0, g->defer_carry_kv[i], 0,
                                  512u * sizeof(float)) &&
-             ds4_gpu_tensor_copy(g->previous_score[i], 0, g->dspark_carry_score[i], 0,
+             ds4_gpu_tensor_copy(g->previous_score[i], 0, g->defer_carry_score[i], 0,
                                  512u * sizeof(float));
     }
     return ds4_gpu_end_commands() && ok;
@@ -41969,9 +41992,11 @@ static bool ds41_dspark_propose_from_row(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
-static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
-                                             const ds4_weights *w, int token, float *logits) {
+static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_weights *w, int token, float *logits,
+                                 int defer_disabled) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    ds4_gpu_stream_expert_defer_begin_token(defer_disabled);
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
@@ -42195,6 +42220,29 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->history = next_history;
     g->pos++;
     return true;
+}
+
+/* Decode a token without stopping at every layer to check expert residency,
+ * and fall back to the stopping path only if the GPU reports that some layer
+ * ran short. Nothing is committed before the check: a token that missed is
+ * rolled back and decoded again. */
+static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
+                                             const ds4_weights *w, int token, float *logits) {
+    static int defer = -1;
+    if (defer < 0) defer = getenv("DS4_METAL_V41_DISABLE_DEFER_EXPERT_SYNC") == NULL;
+    if (!defer || !g || !g->streaming || g->imatrix || g->quality || g->tp_world == 2)
+        return ds41_graph_step_once(g, m, w, token, logits, 1);
+
+    ds41_verify_state st;
+    if (!ds41_verify_snapshot(g, &st))
+        return ds41_graph_step_once(g, m, w, token, logits, 1);
+    if (!ds41_graph_step_once(g, m, w, token, logits, 0)) return false;
+    if (!ds4_gpu_stream_expert_defer_token_missed()) return true;
+    if (!ds41_verify_rollback(g, &st)) {
+        g->valid = false;
+        return false;
+    }
+    return ds41_graph_step_once(g, m, w, token, logits, 1);
 }
 
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent

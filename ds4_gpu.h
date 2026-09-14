@@ -186,6 +186,17 @@ int ds4_gpu_end_commands_async(void);
 /* Turn off the no-copy streaming expert cache for this process: it needs the
  * Metal layer's model views, which cover one model at a time. */
 void ds4_gpu_stream_expert_nocopy_block(void);
+
+/* Deferred expert residency: run the per-layer check on the GPU and read the
+ * verdict once at the end of the token instead of stopping at every layer.
+ * begin_token(disabled) resets the slots; token_missed() reports whether any
+ * layer ran without all of its experts resident, in which case the token must
+ * be decoded again with the deferral off. */
+void ds4_gpu_stream_expert_defer_begin_token(int disabled);
+int ds4_gpu_stream_expert_defer_token_missed(void);
+void ds4_gpu_stream_expert_defer_stats(uint64_t *tokens, uint64_t *redos);
+uint64_t ds4_gpu_stream_expert_defer_layers(void);
+int ds4_gpu_stream_expert_defer_in_flight(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
