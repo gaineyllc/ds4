@@ -15289,7 +15289,12 @@ static void ds4_gpu_stream_expert_cache_residency_publish(void) {
         if (g_stream_expert_cache_residency_dirty ||
             [g_stream_expert_cache_residency_retired count] != 0) {
             [g_stream_expert_cache_residency_set commit];
-            [g_stream_expert_cache_residency_set requestResidency];
+            /* Deliberately no requestResidency: attaching the set to the queue
+             * already makes these allocations resident for the command buffers
+             * that use them, whereas requesting residency outright asks the
+             * driver to hold the whole 55 GiB bank down permanently. With a
+             * large KV allocation that is the difference between 18.2 and 8.6
+             * t/s -- the bank wins the memory it should have been sharing. */
             g_stream_expert_cache_residency_dirty = 0;
             [g_stream_expert_cache_residency_retired removeAllObjects];
         }
@@ -15579,6 +15584,62 @@ static uint64_t g_stream_expert_defer_tokens, g_stream_expert_defer_redos;
 static uint64_t g_stream_expert_defer_layers;
 /* Set from the first deferred layer of a token until the token is checked. */
 static int g_stream_expert_defer_in_flight;
+
+/*
+ * What a deferred layer owes the cache afterwards.
+ *
+ * The stopping path fed the cache as a side effect of reading the router:
+ * route hotness, the LRU touch, the pruners, and the prefetcher that warms the
+ * next token's experts all take the six ids. A deferred layer reads nothing, so
+ * left alone it starves every one of them -- worth nothing at short context,
+ * where the whole working set is resident, and worth about 9% of decode at 65k,
+ * where it is not. The ids exist on the GPU either way, so each deferred layer
+ * records where to find them and the token replays all forty at the end, after
+ * the work is already done. One readback per token instead of forty, and off
+ * the critical path rather than in the middle of it.
+ */
+typedef struct {
+    __unsafe_unretained id<MTLBuffer> selected_buf;
+    NSUInteger  selected_off;
+    const void *model_map;
+    uint64_t    model_size;
+    uint64_t    gate_offset, up_offset, down_offset;
+    uint64_t    gate_expert_bytes, down_expert_bytes;
+    uint32_t    n_total_expert, n_expert;
+    int         valid;
+} ds4_gpu_stream_expert_defer_note;
+
+static ds4_gpu_stream_expert_defer_note
+    g_stream_expert_defer_notes[DS4_METAL_DEFER_MAX_LAYER];
+
+static void ds4_gpu_stream_expert_defer_note_layer(
+        uint32_t layer,
+        id<MTLBuffer> selected_buf,
+        NSUInteger selected_off,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t n_total_expert,
+        uint32_t n_expert) {
+    if (layer >= DS4_METAL_DEFER_MAX_LAYER) return;
+    ds4_gpu_stream_expert_defer_note *n = &g_stream_expert_defer_notes[layer];
+    n->selected_buf = selected_buf;
+    n->selected_off = selected_off;
+    n->model_map = model_map;
+    n->model_size = model_size;
+    n->gate_offset = gate_offset;
+    n->up_offset = up_offset;
+    n->down_offset = down_offset;
+    n->gate_expert_bytes = gate_expert_bytes;
+    n->down_expert_bytes = down_expert_bytes;
+    n->n_total_expert = n_total_expert;
+    n->n_expert = n_expert;
+    n->valid = 1;
+}
 /* A token commits to one mode at its first routed layer and keeps it. Mixing
  * the two within a token would put a stopping layer -- which needs to evict --
  * inside the window where a deferred layer's experts must not be freed. */
@@ -15629,11 +15690,115 @@ void ds4_gpu_stream_expert_defer_begin_token(int disabled) {
 }
 
 /* 1 when some layer of the token ran without all of its experts resident. */
+static void ds4_gpu_stream_expert_cache_prune_layer(uint32_t layer,
+                                                   uint32_t n_total_expert,
+                                                   uint32_t n_selected,
+                                                   const int32_t *protect_ids,
+                                                   uint32_t n_protect);
+static void ds4_gpu_stream_expert_cache_prune_global(uint32_t protect_layer,
+                                                     const int32_t *protect_ids,
+                                                     uint32_t n_protect);
+static void ds4_gpu_expert_prefetch_record(uint32_t       layer,
+                                           const void    *model_map,
+                                           uint64_t       model_size,
+                                           const int32_t *selected_ids,
+                                           uint32_t       n_selected,
+                                           const uint64_t *gate_off,
+                                           const uint64_t *up_off,
+                                           const uint64_t *down_off,
+                                           uint64_t       gate_bytes,
+                                           uint64_t       down_bytes,
+                                           uint64_t       base_gate,
+                                           uint64_t       base_up,
+                                           uint64_t       base_down,
+                                           uint32_t       n_total_expert);
+
+/* Hand the token's routing to the cache now that its work has finished. */
+static void ds4_gpu_stream_expert_defer_replay_routing(void) {
+    int32_t ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    uint64_t gate_abs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    uint64_t up_abs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    uint64_t down_abs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    int pruned_globally = 0;
+    /*
+     * Hotness and the prefetcher are replayed; pruning is not, by measurement.
+     * Nothing here needs the pruners for safety -- installs already stop at the
+     * budget by reusing a slot -- and running them cost more than they returned
+     * (3.34 t/s against 3.83 at 65k), because they shrink a bank that is doing
+     * useful work and then the experts they dropped have to be found again.
+     */
+    static int replay_prune = -1;
+    if (replay_prune < 0)
+        replay_prune = getenv("DS4_METAL_V41_DEFER_REPLAY_PRUNE") != NULL;
+
+    for (uint32_t layer = 0; layer < g_stream_expert_defer_used &&
+                             layer < DS4_METAL_DEFER_MAX_LAYER; layer++) {
+        ds4_gpu_stream_expert_defer_note *n = &g_stream_expert_defer_notes[layer];
+        if (!n->valid) continue;
+        n->valid = 0;
+        uint32_t n_expert = n->n_expert;
+        if (n_expert == 0 ||
+            n_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ||
+            !n->selected_buf) {
+            continue;
+        }
+        /* The command buffer that wrote these ids has completed, so this is a
+         * read out of shared memory, not a synchronisation point. */
+        const uint8_t *base = (const uint8_t *)[n->selected_buf contents];
+        if (!base) continue;
+        memcpy(ids, base + n->selected_off, (size_t)n_expert * sizeof(ids[0]));
+
+        int usable = 1;
+        for (uint32_t i = 0; i < n_expert; i++) {
+            if (ids[i] < 0 || (uint32_t)ids[i] >= n->n_total_expert) {
+                usable = 0;
+                break;
+            }
+            const uint64_t gate_rel = (uint64_t)ids[i] * n->gate_expert_bytes;
+            const uint64_t down_rel = (uint64_t)ids[i] * n->down_expert_bytes;
+            gate_abs[i] = n->gate_offset + gate_rel;
+            up_abs[i] = n->up_offset + gate_rel;
+            down_abs[i] = n->down_offset + down_rel;
+        }
+        if (!usable) continue;
+
+        ds4_gpu_stream_expert_cache_note_selected_hotness(layer, ids, n_expert);
+        ds4_gpu_expert_prefetch_record(layer,
+                                       n->model_map,
+                                       n->model_size,
+                                       ids,
+                                       n_expert,
+                                       gate_abs,
+                                       up_abs,
+                                       down_abs,
+                                       n->gate_expert_bytes,
+                                       n->down_expert_bytes,
+                                       n->gate_offset,
+                                       n->up_offset,
+                                       n->down_offset,
+                                       n->n_total_expert);
+        if (replay_prune) {
+            ds4_gpu_stream_expert_cache_prune_layer(layer,
+                                                    n->n_total_expert,
+                                                    n_expert,
+                                                    ids,
+                                                    n_expert);
+            if (!pruned_globally) {
+                /* The global pruner walks the whole table, so it would run once
+                 * for the token rather than once per layer. */
+                ds4_gpu_stream_expert_cache_prune_global(layer, ids, n_expert);
+                pruned_globally = 1;
+            }
+        }
+    }
+}
+
 int ds4_gpu_stream_expert_defer_token_missed(void) {
     /* The token has been waited on by the caller before we get here, so no
      * kernel is still reading the bank: reopen it for eviction. */
     g_stream_expert_defer_in_flight = 0;
     g_stream_expert_defer_token_mode = 0;
+    ds4_gpu_stream_expert_defer_replay_routing();
     for (uint32_t i = 0; i < g_stream_expert_defer_used &&
                          i < DS4_METAL_DEFER_MAX_LAYER; i++) {
         id<MTLBuffer> b = g_stream_expert_defer_status[i];
@@ -42781,6 +42946,19 @@ int ds4_gpu_routed_moe_one_tensor(
                  * and a missing expert sends this token down the redo path. */
                 use_stream_expert_addr_table = true;
                 g_stream_expert_defer_dispatch = 1;
+                /* Replayed at the end of the token; see the note type. */
+                ds4_gpu_stream_expert_defer_note_layer(layer_index,
+                                                       selectedbuf,
+                                                       ds4_gpu_tensor_offset(selected),
+                                                       model_map,
+                                                       model_size,
+                                                       gate_offset,
+                                                       up_offset,
+                                                       down_offset,
+                                                       gate_expert_bytes,
+                                                       down_expert_bytes,
+                                                       n_total_expert,
+                                                       n_expert);
             } else if (use_iq2_full_expert_addr_table) {
                 selected_id_source = "gpu-full-addr";
                 selected_ids_available = false;
