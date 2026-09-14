@@ -42031,6 +42031,7 @@ static bool ds41_dspark_propose_from_row(ds41_gpu_graph *g, const ds4_model *m,
  * with pread at the head of every token, 24 scattered rows per table -- work
  * that no profile counter covered. */
 static int g_engram_decode_profile = -1;
+static int g_engram_decode_serial;
 static double g_engram_decode_ms;
 static uint64_t g_engram_decode_reads, g_engram_decode_tokens;
 
@@ -42044,19 +42045,61 @@ static void ds41_engram_decode_report(void) {
             g_engram_decode_ms / (double)g_engram_decode_tokens);
 }
 
+/*
+ * Read the second Engram table off the critical path.
+ *
+ * Layer 1 needs rows[0] almost immediately, but layer 14 does not need rows[1]
+ * until thirteen layers of GPU work have gone by -- and the read is pure device
+ * latency, 24 scattered 264-byte rows out of a 94 GiB file. Doing both up front
+ * cost 5.5 ms at the head of every token; the second one now runs underneath
+ * the layers that do not need it and is joined just before layer 14 binds it.
+ */
+typedef struct {
+    pthread_t thread;
+    const ds4_engram_table *table;
+    const uint32_t *ids;
+    float *out;
+    bool active, ok;
+} ds41_engram_decode_bg;
+
+static void *ds41_engram_decode_bg_read(void *arg) {
+    ds41_engram_decode_bg *b = arg;
+    b->ok = ds4_engram_read(b->table, b->ids, DS4_ENGRAM_COLS, b->out);
+    return NULL;
+}
+
+static bool ds41_engram_decode_bg_join(ds41_engram_decode_bg *b) {
+    if (!b->active) return true;
+    if (pthread_join(b->thread, NULL)) ds4_die("cannot join V4.1 Engram decode reader safely");
+    b->active = false;
+    return b->ok;
+}
+
 static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_weights *w, int token, float *logits,
                                  int defer_disabled) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     if (g_engram_decode_profile < 0) {
         g_engram_decode_profile = getenv("DS4_ENGRAM_DECODE_PROFILE") != NULL;
+        g_engram_decode_serial = getenv("DS4_ENGRAM_DECODE_SERIAL") != NULL;
         if (g_engram_decode_profile) atexit(ds41_engram_decode_report);
     }
     ds4_gpu_stream_expert_defer_begin_token(defer_disabled);
     uint32_t ids[2][DS4_ENGRAM_COLS];
+    ds41_engram_decode_bg engram_bg = {0};
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
     for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
+        if (i == 1 && !g_engram_decode_serial) {
+            engram_bg = (ds41_engram_decode_bg){
+                .table = &g->table[1], .ids = ids[1], .out = g->rows[1], .ok = true };
+            if (pthread_create(&engram_bg.thread, NULL,
+                               ds41_engram_decode_bg_read, &engram_bg) == 0) {
+                engram_bg.active = true;
+                continue;
+            }
+            /* Thread creation failed: fall through and read it here. */
+        }
         const double t_eg0 = g_engram_decode_profile ? now_sec() : 0.0;
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
         if (g_engram_decode_profile) {
@@ -42160,7 +42203,15 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
-            ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            const double t_eg1 = (i == 1 && g_engram_decode_profile) ? now_sec() : 0.0;
+            if (i == 1 && !ds41_engram_decode_bg_join(&engram_bg)) ok = false;
+            if (i == 1 && g_engram_decode_profile) {
+                /* Whatever is left here is the part the layers did not cover. */
+                g_engram_decode_ms += (now_sec() - t_eg1) * 1000.0;
+                g_engram_decode_reads++;
+            }
+            if (ok)
+                ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
         /* The drafter reads the attention input of its target layers. V4.1's
          * Engram layers are 1 and 14, so nothing it adds to the residual can
@@ -42190,6 +42241,9 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
+    /* Nothing below reads rows[1], but the thread must not outlive this frame:
+     * its ids and destination are this call's own storage. */
+    if (!ds41_engram_decode_bg_join(&engram_bg)) ok = false;
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (ok && g->dspark_ready && g->dspark_capture_valid) {
         if (!ds4_gpu_begin_commands() ||
