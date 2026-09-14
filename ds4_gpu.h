@@ -182,6 +182,10 @@ int ds4_gpu_end_commands(void);
  * the CPU encodes the next one. The caller must still drain before reading a
  * result back or overwriting a host buffer the GPU may still be reading. */
 int ds4_gpu_end_commands_async(void);
+
+/* Turn off the no-copy streaming expert cache for this process: it needs the
+ * Metal layer's model views, which cover one model at a time. */
+void ds4_gpu_stream_expert_nocopy_block(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
