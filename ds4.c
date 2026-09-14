@@ -42056,6 +42056,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         !getenv("DS4_METAL_DISABLE_V41_DECODE_QUEUE") &&
         (g->tp_world == 2 ?
             !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE") : true);
+    /* Queueing layers into one buffer removes sync points but leaves the two
+     * sides taking turns: the GPU waits out the encoding, then the CPU waits
+     * out the execution. Committing each layer without waiting keeps both
+     * busy -- buffers on one queue still run in order, so only a host read,
+     * or a host write to a buffer the GPU may still be reading, has to
+     * drain. */
+    const bool overlap = queue_layers && g->tp_world != 2 &&
+        !getenv("DS4_METAL_DISABLE_V41_DECODE_OVERLAP");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -42078,8 +42086,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
-        if (drain && !ds4_gpu_end_commands()) ok = false;
+        const bool drain = !queue_layers || overlap ||
+            il == 13 || il + 1u == DS4_N_LAYER;
+        const bool blocking = !overlap || il == 13 || il + 1u == DS4_N_LAYER;
+        if (drain &&
+            !(blocking ? ds4_gpu_end_commands() : ds4_gpu_end_commands_async()))
+            ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,

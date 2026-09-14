@@ -176,6 +176,12 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+
+/* Commit the current batch without waiting for it. Buffers submitted to one
+ * queue execute in submission order, so a layer may be handed to the GPU while
+ * the CPU encodes the next one. The caller must still drain before reading a
+ * result back or overwriting a host buffer the GPU may still be reading. */
+int ds4_gpu_end_commands_async(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
