@@ -3792,6 +3792,7 @@ extern "C" void ds4_gpu_stream_expert_defer_stats(uint64_t *t, uint64_t *r) {
     if (t) *t = 0; if (r) *r = 0;
 }
 extern "C" uint64_t ds4_gpu_stream_expert_defer_layers(void) { return 0; }
+extern "C" uint64_t ds4_gpu_stream_expert_defer_backed_off(void) { return 0; }
 extern "C" int ds4_gpu_stream_expert_defer_in_flight(void) { return 0; }
 
 extern "C" int ds4_gpu_end_commands_async(void) {

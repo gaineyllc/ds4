@@ -196,6 +196,7 @@ void ds4_gpu_stream_expert_defer_begin_token(int disabled);
 int ds4_gpu_stream_expert_defer_token_missed(void);
 void ds4_gpu_stream_expert_defer_stats(uint64_t *tokens, uint64_t *redos);
 uint64_t ds4_gpu_stream_expert_defer_layers(void);
+uint64_t ds4_gpu_stream_expert_defer_backed_off(void);
 int ds4_gpu_stream_expert_defer_in_flight(void);
 int ds4_gpu_synchronize(void);
 

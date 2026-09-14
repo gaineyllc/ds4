@@ -4469,10 +4469,11 @@ void ds4_gpu_print_memory_report(const char *label) {
             const uint64_t defer_layers = ds4_gpu_stream_expert_defer_layers();
             if (defer_layers != 0) {
                 fprintf(stderr,
-                        "ds4:   deferred expert residency: layers=%llu tokens=%llu redos=%llu\n",
+                        "ds4:   deferred expert residency: layers=%llu tokens=%llu redos=%llu backed_off=%llu\n",
                         (unsigned long long)defer_layers,
                         (unsigned long long)defer_tokens,
-                        (unsigned long long)defer_redos);
+                        (unsigned long long)defer_redos,
+                        (unsigned long long)ds4_gpu_stream_expert_defer_backed_off());
             }
         }
         if (g_stream_expert_cache_mlock_bytes != 0 ||
@@ -9559,6 +9560,20 @@ int ds4_gpu_begin_commands(void) {
  * reads, and the cache needs free slots to admit the next layer's experts. */
 #define DS4_GPU_MAX_ASYNC_BATCHES 8
 
+/* How many layer command buffers may be in flight at once. Each one keeps the
+ * memory it references resident, so a deeper queue costs peak footprint --
+ * which only matters once the KV cache is large enough to compete for it. */
+static NSUInteger ds4_gpu_max_async_batches(void) {
+    static long cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_METAL_MAX_ASYNC_BATCHES");
+        char *end = NULL;
+        cached = env ? strtol(env, &end, 10) : DS4_GPU_MAX_ASYNC_BATCHES;
+        if (!env || end == env || cached < 1) cached = DS4_GPU_MAX_ASYNC_BATCHES;
+    }
+    return (NSUInteger)cached;
+}
+
 int ds4_gpu_end_commands_async(void) {
     if (!g_batch_cb) {
         ds4_gpu_parallel_ffn_reset_state(YES);
@@ -9573,7 +9588,7 @@ int ds4_gpu_end_commands_async(void) {
     [cb commit];
     [g_pending_cbs addObject:cb];
     g_async_batches++;
-    if ([g_pending_cbs count] > DS4_GPU_MAX_ASYNC_BATCHES) {
+    if ([g_pending_cbs count] > ds4_gpu_max_async_batches()) {
         g_async_drains++;
         return ds4_gpu_wait_pending_command_buffers("decode overlap");
     }
@@ -15578,10 +15593,10 @@ static int ds4_gpu_stream_full_expert_addr_table_prepare(
  * ========================================================================= */
 #define DS4_METAL_DEFER_MAX_LAYER 64
 static int g_stream_expert_defer_disabled_for_token;
-static id<MTLBuffer> g_stream_expert_defer_status[DS4_METAL_DEFER_MAX_LAYER];
 static uint32_t g_stream_expert_defer_used;
 static uint64_t g_stream_expert_defer_tokens, g_stream_expert_defer_redos;
 static uint64_t g_stream_expert_defer_layers;
+static uint32_t g_stream_expert_defer_layers_this_token;
 /* Set from the first deferred layer of a token until the token is checked. */
 static int g_stream_expert_defer_in_flight;
 
@@ -15611,6 +15626,22 @@ typedef struct {
 
 static ds4_gpu_stream_expert_defer_note
     g_stream_expert_defer_notes[DS4_METAL_DEFER_MAX_LAYER];
+
+/* One word per token, raised by the address kernels when they meet an expert
+ * whose address is zero. Always bound, so the kernels need no variant. */
+static id<MTLBuffer> g_stream_expert_miss_buffer;
+
+static id<MTLBuffer> ds4_gpu_stream_expert_miss_flag(void) {
+    if (g_stream_expert_miss_buffer) return g_stream_expert_miss_buffer;
+    if (!g_device) return nil;
+    id<MTLBuffer> b = [g_device newBufferWithLength:sizeof(uint32_t)
+                                            options:MTLResourceStorageModeShared];
+    if (!b) return nil;
+    b.label = @"ds4_stream_expert_miss";
+    *(uint32_t *)[b contents] = 0;
+    g_stream_expert_miss_buffer = b;
+    return b;
+}
 
 static void ds4_gpu_stream_expert_defer_note_layer(
         uint32_t layer,
@@ -15649,42 +15680,76 @@ int ds4_gpu_stream_expert_defer_in_flight(void) {
     return g_stream_expert_defer_in_flight;
 }
 
+/*
+ * Deferral is a bet that every expert the token routes to is already in the
+ * cache, and a lost bet costs a whole wasted decode. Whether it pays is not a
+ * property of the engine but of how much cache is left over: with a short
+ * context the bank holds the working set and the bet always wins, while at 65k
+ * the KV takes enough room that it always loses -- 39 redos in 39 tokens, which
+ * turned a 25% gain into a 35% loss.
+ *
+ * So rather than guess a context threshold, the bet is simply stopped when it
+ * starts losing and retried occasionally in case conditions changed. A run that
+ * never misses never backs off; one that misses settles into the stopping path
+ * with a rare probe.
+ */
+#define DS4_METAL_DEFER_BACKOFF_MIN 8u
+#define DS4_METAL_DEFER_BACKOFF_MAX 4096u
+#define DS4_METAL_DEFER_BACKOFF_FORGIVE 256u
+static uint32_t g_stream_expert_defer_cooldown;
+static uint32_t g_stream_expert_defer_backoff;
+static uint32_t g_stream_expert_defer_streak;
+static uint64_t g_stream_expert_defer_skipped;
+
 static int ds4_gpu_stream_expert_defer_enabled(void) {
     static int checked = 0, enabled = 0;
     if (!checked) {
         enabled = getenv("DS4_METAL_V41_DISABLE_DEFER_EXPERT_SYNC") == NULL;
         checked = 1;
     }
-    return enabled && !g_stream_expert_defer_disabled_for_token;
+    return enabled &&
+           !g_stream_expert_defer_disabled_for_token &&
+           g_stream_expert_defer_cooldown == 0;
 }
 
-static id<MTLBuffer> ds4_gpu_stream_expert_defer_slot(uint32_t layer) {
-    if (!g_device || layer >= DS4_METAL_DEFER_MAX_LAYER) return nil;
-    if (g_stream_expert_defer_status[layer]) return g_stream_expert_defer_status[layer];
-    const NSUInteger bytes =
-        (NSUInteger)DS4_METAL_STREAM_EXPERT_VALIDATE_WORDS * sizeof(uint32_t);
-    id<MTLBuffer> b = [g_device newBufferWithLength:bytes
-                                            options:MTLResourceStorageModeShared];
-    if (!b) return nil;
-    b.label = @"ds4_stream_expert_defer_status";
-    memset([b contents], 0, bytes);
-    g_stream_expert_defer_status[layer] = b;
-    return b;
+static void ds4_gpu_stream_expert_defer_note_outcome(int missed) {
+    if (missed) {
+        g_stream_expert_defer_streak = 0;
+        g_stream_expert_defer_backoff =
+            g_stream_expert_defer_backoff == 0
+                ? DS4_METAL_DEFER_BACKOFF_MIN
+                : (g_stream_expert_defer_backoff > DS4_METAL_DEFER_BACKOFF_MAX / 2u
+                       ? DS4_METAL_DEFER_BACKOFF_MAX
+                       : g_stream_expert_defer_backoff * 2u);
+        g_stream_expert_defer_cooldown = g_stream_expert_defer_backoff;
+        return;
+    }
+    /* A long clean run means the pressure that caused the misses has passed. */
+    if (++g_stream_expert_defer_streak >= DS4_METAL_DEFER_BACKOFF_FORGIVE) {
+        g_stream_expert_defer_streak = 0;
+        g_stream_expert_defer_backoff = 0;
+    }
 }
 
 void ds4_gpu_stream_expert_defer_begin_token(int disabled) {
     g_stream_expert_defer_disabled_for_token = disabled ? 1 : 0;
     g_stream_expert_defer_in_flight = 0;
     g_stream_expert_defer_token_mode = disabled ? 2 : 0;
+    /* Cleared for every token, deferred or not: a stale flag left over from an
+     * earlier token would send this one down the rollback path for nothing. */
+    g_stream_expert_defer_layers_this_token = 0;
+    {
+        id<MTLBuffer> miss = ds4_gpu_stream_expert_miss_flag();
+        if (miss) *(uint32_t *)[miss contents] = 0;
+    }
+    if (!disabled && g_stream_expert_defer_cooldown != 0) {
+        g_stream_expert_defer_cooldown--;
+        g_stream_expert_defer_skipped++;
+        g_stream_expert_defer_token_mode = 2;
+        return;
+    }
     if (disabled) return;
     g_stream_expert_cache_residency_published_this_token = 0;
-    const NSUInteger bytes =
-        (NSUInteger)DS4_METAL_STREAM_EXPERT_VALIDATE_WORDS * sizeof(uint32_t);
-    for (uint32_t i = 0; i < g_stream_expert_defer_used &&
-                         i < DS4_METAL_DEFER_MAX_LAYER; i++) {
-        if (g_stream_expert_defer_status[i])
-            memset([g_stream_expert_defer_status[i] contents], 0, bytes);
-    }
     g_stream_expert_defer_used = 0;
     g_stream_expert_defer_tokens++;
 }
@@ -15799,17 +15864,16 @@ int ds4_gpu_stream_expert_defer_token_missed(void) {
     g_stream_expert_defer_in_flight = 0;
     g_stream_expert_defer_token_mode = 0;
     ds4_gpu_stream_expert_defer_replay_routing();
-    for (uint32_t i = 0; i < g_stream_expert_defer_used &&
-                         i < DS4_METAL_DEFER_MAX_LAYER; i++) {
-        id<MTLBuffer> b = g_stream_expert_defer_status[i];
-        if (!b) continue;
-        const uint32_t *w = (const uint32_t *)[b contents];
-        /* Word 3 is the expert count the validator saw; zero means the layer
-         * never ran it, which is a miss as far as this token is concerned. */
-        if (w[3] == 0 || w[0] != 1u) {
-            g_stream_expert_defer_redos++;
-            return 1;
-        }
+    /* A token that never deferred has nothing to redo, whatever the address
+     * kernels saw: it stopped and loaded at every layer like it always did. */
+    if (g_stream_expert_defer_layers_this_token == 0) return 0;
+    g_stream_expert_defer_layers_this_token = 0;
+    id<MTLBuffer> miss = g_stream_expert_miss_buffer;
+    const int missed = miss && *(const uint32_t *)[miss contents] != 0;
+    ds4_gpu_stream_expert_defer_note_outcome(missed);
+    if (missed) {
+        g_stream_expert_defer_redos++;
+        return 1;
     }
     return 0;
 }
@@ -15821,6 +15885,10 @@ void ds4_gpu_stream_expert_defer_stats(uint64_t *tokens, uint64_t *redos) {
 
 uint64_t ds4_gpu_stream_expert_defer_layers(void) {
     return g_stream_expert_defer_layers;
+}
+
+uint64_t ds4_gpu_stream_expert_defer_backed_off(void) {
+    return g_stream_expert_defer_skipped;
 }
 
 static id<MTLBuffer> ds4_gpu_stream_expert_validate_status_buffer(void) {
@@ -15870,41 +15938,6 @@ static int ds4_gpu_encode_stream_expert_cache_validate(
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
-    return 1;
-}
-
-/* Record this layer's residency on the GPU and keep encoding. */
-static int ds4_gpu_stream_expert_cache_validate_deferred(
-        const ds4_gpu_tensor *selected,
-        id<MTLBuffer> gate_addrs,
-        id<MTLBuffer> up_addrs,
-        id<MTLBuffer> down_addrs,
-        uint32_t n_total_expert,
-        uint32_t n_expert,
-        uint32_t layer) {
-    id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
-    id<MTLBuffer> status = ds4_gpu_stream_expert_defer_slot(layer);
-    if (!selectedbuf || !status || !g_batch_cb) return 0;
-    ds4_gpu_stream_expert_validate_args args = {
-        .n_total_expert = n_total_expert,
-        .n_expert = n_expert,
-    };
-    if (!ds4_gpu_encode_stream_expert_cache_validate(g_batch_cb,
-                                                     &args,
-                                                     selectedbuf,
-                                                     ds4_gpu_tensor_offset(selected),
-                                                     gate_addrs,
-                                                     up_addrs,
-                                                     down_addrs,
-                                                     status)) {
-        return 0;
-    }
-    g_batch_has_work = YES;
-    if (layer + 1u > g_stream_expert_defer_used) {
-        g_stream_expert_defer_used = layer + 1u;
-    }
-    g_stream_expert_defer_in_flight = 1;
-    g_stream_expert_defer_layers++;
     return 1;
 }
 
@@ -33671,6 +33704,7 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
     [enc setBuffer:dst_mid    offset:dst_mid_off atIndex:7];
     [enc setBuffer:ids        offset:ids_off     atIndex:8];
     [enc setBuffer:weights    offset:weights_off atIndex:9];
+    [enc setBuffer:ds4_gpu_stream_expert_miss_flag() offset:0 atIndex:10];
     for (uint32_t i = 0; i < n_entries; i++) {
         [enc useResource:entries[i]->gate_buffer usage:MTLResourceUsageRead];
         [enc useResource:entries[i]->up_buffer usage:MTLResourceUsageRead];
@@ -33798,6 +33832,7 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
     [enc setBuffer:src1  offset:src1_off atIndex:2];
     [enc setBuffer:dst   offset:dst_off  atIndex:3];
     [enc setBuffer:ids   offset:ids_off  atIndex:4];
+    [enc setBuffer:ds4_gpu_stream_expert_miss_flag() offset:0 atIndex:5];
     for (uint32_t i = 0; i < n_entries; i++) {
         [enc useResource:entries[i]->down_buffer usage:MTLResourceUsageRead];
     }
@@ -42891,7 +42926,7 @@ int ds4_gpu_routed_moe_one_tensor(
                 n_expert <= 6u &&
                 g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
                 g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil &&
-                g_moe_stream_expert_cache_validate_pipeline != nil &&
+                ds4_gpu_stream_expert_miss_flag() != nil &&
                 g_stream_expert_defer_token_mode != 2 &&
                 ds4_gpu_stream_expert_cache_addr_buffers(layer_index,
                                                          &stream_gate_addr_buf,
@@ -42931,21 +42966,18 @@ int ds4_gpu_routed_moe_one_tensor(
                 selected_ids_available = false;
                 selected_exec_ids_from_host = false;
                 g_routed_moe_selected_override_n = 0;
-                if (!ds4_gpu_stream_expert_cache_validate_deferred(selected,
-                                                                   stream_gate_addr_buf,
-                                                                   stream_up_addr_buf,
-                                                                   stream_down_addr_buf,
-                                                                   n_total_expert,
-                                                                   n_expert,
-                                                                   layer_index)) {
-                    return 0;
-                }
                 /* The masked/split variants are decided inside the block below,
                  * which deferral skips, so they stay off and the plain address
                  * kernel runs. They only ever engage when an expert is missing,
                  * and a missing expert sends this token down the redo path. */
                 use_stream_expert_addr_table = true;
                 g_stream_expert_defer_dispatch = 1;
+                g_stream_expert_defer_in_flight = 1;
+                g_stream_expert_defer_layers++;
+                g_stream_expert_defer_layers_this_token++;
+                if (layer_index + 1u > g_stream_expert_defer_used) {
+                    g_stream_expert_defer_used = layer_index + 1u;
+                }
                 /* Replayed at the end of the token; see the note type. */
                 ds4_gpu_stream_expert_defer_note_layer(layer_index,
                                                        selectedbuf,
