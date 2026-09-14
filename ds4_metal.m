@@ -376,6 +376,7 @@ static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, c
 
 static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder);
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
+static uint64_t g_async_batches, g_async_drains;
 static id<MTLSharedEvent> g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
 static id<MTLComputePipelineState> g_set_rows_f32_i32_pipeline;
@@ -1580,6 +1581,9 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
         ds4_gpu_invalidate_zero_prefix_prefill_block_maps();
     }
     if (getenv("DS4_METAL_CB_TIMES")) {
+        fprintf(stderr, "ds4: async batches=%llu depth-drains=%llu\n",
+                (unsigned long long)g_async_batches,
+                (unsigned long long)g_async_drains);
         const double t_done = ds4_gpu_now_ms();
         struct timespec ts_mono;
         clock_gettime(CLOCK_MONOTONIC, &ts_mono);
@@ -9503,6 +9507,31 @@ int ds4_gpu_begin_commands(void) {
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
     ds4_gpu_timeline_attach(g_batch_cb);
     return g_batch_cb != nil;
+}
+
+/* Depth is bounded: every in-flight buffer pins the streaming expert slabs it
+ * reads, and the cache needs free slots to admit the next layer's experts. */
+#define DS4_GPU_MAX_ASYNC_BATCHES 8
+
+int ds4_gpu_end_commands_async(void) {
+    if (!g_batch_cb) {
+        ds4_gpu_parallel_ffn_reset_state(YES);
+        return 0;
+    }
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    ds4_gpu_close_batch_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    ds4_gpu_stream_expert_cache_note_batch_committed();
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+    g_async_batches++;
+    if ([g_pending_cbs count] > DS4_GPU_MAX_ASYNC_BATCHES) {
+        g_async_drains++;
+        return ds4_gpu_wait_pending_command_buffers("decode overlap");
+    }
+    return 1;
 }
 
 int ds4_gpu_flush_encoder(void) {
