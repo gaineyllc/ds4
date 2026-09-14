@@ -197,7 +197,18 @@ int ds4_gpu_stream_expert_defer_token_missed(void);
 void ds4_gpu_stream_expert_defer_stats(uint64_t *tokens, uint64_t *redos);
 uint64_t ds4_gpu_stream_expert_defer_layers(void);
 uint64_t ds4_gpu_stream_expert_defer_backed_off(void);
+uint64_t ds4_gpu_stream_expert_defer_cold_skipped(void);
 int ds4_gpu_stream_expert_defer_in_flight(void);
+
+/* Router layer registry: name each layer's router bias so the backend can
+ * histogram expert usage (DS4_EXPERT_USAGE_DUMP) and apply a per-layer bias
+ * override (expert keep-lists). */
+int ds4_gpu_router_register_layer(uint32_t layer, const void *map, uint64_t bias_offset,
+                                  uint32_t n_expert);
+int ds4_gpu_router_bias_override(const void *map, uint64_t bias_offset,
+                                 const float *bias, uint32_t n_expert);
+/* 1 when the current token is expected to run its routed layers deferred. */
+int ds4_gpu_stream_expert_defer_expected(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

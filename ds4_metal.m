@@ -848,6 +848,9 @@ static uint64_t g_model_residency_count;
 static int g_model_residency_added_to_queue;
 static int g_glm_model_mode;
 static int g_ssd_streaming_mode;
+/* Experts installed since the token began: the stopping path's evidence
+ * that the bank is (not yet) warm enough for deferral to be worth betting on. */
+static uint64_t g_stream_expert_cache_installs_this_token;
 static int g_glm_streaming_prefill_full_layer_runtime;
 static int g_metal4_runtime_available;
 static int g_metal4_family_supported;
@@ -864,6 +867,7 @@ static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_cache_residency_drop(id<MTLBuffer> buffer);
 static void ds4_gpu_stream_expert_cache_residency_flush_retired(void);
+static void ds4_gpu_stream_expert_cache_residency_commit_stats(double *ms, uint64_t *commits, uint64_t *members);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
@@ -4471,11 +4475,22 @@ void ds4_gpu_print_memory_report(const char *label) {
             const uint64_t defer_layers = ds4_gpu_stream_expert_defer_layers();
             if (defer_layers != 0) {
                 fprintf(stderr,
-                        "ds4:   deferred expert residency: layers=%llu tokens=%llu redos=%llu backed_off=%llu\n",
+                        "ds4:   deferred expert residency: layers=%llu tokens=%llu redos=%llu backed_off=%llu cold=%llu\n",
                         (unsigned long long)defer_layers,
                         (unsigned long long)defer_tokens,
                         (unsigned long long)defer_redos,
-                        (unsigned long long)ds4_gpu_stream_expert_defer_backed_off());
+                        (unsigned long long)ds4_gpu_stream_expert_defer_backed_off(),
+                        (unsigned long long)ds4_gpu_stream_expert_defer_cold_skipped());
+            }
+            {
+                double commit_ms = 0.0; uint64_t commits = 0, members = 0;
+                ds4_gpu_stream_expert_cache_residency_commit_stats(&commit_ms, &commits, &members);
+                if (commits != 0) {
+                    fprintf(stderr,
+                            "ds4:   residency set commits=%llu total=%.1f ms avg=%.3f ms members=%llu\n",
+                            (unsigned long long)commits, commit_ms, commit_ms / (double)commits,
+                            (unsigned long long)members);
+                }
             }
         }
         if (g_stream_expert_cache_mlock_bytes != 0 ||
@@ -15240,6 +15255,15 @@ static int g_stream_expert_cache_residency_dirty;
 static NSMutableArray *g_stream_expert_cache_residency_retired;
 static int g_stream_expert_cache_residency_failed;
 static int g_stream_expert_cache_residency_published_this_token;
+static double g_stream_expert_cache_residency_commit_ms;
+static uint64_t g_stream_expert_cache_residency_commits;
+static uint64_t g_stream_expert_cache_residency_commit_members;
+
+static void ds4_gpu_stream_expert_cache_residency_commit_stats(double *ms, uint64_t *commits, uint64_t *members) {
+    if (ms) *ms = g_stream_expert_cache_residency_commit_ms;
+    if (commits) *commits = g_stream_expert_cache_residency_commits;
+    if (members) *members = g_stream_expert_cache_residency_commit_members;
+}
 
 static void ds4_gpu_stream_expert_cache_residency_note(id<MTLBuffer> buffer) {
 #if TARGET_OS_OSX
@@ -15266,7 +15290,6 @@ static void ds4_gpu_stream_expert_cache_residency_note(id<MTLBuffer> buffer) {
         [g_stream_expert_cache_residency_members addObject:buffer];
         [g_stream_expert_cache_residency_set addAllocation:buffer];
         g_stream_expert_cache_residency_dirty = 1;
-        g_stream_expert_cache_residency_published_this_token = 0;
     }
 #else
     (void)buffer;
@@ -15308,7 +15331,12 @@ static void ds4_gpu_stream_expert_cache_residency_publish(void) {
     if (@available(macOS 15.0, *)) {
         if (g_stream_expert_cache_residency_dirty ||
             [g_stream_expert_cache_residency_retired count] != 0) {
+            const double t0 = ds4_gpu_now_ms();
             [g_stream_expert_cache_residency_set commit];
+            g_stream_expert_cache_residency_commit_ms += ds4_gpu_now_ms() - t0;
+            g_stream_expert_cache_residency_commits++;
+            g_stream_expert_cache_residency_commit_members =
+                [g_stream_expert_cache_residency_members count];
             /* Deliberately no requestResidency: attaching the set to the queue
              * already makes these allocations resident for the command buffers
              * that use them, whereas requesting residency outright asks the
@@ -15341,7 +15369,12 @@ static void ds4_gpu_stream_expert_cache_residency_flush_retired(void) {
     if (ds4_gpu_stream_expert_defer_in_flight()) return;
     if (@available(macOS 15.0, *)) {
         if ([g_stream_expert_cache_residency_retired count] == 0) return;
+        const double t0 = ds4_gpu_now_ms();
         [g_stream_expert_cache_residency_set commit];
+        g_stream_expert_cache_residency_commit_ms += ds4_gpu_now_ms() - t0;
+        g_stream_expert_cache_residency_commits++;
+        g_stream_expert_cache_residency_commit_members =
+            [g_stream_expert_cache_residency_members count];
         [g_stream_expert_cache_residency_retired removeAllObjects];
     }
 #endif
@@ -15699,6 +15732,7 @@ static void ds4_gpu_stream_expert_defer_note_layer(
  * the two within a token would put a stopping layer -- which needs to evict --
  * inside the window where a deferred layer's experts must not be freed. */
 static int g_stream_expert_defer_token_mode; /* 0 undecided, 1 defer, 2 stop */
+static int g_stream_expert_defer_token_mode_last; /* mode the previous token ran in */
 
 int ds4_gpu_stream_expert_defer_in_flight(void) {
     return g_stream_expert_defer_in_flight;
@@ -15720,6 +15754,13 @@ int ds4_gpu_stream_expert_defer_in_flight(void) {
 #define DS4_METAL_DEFER_BACKOFF_MIN 8u
 #define DS4_METAL_DEFER_BACKOFF_MAX 4096u
 #define DS4_METAL_DEFER_BACKOFF_FORGIVE 256u
+/* Deferral is only attempted once this many consecutive stopping-path tokens
+ * installed nothing: a cold bank would otherwise lose the bet on every token
+ * (each one decoded twice) until backoff caught up. The stopping path is the
+ * only place the evidence is gathered, so a redo also restarts the count. */
+#define DS4_METAL_DEFER_WARM_TOKENS 4u
+static uint32_t g_stream_expert_defer_warm_streak;
+static uint64_t g_stream_expert_defer_cold_skipped;
 static uint32_t g_stream_expert_defer_cooldown;
 static uint32_t g_stream_expert_defer_backoff;
 static uint32_t g_stream_expert_defer_streak;
@@ -15734,6 +15775,16 @@ static int ds4_gpu_stream_expert_defer_enabled(void) {
     return enabled &&
            !g_stream_expert_defer_disabled_for_token &&
            g_stream_expert_defer_cooldown == 0;
+}
+
+/* Will this token's routed layers run deferred? True from token begin, so the
+ * graph can skip the per-layer early expert load whose only job was to drain
+ * the GPU, read the router back and install misses before the MoE ran -- a
+ * deferred token finds its misses on the GPU and reloads them on the redo. */
+int ds4_gpu_stream_expert_defer_expected(void) {
+    return g_ssd_streaming_mode &&
+           g_stream_expert_defer_token_mode != 2 &&
+           ds4_gpu_stream_expert_defer_enabled();
 }
 
 static void ds4_gpu_stream_expert_defer_note_outcome(int missed) {
@@ -15768,12 +15819,28 @@ void ds4_gpu_stream_expert_defer_begin_token(int disabled) {
         id<MTLBuffer> miss = ds4_gpu_stream_expert_miss_flag();
         if (miss) *(uint32_t *)[miss contents] = 0;
     }
+    /* Evidence from the token that just finished. A deferred token installs
+     * nothing (it never stops), so only stopping tokens move the streak. */
+    if (g_stream_expert_defer_token_mode_last == 2) {
+        g_stream_expert_defer_warm_streak =
+            g_stream_expert_cache_installs_this_token == 0 ?
+                g_stream_expert_defer_warm_streak + 1u : 0u;
+    }
+    g_stream_expert_cache_installs_this_token = 0;
     if (!disabled && g_stream_expert_defer_cooldown != 0) {
         g_stream_expert_defer_cooldown--;
         g_stream_expert_defer_skipped++;
         g_stream_expert_defer_token_mode = 2;
+        g_stream_expert_defer_token_mode_last = 2;
         return;
     }
+    if (!disabled && g_stream_expert_defer_warm_streak < DS4_METAL_DEFER_WARM_TOKENS) {
+        g_stream_expert_defer_cold_skipped++;
+        g_stream_expert_defer_token_mode = 2;
+        g_stream_expert_defer_token_mode_last = 2;
+        return;
+    }
+    g_stream_expert_defer_token_mode_last = disabled ? 2 : 1;
     if (disabled) return;
     g_stream_expert_cache_residency_published_this_token = 0;
     g_stream_expert_defer_used = 0;
@@ -15899,6 +15966,7 @@ int ds4_gpu_stream_expert_defer_token_missed(void) {
     ds4_gpu_stream_expert_defer_note_outcome(missed);
     if (missed) {
         g_stream_expert_defer_redos++;
+        g_stream_expert_defer_warm_streak = 0;
         return 1;
     }
     return 0;
@@ -15915,6 +15983,10 @@ uint64_t ds4_gpu_stream_expert_defer_layers(void) {
 
 uint64_t ds4_gpu_stream_expert_defer_backed_off(void) {
     return g_stream_expert_defer_skipped;
+}
+
+uint64_t ds4_gpu_stream_expert_defer_cold_skipped(void) {
+    return g_stream_expert_defer_cold_skipped;
 }
 
 static id<MTLBuffer> ds4_gpu_stream_expert_validate_status_buffer(void) {
@@ -17155,6 +17227,7 @@ ds4_gpu_stream_expert_cache_install_loaded(
     g_stream_expert_cache_misses++;
     g_stream_expert_cache_layer_misses[layer]++;
     g_stream_expert_cache_wraps += 3;
+    g_stream_expert_cache_installs_this_token++;
     return e;
 }
 
@@ -35020,6 +35093,150 @@ static int ds4_gpu_encode_sum_rows_f32(
     return 1;
 }
 
+/*
+ * Router layer registry. The router kernels are handed a bias by model offset
+ * and never learn which layer they serve, so the host registers each layer's
+ * bias offset once at load. Two features hang off it:
+ *
+ *  - an expert-usage histogram (DS4_EXPERT_USAGE_DUMP=file): every routed
+ *    selection, prefill and decode, is counted per (layer, expert) on the GPU
+ *    and written out at exit as "layer expert count weight_sum";
+ *  - a per-layer router bias override, which is how a keep-list prunes
+ *    experts without touching the GGUF: experts outside the list get a bias
+ *    the top-k can never pick, the survivors renormalize as usual, and the
+ *    streaming bank only ever sees the kept set.
+ */
+#define DS4_ROUTER_REGISTRY_MAX 128
+typedef struct {
+    const void   *map;
+    uint64_t      bias_offset;
+    uint32_t      layer;
+    uint32_t      n_expert;
+    id<MTLBuffer> override;      /* nil: use the model's own bias */
+} ds4_router_layer_reg;
+static ds4_router_layer_reg g_router_layers[DS4_ROUTER_REGISTRY_MAX];
+static uint32_t g_router_layer_count;
+static id<MTLBuffer> g_router_usage_stats;   /* [layers][experts][2] uint32 */
+static uint32_t g_router_usage_layers, g_router_usage_experts;
+static id<MTLComputePipelineState> g_router_usage_pipeline;
+
+static ds4_router_layer_reg *ds4_gpu_router_layer_find(const void *map, uint64_t bias_offset) {
+    for (uint32_t i = 0; i < g_router_layer_count; i++) {
+        if (g_router_layers[i].map == map &&
+            g_router_layers[i].bias_offset == bias_offset) return &g_router_layers[i];
+    }
+    return NULL;
+}
+
+int ds4_gpu_router_register_layer(uint32_t layer, const void *map, uint64_t bias_offset,
+                                  uint32_t n_expert) {
+    if (ds4_gpu_router_layer_find(map, bias_offset)) return 1;
+    if (g_router_layer_count >= DS4_ROUTER_REGISTRY_MAX) return 0;
+    ds4_router_layer_reg *r = &g_router_layers[g_router_layer_count++];
+    r->map = map;
+    r->bias_offset = bias_offset;
+    r->layer = layer;
+    r->n_expert = n_expert;
+    r->override = nil;
+    return 1;
+}
+
+int ds4_gpu_router_bias_override(const void *map, uint64_t bias_offset,
+                                 const float *bias, uint32_t n_expert) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_router_layer_reg *r = ds4_gpu_router_layer_find(map, bias_offset);
+    if (!r || !bias || r->n_expert != n_expert) return 0;
+    id<MTLBuffer> buf = [g_device newBufferWithBytes:bias
+                                              length:(NSUInteger)n_expert * sizeof(float)
+                                             options:MTLResourceStorageModeShared];
+    if (!buf) return 0;
+    r->override = buf;
+    return 1;
+}
+
+static void ds4_gpu_router_usage_dump(void) {
+    const char *path = getenv("DS4_EXPERT_USAGE_DUMP");
+    if (!path || !g_router_usage_stats) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    const uint32_t *st = (const uint32_t *)[g_router_usage_stats contents];
+    fprintf(f, "# layer expert count weight_sum\n");
+    for (uint32_t l = 0; l < g_router_usage_layers; l++) {
+        for (uint32_t e = 0; e < g_router_usage_experts; e++) {
+            const uint32_t *v = st + ((size_t)l * g_router_usage_experts + e) * 2u;
+            if (v[0] == 0) continue;
+            fprintf(f, "%u %u %u %.4f\n", l, e, v[0], (double)v[1] / 65536.0);
+        }
+    }
+    fclose(f);
+}
+
+static int ds4_gpu_router_usage_enabled(uint32_t n_expert) {
+    static int checked = 0, enabled = 0;
+    if (!checked) {
+        checked = 1;
+        enabled = getenv("DS4_EXPERT_USAGE_DUMP") != NULL;
+        if (enabled) {
+            g_router_usage_layers = DS4_ROUTER_REGISTRY_MAX;
+            g_router_usage_experts = n_expert;
+            const NSUInteger bytes =
+                (NSUInteger)g_router_usage_layers * n_expert * 2u * sizeof(uint32_t);
+            g_router_usage_stats = [g_device newBufferWithLength:bytes
+                                                         options:MTLResourceStorageModeShared];
+            g_router_usage_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_router_usage_accum");
+            if (!g_router_usage_stats || !g_router_usage_pipeline) {
+                fprintf(stderr, "ds4: expert usage dump unavailable\n");
+                enabled = 0;
+            } else {
+                memset([g_router_usage_stats contents], 0, bytes);
+                atexit(ds4_gpu_router_usage_dump);
+            }
+        }
+    }
+    return enabled && n_expert == g_router_usage_experts;
+}
+
+/* Substitute an overridden bias for the model's, and name the layer for the
+ * usage histogram. Called by the router entry points once they have wrapped
+ * the model bias; a layer nobody registered keeps the model bias. */
+static void ds4_gpu_router_apply_registry(const void *map, uint64_t bias_offset,
+                                          __strong id<MTLBuffer> *biasbuf,
+                                          NSUInteger *bias_off,
+                                          int32_t *usage_layer) {
+    *usage_layer = -1;
+    const ds4_router_layer_reg *r = ds4_gpu_router_layer_find(map, bias_offset);
+    if (!r) return;
+    *usage_layer = (int32_t)r->layer;
+    if (r->override && biasbuf && *biasbuf) {
+        *biasbuf = r->override;
+        *bias_off = 0;
+    }
+}
+
+static void ds4_gpu_encode_router_usage(id<MTLCommandBuffer> cb,
+                                        id<MTLBuffer> selectedbuf, NSUInteger selected_off,
+                                        id<MTLBuffer> weightsbuf, NSUInteger weights_off,
+                                        uint32_t n_expert, uint32_t n_expert_used,
+                                        uint32_t n_tokens, int32_t usage_layer) {
+    if (usage_layer < 0 || !ds4_gpu_router_usage_enabled(n_expert)) return;
+    const uint32_t layer = (uint32_t)usage_layer;
+    if (layer >= g_router_usage_layers) return;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_router_usage_pipeline];
+    [enc setBuffer:selectedbuf offset:selected_off atIndex:0];
+    [enc setBuffer:weightsbuf offset:weights_off atIndex:1];
+    [enc setBuffer:g_router_usage_stats offset:0 atIndex:2];
+    [enc setBytes:&n_expert_used length:sizeof(n_expert_used) atIndex:3];
+    [enc setBytes:&n_expert length:sizeof(n_expert) atIndex:4];
+    [enc setBytes:&layer length:sizeof(layer) atIndex:5];
+    [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:6];
+    const NSUInteger total = (NSUInteger)n_tokens * n_expert_used;
+    const NSUInteger tg = 64;
+    [enc dispatchThreadgroups:MTLSizeMake((total + tg - 1) / tg, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+}
+
 static int ds4_gpu_encode_router_select(
         id<MTLCommandBuffer>  cb,
         ds4_gpu_tensor     *selected,
@@ -35044,7 +35261,8 @@ static int ds4_gpu_encode_router_select(
         float                 expert_weight_scale,
         bool                  has_bias,
         bool                  hash_mode,
-        bool                  mixed_visual) {
+        bool                  mixed_visual,
+        int32_t               usage_layer) {
     id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
     id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
     id<MTLBuffer> probsbuf = ds4_gpu_tensor_buffer(probs);
@@ -35444,6 +35662,8 @@ static int ds4_gpu_encode_router_select(
          threadsPerThreadgroup:MTLSizeMake(ds4_gpu_bin_threads(n_expert_used, g_bin_mul_scalar_pipeline), 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
+    ds4_gpu_encode_router_usage(cb, selectedbuf, selected_off, weightsbuf, weights_off,
+                                n_expert, n_expert_used, n_tokens, usage_layer);
     return 1;
 }
 
@@ -41242,6 +41462,8 @@ int ds4_gpu_router_select_tensor(
             if (!hashbuf) return 0;
             hash_set_offset = (NSUInteger)hash_inner;
         }
+        int32_t usage_layer = -1;
+        ds4_gpu_router_apply_registry(model_map, bias_offset, &biasbuf, &bias_set_offset, &usage_layer);
 
         const bool had_batch = g_batch_cb != nil;
         if (!had_batch && ds4_gpu_begin_commands() == 0) return 0;
@@ -41272,7 +41494,8 @@ int ds4_gpu_router_select_tensor(
                                                       expert_weight_scale,
                                                       has_bias && !hash_mode,
                                                       hash_mode,
-                                                      false);
+                                                      false,
+                                                      usage_layer);
         if (!had_batch) {
             ok = ds4_gpu_end_commands() != 0 && ok;
         }
@@ -41344,6 +41567,9 @@ int ds4_gpu_router_select_batch_tensor(
             hash_set_offset = (NSUInteger)hash_inner;
         }
 
+        int32_t usage_layer = -1;
+        ds4_gpu_router_apply_registry(model_map, bias_offset, &biasbuf, &bias_set_offset, &usage_layer);
+
         const bool had_batch = g_batch_cb != nil;
         if (!had_batch && ds4_gpu_begin_commands() == 0) return 0;
         int owned = 0;
@@ -41372,7 +41598,8 @@ int ds4_gpu_router_select_batch_tensor(
                                                       expert_weight_scale,
                                                       has_bias && !hash_mode,
                                                       hash_mode,
-                                                      false);
+                                                      false,
+                                                      usage_layer);
         if (!had_batch) {
             ok = ds4_gpu_end_commands() != 0 && ok;
         }
@@ -41448,6 +41675,11 @@ int ds4_gpu_router_select_batch_visual_tensor(
                 vision_map, vision_size, visual_bias_offset,
                 (uint64_t)n_expert * sizeof(float), &visual_inner);
         if (!visual_biasbuf) return 0;
+        int32_t usage_layer = -1, visual_layer = -1;
+        NSUInteger visual_set_offset = (NSUInteger)visual_inner;
+        ds4_gpu_router_apply_registry(model_map, bias_offset, &biasbuf, &bias_set_offset, &usage_layer);
+        ds4_gpu_router_apply_registry(vision_map, visual_bias_offset, &visual_biasbuf,
+                                      &visual_set_offset, &visual_layer);
 
         const bool had_batch = g_batch_cb != nil;
         if (!had_batch && ds4_gpu_begin_commands() == 0) return 0;
@@ -41459,10 +41691,10 @@ int ds4_gpu_router_select_batch_visual_tensor(
                 biasbuf, bias_set_offset,
                 hashbuf, hash_set_offset,
                 tokensbuf, ds4_gpu_tensor_offset(tokens),
-                visual_biasbuf, (NSUInteger)visual_inner,
+                visual_biasbuf, visual_set_offset,
                 NULL, hash_rows, vocab_size, n_tokens,
                 n_expert, n_expert_used, expert_weight_scale,
-                has_bias && !hash_mode, hash_mode, true);
+                has_bias && !hash_mode, hash_mode, true, usage_layer);
         if (!had_batch) ok = ds4_gpu_end_commands() != 0 && ok;
         if (!ok) return 0;
     }

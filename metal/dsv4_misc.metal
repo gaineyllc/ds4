@@ -7084,3 +7084,25 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+/* Per-layer routed-expert usage histogram. One thread per (row, slot):
+ * counts selections and accumulates the normalized router weight in 16.16
+ * fixed point so a plain uint atomic serves both. Used only when the host
+ * asked for an expert-usage dump (DS4_EXPERT_USAGE_DUMP). */
+kernel void kernel_dsv4_router_usage_accum(
+        device const int   *selected [[buffer(0)]],
+        device const float *weights  [[buffer(1)]],
+        device atomic_uint *stats    [[buffer(2)]],
+        constant uint      &n_used   [[buffer(3)]],
+        constant uint      &n_expert [[buffer(4)]],
+        constant uint      &layer    [[buffer(5)]],
+        constant uint      &n_rows   [[buffer(6)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n_rows * n_used) return;
+    const int e = selected[gid];
+    if (e < 0 || (uint)e >= n_expert) return;
+    const float w = clamp(weights[gid], 0.0f, 16.0f);
+    const uint base = (layer * n_expert + (uint)e) * 2u;
+    atomic_fetch_add_explicit(&stats[base], 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&stats[base + 1u], (uint)(w * 65536.0f), memory_order_relaxed);
+}

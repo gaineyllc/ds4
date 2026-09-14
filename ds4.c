@@ -5998,10 +5998,18 @@ static void weights_validate_layout(
         tensor_expect_dense_quant_layout(l->attn_output_b,  2, out_low_dim, DS4_N_EMBD, 0);
 
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-            /* The V4.1 grouped output kernels consume Q8 blocks directly. */
-            tensor_expect_layout(l->attn_output_a, DS4_TENSOR_Q8_0, 2,
+            /* The V4.1 grouped output kernels consume Q8_0 or Q4_K blocks:
+             * decode dispatches on the type (ds41_attention_low), prefill has
+             * a Q8_0 batch kernel and a per-row path for the rest. */
+            if (l->attn_output_a->type != DS4_TENSOR_Q8_0 &&
+                l->attn_output_a->type != DS4_TENSOR_Q4_K) {
+                fprintf(stderr, "ds4: layer %u attn_output_a must be q8_0 or q4_K, got %s\n",
+                        il, tensor_type_name(l->attn_output_a->type));
+                exit(1);
+            }
+            tensor_expect_dense_quant_layout(l->attn_output_a, 2,
                 DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-            tensor_expect_layout(l->attn_output_b, DS4_TENSOR_Q8_0, 2,
+            tensor_expect_dense_quant_layout(l->attn_output_b, 2,
                 out_low_dim, DS4_N_EMBD, 0);
             if (ds41_kv_source(il)) {
                 tensor_expect_layout(l->attn_compressor_kv, DS4_TENSOR_F16, 2,
@@ -7870,6 +7878,101 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
     }
 }
 
+
+#ifndef DS4_NO_GPU
+/*
+ * Expert keep-lists: DS4_EXPERT_KEEP=FILE names, per routed layer, the experts
+ * the router may choose. Lines are "<layer>: <id> <id> ..."; '#' comments.
+ * Layers absent from the file keep every expert. Pruned experts get a router
+ * bias the top-k can never pick, so they are never routed, never read from
+ * disk and never enter the streaming bank; the chosen experts renormalize as
+ * usual. The GGUF is untouched. The point is fitting the routed working set
+ * in memory: a 384-expert V4.1 layer set is 142 GiB at Q2, and no bank on a
+ * 128 GiB machine holds the experts a long generation touches.
+ */
+static bool weights_parse_keep_line(const char *line, uint32_t *layer,
+                                    uint8_t *keep, uint32_t n_expert, uint32_t *kept) {
+    char *end = NULL;
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line == '#' || *line == '\n' || *line == '\0') return false;
+    unsigned long il = strtoul(line, &end, 10);
+    if (end == line || il >= DS4_N_LAYER) return false;
+    if (*end == ':') end++;
+    memset(keep, 0, n_expert);
+    *kept = 0;
+    for (;;) {
+        const char *p = end;
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        if (*p == '\0' || *p == '\n' || *p == '#') break;
+        unsigned long e = strtoul(p, &end, 10);
+        if (end == p) break;
+        if (e < n_expert && !keep[e]) { keep[e] = 1; (*kept)++; }
+    }
+    *layer = (uint32_t)il;
+    return true;
+}
+
+static void weights_apply_expert_keep(const ds4_weights *w, const ds4_model *m,
+                                      uint32_t start, uint32_t end) {
+    const char *path = getenv("DS4_EXPERT_KEEP");
+    if (!path || !path[0]) return;
+    FILE *f = fopen(path, "r");
+    if (!f) ds4_die_errno("cannot open expert keep-list", path);
+    uint8_t keep[DS4_N_EXPERT];
+    float bias[DS4_N_EXPERT];
+    char line[16384];
+    uint32_t layers = 0, total_kept = 0;
+    while (fgets(line, sizeof(line), f)) {
+        uint32_t il = 0, kept = 0;
+        if (!weights_parse_keep_line(line, &il, keep, DS4_N_EXPERT, &kept)) continue;
+        if (il < start || il > end) continue;
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!l->ffn_exp_probs_b) continue;
+        if (kept < DS4_N_EXPERT_USED) ds4_die("expert keep-list keeps fewer experts than the router uses");
+        const ds4_tensor *biases[2] = { l->ffn_exp_probs_b, l->ffn_exp_probs_vl };
+        for (uint32_t b = 0; b < 2; b++) {
+            if (!biases[b]) continue;
+            const float *src = (const float *)((const uint8_t *)m->map + biases[b]->abs_offset);
+            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                bias[e] = keep[e] ? src[e] : -1e30f;
+            }
+            if (!ds4_gpu_router_bias_override(m->map, biases[b]->abs_offset, bias, DS4_N_EXPERT)) {
+                ds4_die("cannot apply expert keep-list to the router");
+            }
+        }
+        layers++;
+        total_kept += kept;
+    }
+    fclose(f);
+    if (layers) {
+        fprintf(stderr, "ds4: expert keep-list %s: %u layers, %.1f experts/layer kept of %u\n",
+                path, layers, (double)total_kept / layers, (unsigned)DS4_N_EXPERT);
+    }
+}
+#endif
+
+/* Name every routed layer's router bias to the backend (see ds4_gpu.h). */
+static void weights_register_routers(const ds4_weights *w, const ds4_model *m,
+                                     uint32_t start, uint32_t end) {
+#ifndef DS4_NO_GPU
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) return;
+    for (uint32_t il = start; il <= end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (l->ffn_exp_probs_b) {
+            (void)ds4_gpu_router_register_layer(il, m->map, l->ffn_exp_probs_b->abs_offset,
+                                                DS4_N_EXPERT);
+        }
+        if (l->ffn_exp_probs_vl) {
+            (void)ds4_gpu_router_register_layer(il, m->map, l->ffn_exp_probs_vl->abs_offset,
+                                                DS4_N_EXPERT);
+        }
+    }
+    weights_apply_expert_keep(w, m, start, end);
+#else
+    (void)w; (void)m; (void)start; (void)end;
+#endif
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
@@ -8001,6 +8104,7 @@ static void weights_bind(
     }
 
     weights_validate_layout(w, start, end, require_token_embd, require_output);
+    weights_register_routers(w, m, start, end);
 }
 
 typedef struct {
@@ -40731,10 +40835,17 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
-    return tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
-        ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
-            l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
-            4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O);
+    bool ok;
+    if (l->attn_output_a->type == DS4_TENSOR_Q4_K) {
+        ok = ds4_gpu_attention_output_low_q4_K_slice_tensor(g->low, m->map, m->size,
+            l->attn_output_a->abs_offset, 4096, 1024, group0, groups, g->heads) != 0;
+    } else {
+        ok = tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
+            ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
+                l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
+                4096, 1024, groups, g->heads);
+    }
+    return ok && ds41_bf16(g->low, groups * DS4_N_LORA_O);
 }
 
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
@@ -40909,7 +41020,11 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
      * (10.87 vs 12.31) where the cache is roomier and the extra per-layer
      * drain dominates. On by default for the large-context case;
      * DS4_METAL_DISABLE_V41_EARLY_EXPERT_LOAD turns it off. */
-    if (g->streaming && !getenv("DS4_METAL_DISABLE_V41_EARLY_EXPERT_LOAD")) {
+    /* A deferred token never needs this: it checks residency on the GPU and
+     * pays for a miss with one redo, whereas the early load pays a full GPU
+     * drain on every layer to find out that nothing was missing. */
+    if (g->streaming && !getenv("DS4_METAL_DISABLE_V41_EARLY_EXPERT_LOAD") &&
+        !ds4_gpu_stream_expert_defer_expected()) {
         const ds4_gpu_stream_expert_table etable =
             graph_stream_expert_table_make(m, l, il,
                                            gate_row * DS4_N_FF_EXP,
