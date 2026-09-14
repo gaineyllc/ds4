@@ -377,6 +377,40 @@ static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, c
 static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder);
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
 static uint64_t g_async_batches, g_async_drains;
+
+/* How much of a layer's routing repeats from one token to the next. If the
+ * previous token's experts cover this one's, they can be fetched before the
+ * router resolves and the readback stops being on the critical path. */
+#define DS4_ROUTE_REPEAT_MAX_LAYER 64
+#define DS4_ROUTE_REPEAT_MAX_USED 8
+static int32_t g_route_prev[DS4_ROUTE_REPEAT_MAX_LAYER][DS4_ROUTE_REPEAT_MAX_USED];
+static uint32_t g_route_prev_n[DS4_ROUTE_REPEAT_MAX_LAYER];
+static uint64_t g_route_calls, g_route_matched, g_route_total, g_route_full;
+
+static void ds4_gpu_note_route_repeat(uint32_t layer, const int32_t *ids, uint32_t n) {
+    static int checked = 0, enabled = 0;
+    if (!checked) { enabled = getenv("DS4_METAL_ROUTE_REPEAT") != NULL; checked = 1; }
+    if (!enabled || layer >= DS4_ROUTE_REPEAT_MAX_LAYER ||
+        n == 0 || n > DS4_ROUTE_REPEAT_MAX_USED) return;
+    if (g_route_prev_n[layer] == n) {
+        uint32_t hit = 0;
+        for (uint32_t i = 0; i < n; i++)
+            for (uint32_t j = 0; j < n; j++)
+                if (ids[i] == g_route_prev[layer][j]) { hit++; break; }
+        g_route_calls++;
+        g_route_matched += hit;
+        g_route_total += n;
+        if (hit == n) g_route_full++;
+        if ((g_route_calls % 400u) == 0u)
+            fprintf(stderr, "ds4: route repeat: %.1f%% of experts, %.1f%% of layers fully "
+                            "(%llu samples)\n",
+                    100.0 * (double)g_route_matched / (double)g_route_total,
+                    100.0 * (double)g_route_full / (double)g_route_calls,
+                    (unsigned long long)g_route_calls);
+    }
+    for (uint32_t i = 0; i < n; i++) g_route_prev[layer][i] = ids[i];
+    g_route_prev_n[layer] = n;
+}
 static id<MTLSharedEvent> g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
 static id<MTLComputePipelineState> g_set_rows_f32_i32_pipeline;
@@ -38622,6 +38656,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                         (uint64_t)n_expert * sizeof(stream_selected_ids[0])) == 0) {
                     stream_ok = 0;
                 }
+                if (stream_ok)
+                    ds4_gpu_note_route_repeat(layer_index, stream_selected_ids, n_expert);
             }
             for (uint32_t i = 0; stream_ok && i < n_expert; i++) {
                 if (stream_selected_ids[i] < 0 ||
@@ -41807,6 +41843,14 @@ int ds4_gpu_routed_moe_one_tensor(
         const bool q4_selected_shared_event =
             use_q4_selected_slots &&
             getenv("DS4_METAL_Q4_SELECTED_SHARED_EVENT") != NULL;
+        /* Reading the router's choice back has to wait for the GPU either
+         * way, but ending the whole batch also drains every buffer already
+         * queued behind it, which is exactly the overlap decode depends on.
+         * Waiting on an event instead leaves the queue alone and keeps a
+         * buffer open to carry on encoding into. */
+        const bool selected_event_boundary =
+            !q4_selected_shared_event &&
+            getenv("DS4_METAL_DISABLE_SELECTED_EVENT_BOUNDARY") == NULL;
         const bool q4_selected_base_views =
             use_q4_selected_slots &&
             getenv("DS4_METAL_Q4_SELECTED_USE_BASE_VIEWS") != NULL &&
@@ -42244,7 +42288,7 @@ int ds4_gpu_routed_moe_one_tensor(
                     if (g_batch_cb != nil) {
                         double selected_boundary_t0 =
                             selected_timing ? ds4_gpu_now_ms() : 0.0;
-                        if (q4_selected_shared_event) {
+                        if (q4_selected_shared_event || selected_event_boundary) {
                             if (ds4_gpu_signal_batch_and_wait_event("selected-id readback") == 0) { if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32942); return 0; }
                         } else if (ds4_gpu_end_commands() == 0) {
                             if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32931);
@@ -42263,11 +42307,12 @@ int ds4_gpu_routed_moe_one_tensor(
                             if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32943);
                             return 0;
                         }
+                        ds4_gpu_note_route_repeat(layer_index, selected_ids, n_expert);
                         if (selected_timing) {
                             selected_copy_ms +=
                                 ds4_gpu_now_ms() - selected_copy_t0;
                         }
-                        if (!q4_selected_shared_event) {
+                        if (!q4_selected_shared_event && !selected_event_boundary) {
                             selected_boundary_t0 =
                                 selected_timing ? ds4_gpu_now_ms() : 0.0;
                             if (ds4_gpu_begin_commands() == 0) { if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32967); return 0; }
@@ -42286,6 +42331,7 @@ int ds4_gpu_routed_moe_one_tensor(
                             if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32965);
                             return 0;
                         }
+                        ds4_gpu_note_route_repeat(layer_index, selected_ids, n_expert);
                         if (selected_timing) {
                             selected_copy_ms +=
                                 ds4_gpu_now_ms() - selected_copy_t0;
@@ -42300,6 +42346,7 @@ int ds4_gpu_routed_moe_one_tensor(
 
             if (selected_ids_available) {
                 for (uint32_t i = 0; i < n_expert; i++) {
+                    if (i == 0) ds4_gpu_note_route_repeat(layer_index, selected_ids, n_expert);
                     if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
                         fprintf(stderr,
                                 "ds4: Metal routed MoE selected expert id %d is outside 0..%u\n",
