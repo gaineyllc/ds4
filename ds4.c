@@ -40673,9 +40673,6 @@ fail:
 #undef DS41_SCRATCH
 
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
-    static int twice = -1;
-    if (twice < 0) twice = getenv("DS4_METAL_V41_BF16_TWICE") != NULL;
-    if (twice && !ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16)) return false;
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
 
@@ -41122,7 +41119,9 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
 
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
-    return ds41_moe_partial(g, m, l, il, token) && ds41_moe_finish(g, il);
+    if (!ds41_moe_partial(g, m, l, il, token)) { fprintf(stderr, "ds4: moe: partial failed\n"); return false; }
+    if (!ds41_moe_finish(g, il)) { fprintf(stderr, "ds4: moe: finish failed\n"); return false; }
+    return true;
 }
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
@@ -41437,15 +41436,18 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
-        ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
+    if (!ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC)) { fprintf(stderr, "ds4: after_moe: hc_expand_split failed\n"); return false; }
+    if (!ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC)) { fprintf(stderr, "ds4: after_moe: bf16 failed\n"); return false; }
+    if (!ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float))) { fprintf(stderr, "ds4: after_moe: copy failed\n"); return false; }
+    return true;
 }
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+    if (!ds41_graph_before_moe(g, m, l, il)) { fprintf(stderr, "ds4: V4.1 layer %u: before_moe failed\n", il); return false; }
+    if (!ds41_moe(g, m, l, il, (uint32_t)token)) { fprintf(stderr, "ds4: V4.1 layer %u: moe failed\n", il); return false; }
+    if (!ds41_graph_after_moe(g)) { fprintf(stderr, "ds4: V4.1 layer %u: after_moe failed\n", il); return false; }
+    return true;
 }
 
 
@@ -42361,8 +42363,10 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
             il == 13 || il + 1u == DS4_N_LAYER;
         const bool blocking = !overlap || il == 13 || il + 1u == DS4_N_LAYER;
         if (drain &&
-            !(blocking ? ds4_gpu_end_commands() : ds4_gpu_end_commands_async()))
+            !(blocking ? ds4_gpu_end_commands() : ds4_gpu_end_commands_async())) {
+            fprintf(stderr, "ds4: V4.1 layer %u: %s end_commands failed\n", il, blocking ? "blocking" : "async");
             ok = false;
+        }
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
