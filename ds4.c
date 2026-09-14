@@ -41017,6 +41017,13 @@ typedef struct {
      * on first use so deferral works without a DSpark module. */
     ds4_gpu_tensor *defer_carry_kv[4], *defer_carry_score[4];
     bool defer_carry_ready;
+    /* Set by the deferred-decode wrapper so the token's own command buffer
+     * carries the rollback copies; read back out for the rollback itself. */
+    bool defer_snapshot_wanted;
+    bool defer_snapshot_taken;
+    uint32_t defer_snapshot_pos;
+    ds4_engram_history defer_snapshot_history;
+    bool defer_snapshot_valid;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -42243,6 +42250,34 @@ static bool ds41_verify_carry_ready(ds41_gpu_graph *g) {
     return true;
 }
 
+/*
+ * Take the rollback snapshot inside the token's own command buffer.
+ *
+ * Doing it as a separate commit-and-wait, which is what this used to be, puts a
+ * full GPU drain at the head of every token. That is nearly free when a token
+ * is short and ruinous when it is not: at 65k context it cost 60% of decode
+ * (6.5 t/s against 15.8 with the snapshot removed altogether). Command buffers
+ * on one queue run in order, so encoding the copies ahead of the token's own
+ * work is enough to guarantee they read the carry before the compressor
+ * overwrites it -- no wait required.
+ */
+static bool ds41_verify_snapshot_encode(ds41_gpu_graph *g) {
+    if (!g) return false;
+    if (!ds41_verify_carry_ready(g)) return false;
+    g->defer_snapshot_pos = g->pos;
+    g->defer_snapshot_history = g->history;
+    g->defer_snapshot_valid = g->valid;
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < 4; i++) {
+        ok = ds4_gpu_tensor_copy(g->defer_carry_kv[i], 0, g->previous_kv[i], 0,
+                                 512u * sizeof(float)) &&
+             ds4_gpu_tensor_copy(g->defer_carry_score[i], 0, g->previous_score[i], 0,
+                                 512u * sizeof(float));
+    }
+    g->defer_snapshot_taken = ok;
+    return ok;
+}
+
 static bool ds41_verify_snapshot(ds41_gpu_graph *g, ds41_verify_state *st) {
     if (!g || !st) return false;
     if (!ds41_verify_carry_ready(g)) return false;
@@ -42306,7 +42341,11 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
     if (g->streaming) ds4_gpu_stream_expert_cache_replenish_free_slots();
 #endif
     bool ok = ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&
-        ds4_gpu_begin_commands() && ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
+        ds4_gpu_begin_commands();
+    /* Rides this token's command buffer rather than a drain of its own. */
+    g->defer_snapshot_taken = false;
+    if (ok && g->defer_snapshot_wanted && !ds41_verify_snapshot_encode(g)) ok = false;
+    ok = ok && ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
@@ -42393,11 +42432,21 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (!defer || !g || !g->streaming || g->imatrix || g->quality || g->tp_world == 2)
         return ds41_graph_step_once(g, m, w, token, logits, 1);
 
-    ds41_verify_state st;
-    if (!ds41_verify_snapshot(g, &st))
-        return ds41_graph_step_once(g, m, w, token, logits, 1);
-    if (!ds41_graph_step_once(g, m, w, token, logits, 0)) return false;
+    g->defer_snapshot_wanted = true;
+    const bool stepped = ds41_graph_step_once(g, m, w, token, logits, 0);
+    g->defer_snapshot_wanted = false;
+    if (!stepped) return false;
     if (!ds4_gpu_stream_expert_defer_token_missed()) return true;
+    if (!g->defer_snapshot_taken) {
+        /* No rollback state, so this token cannot be undone. */
+        g->valid = false;
+        return false;
+    }
+    ds41_verify_state st = {
+        .pos = g->defer_snapshot_pos,
+        .history = g->defer_snapshot_history,
+        .valid = g->defer_snapshot_valid,
+    };
     if (!ds41_verify_rollback(g, &st)) {
         g->valid = false;
         return false;
