@@ -42312,10 +42312,31 @@ static bool ds41_verify_rollback(ds41_gpu_graph *g, const ds41_verify_state *st)
     return ds4_gpu_end_commands() && ok;
 }
 
+/* Decode-side Engram cost. The two n-gram tables are 94 GiB each and are read
+ * with pread at the head of every token, 24 scattered rows per table -- work
+ * that no profile counter covered. */
+static int g_engram_decode_profile = -1;
+static double g_engram_decode_ms;
+static uint64_t g_engram_decode_reads, g_engram_decode_tokens;
+
+static void ds41_engram_decode_report(void) {
+    if (g_engram_decode_profile <= 0 || g_engram_decode_tokens == 0) return;
+    fprintf(stderr,
+            "ds4: engram decode reads=%llu tokens=%llu total=%.1f ms avg=%.3f ms/token\n",
+            (unsigned long long)g_engram_decode_reads,
+            (unsigned long long)g_engram_decode_tokens,
+            g_engram_decode_ms,
+            g_engram_decode_ms / (double)g_engram_decode_tokens);
+}
+
 static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_weights *w, int token, float *logits,
                                  int defer_disabled) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    if (g_engram_decode_profile < 0) {
+        g_engram_decode_profile = getenv("DS4_ENGRAM_DECODE_PROFILE") != NULL;
+        if (g_engram_decode_profile) atexit(ds41_engram_decode_report);
+    }
     ds4_gpu_stream_expert_defer_begin_token(defer_disabled);
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
@@ -42325,13 +42346,19 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
     if (overlap_engram && !ds4_engram_reader_start(g->engram_reader,
             g->table, ids, &g->rows[0][0])) return false;
     for (uint32_t i = 0; !overlap_engram && !ds41_image_at(g, g->pos) && i < 2; i++) {
+        const double t_eg0 = g_engram_decode_profile ? now_sec() : 0.0;
 #ifdef __APPLE__
         if (!ds4_engram_read_batch(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]))
             return false;
 #else
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
 #endif
+        if (g_engram_decode_profile) {
+            g_engram_decode_ms += (now_sec() - t_eg0) * 1000.0;
+            g_engram_decode_reads++;
+        }
     }
+    if (g_engram_decode_profile) g_engram_decode_tokens++;
     const float initial_pre[] = {1, 0, 0, 0};
 #ifndef DS4_NO_GPU
     /* Top up the clean-slot reserve before opening this token's command
