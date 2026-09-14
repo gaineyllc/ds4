@@ -72633,6 +72633,42 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+#if defined(__APPLE__)
+        /*
+         * Hold the support model's weights down.
+         *
+         * The drafter is read through no-copy views of its own mapping, and
+         * nothing was wiring that mapping: measured mid-decode it sat at 3 MiB
+         * resident out of 7.84 GiB, so every draft step was faulting its
+         * weights back off the SSD while the target's expert streaming churned
+         * the page cache around it. The target's static weights have been
+         * locked since forever for exactly this reason; the support model is
+         * small enough to deserve the same treatment, and is skipped when the
+         * machine cannot spare it.
+         */
+        if (support_model_runtime_ready && e->ssd_streaming &&
+            e->mtp_model.map && e->mtp_model.size > e->mtp_model.tensor_data_pos &&
+            getenv("DS4_DISABLE_SUPPORT_MODEL_MLOCK") == NULL) {
+            const uint64_t lo = e->mtp_model.tensor_data_pos;
+            const uint64_t hi = e->mtp_model.size;
+            uint64_t locked = 0, failed = 0;
+            bool can_lock = true;
+            for (uint64_t off = lo; off < hi;) {
+                uint64_t len = hi - off;
+                if (len > 256ull * 1024 * 1024) len = 256ull * 1024 * 1024;
+                if (can_lock && mlock(e->mtp_model.map + off, (size_t)len) == 0) {
+                    locked += len;
+                } else {
+                    can_lock = false;
+                    failed += len;
+                }
+                off += len;
+            }
+            fprintf(stderr,
+                    "ds4: support model weights locked %.2f GiB; pageable %.2f GiB\n",
+                    locked / 1073741824.0, failed / 1073741824.0);
+        }
+#endif
         if (!ds4_engine_preload_pro_q4_expert_tables(e,
                                                      load_slice,
                                                      load_layer_start,
