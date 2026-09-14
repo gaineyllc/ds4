@@ -3982,6 +3982,17 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
         device       char * dst_mid,
         device const char * ids,
         device const char * weights,
+        /*
+         * Deferred decode needs to know whether any expert this token routed to
+         * was missing from the cache. This kernel is already the thing that
+         * finds out -- it returns without contributing when an address is zero
+         * -- so it raises the flag itself. The alternative, a separate one-
+         * thread validator dispatch per layer, sits as a barrier between the
+         * MoE and everything after it and cost 30% of decode at 65k context
+         * (6.9 t/s against 9.9 with it removed). Here a miss costs one relaxed
+         * atomic and a hit costs nothing at all.
+         */
+        device atomic_uint * miss,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -3998,6 +4009,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
     const uint64_t gate_addr = gate_addrs[(uint)i02];
     const uint64_t up_addr = up_addrs[(uint)i02];
     if (gate_addr == 0 || up_addr == 0) {
+        atomic_fetch_or_explicit(miss, 1u, memory_order_relaxed);
         return;
     }
 
@@ -6106,6 +6118,7 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
         device const char * src1,
         device       char * dst,
         device const char * ids,
+        device atomic_uint * miss,   /* see the pair kernel above */
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -6135,6 +6148,7 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
         }
         const uint64_t addr = addrs[(uint)expert];
         if (addr == 0) {
+            atomic_fetch_or_explicit(miss, 1u, memory_order_relaxed);
             continue;
         }
         device const char *src0_cur =
