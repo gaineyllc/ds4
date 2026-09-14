@@ -862,6 +862,8 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
         uint64_t down_expert_bytes);
 static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
+static void ds4_gpu_stream_expert_cache_residency_drop(id<MTLBuffer> buffer);
+static void ds4_gpu_stream_expert_cache_residency_flush_retired(void);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
@@ -14616,6 +14618,9 @@ void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes) {
     /* Release the trailing slabs. Dropping the last strong reference returns
      * the wired pages to the OS, which is the entire point of the exercise. */
     for (uint32_t i = keep_slabs; i < g_stream_expert_cache_slab_count; i++) {
+        /* The residency set (and its member index) hold the slab too; a nil
+         * here alone would leave the wired pages behind. */
+        ds4_gpu_stream_expert_cache_residency_drop(g_stream_expert_cache_slabs[i]);
         g_stream_expert_cache_slabs[i] = nil;
         g_stream_expert_cache_slab_start_slot[i] = 0;
         g_stream_expert_cache_slab_slot_count[i] = 0;
@@ -15323,6 +15328,25 @@ static void ds4_gpu_stream_expert_cache_residency_publish(void) {
 #endif
 }
 
+/* Removals never mark the set dirty (see above), so on their own they never
+ * reach a commit: a token that only evicts -- every token on the stopping
+ * path, or a cache release -- would hold its retired buffers forever. Commit
+ * them whenever no deferred token can still be naming them through the set.
+ * Called once per token and on a full cache clear; a no-op when nothing is
+ * retired, so the deferred path's once-per-token commit budget is unchanged. */
+static void ds4_gpu_stream_expert_cache_residency_flush_retired(void) {
+#if TARGET_OS_OSX
+    if (g_stream_expert_cache_residency_failed) return;
+    if (!g_stream_expert_cache_residency_set) return;
+    if (ds4_gpu_stream_expert_defer_in_flight()) return;
+    if (@available(macOS 15.0, *)) {
+        if ([g_stream_expert_cache_residency_retired count] == 0) return;
+        [g_stream_expert_cache_residency_set commit];
+        [g_stream_expert_cache_residency_retired removeAllObjects];
+    }
+#endif
+}
+
 static int ds4_gpu_stream_expert_cache_residency_ready(void) {
 #if TARGET_OS_OSX
     if (g_stream_expert_cache_residency_failed) return 0;
@@ -15734,6 +15758,8 @@ static void ds4_gpu_stream_expert_defer_note_outcome(int missed) {
 void ds4_gpu_stream_expert_defer_begin_token(int disabled) {
     g_stream_expert_defer_disabled_for_token = disabled ? 1 : 0;
     g_stream_expert_defer_in_flight = 0;
+    /* The previous token is done with the set: let its evictions go. */
+    ds4_gpu_stream_expert_cache_residency_flush_retired();
     g_stream_expert_defer_token_mode = disabled ? 2 : 0;
     /* Cleared for every token, deferred or not: a stale flag left over from an
      * earlier token would send this one down the rollback path for nothing. */
@@ -16150,6 +16176,7 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     g_stream_expert_cache_bytes = 0;
     g_stream_expert_cache_entry_count = 0;
     for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        ds4_gpu_stream_expert_cache_residency_drop(g_stream_expert_cache_slabs[i]);
         g_stream_expert_cache_slabs[i] = nil;
         g_stream_expert_cache_slab_start_slot[i] = 0;
         g_stream_expert_cache_slab_slot_count[i] = 0;
@@ -16162,6 +16189,10 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     memset(g_stream_expert_cache_slab_slot_locked,
            0,
            sizeof(g_stream_expert_cache_slab_slot_locked));
+    /* Every entry just left the residency set; nothing is in flight that
+     * could name them, so release the retired buffers now rather than at
+     * the next token (which a cache release outside decode never reaches). */
+    ds4_gpu_stream_expert_cache_residency_flush_retired();
     if (reset_stats) {
         g_stream_expert_cache_hits = 0;
         g_stream_expert_cache_misses = 0;
