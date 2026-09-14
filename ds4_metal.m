@@ -12937,6 +12937,17 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
             "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
             ds4_gpu_gib(offset),
             ds4_gpu_gib(end));
+    if (getenv("DS4_METAL_MODEL_VIEW_DEBUG")) {
+        fprintf(stderr, "ds4:   want map=%p size=%llu; %u views registered:\n",
+                model_map, (unsigned long long)model_size, g_model_view_count);
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            fprintf(stderr, "ds4:     [%u] map=%p size=%llu off=%.3f GiB bytes=%.3f GiB\n",
+                    i, g_model_views[i].model_map,
+                    (unsigned long long)g_model_views[i].model_size,
+                    ds4_gpu_gib(g_model_views[i].model_offset),
+                    ds4_gpu_gib(g_model_views[i].bytes));
+        }
+    }
     return nil;
 }
 
@@ -13502,10 +13513,11 @@ static int ds4_gpu_stream_expert_pread_into(
     if (ms_out) *ms_out = dt;
     if (!ok || pos != len) {
         fprintf(stderr,
-                "ds4: Metal streaming expert explicit pread failed offset=%.2f GiB len=%.2f MiB read=%.2f MiB\n",
+                "ds4: Metal streaming expert explicit pread failed offset=%.2f GiB len=%.2f MiB read=%.2f MiB errno=%d\n",
                 ds4_gpu_gib(offset),
                 ds4_gpu_mib(len),
-                ds4_gpu_mib(pos));
+                ds4_gpu_mib(pos),
+                errno);
         return 0;
     }
     return 1;
@@ -15195,8 +15207,19 @@ static int g_stream_expert_defer_dispatch;
 
 static id g_stream_expert_cache_residency_set;
 static NSMutableSet *g_stream_expert_cache_residency_members;
+/*
+ * Additions and removals are not symmetric. A buffer that was just added is not
+ * safe to read until the set is committed, so a pending addition must stop a
+ * layer from deferring. A removal is only about not leaving a freed allocation
+ * in the set, which holding the buffer alive until the next commit takes care
+ * of -- so pending removals must NOT stop deferral. Treating them the same way
+ * deadlocks the two features against each other: pruning drops entries, the set
+ * goes dirty, deferral switches off, the stopping path prunes again.
+ */
 static int g_stream_expert_cache_residency_dirty;
+static NSMutableArray *g_stream_expert_cache_residency_retired;
 static int g_stream_expert_cache_residency_failed;
+static int g_stream_expert_cache_residency_published_this_token;
 
 static void ds4_gpu_stream_expert_cache_residency_note(id<MTLBuffer> buffer) {
 #if TARGET_OS_OSX
@@ -15223,6 +15246,7 @@ static void ds4_gpu_stream_expert_cache_residency_note(id<MTLBuffer> buffer) {
         [g_stream_expert_cache_residency_members addObject:buffer];
         [g_stream_expert_cache_residency_set addAllocation:buffer];
         g_stream_expert_cache_residency_dirty = 1;
+        g_stream_expert_cache_residency_published_this_token = 0;
     }
 #else
     (void)buffer;
@@ -15236,7 +15260,11 @@ static void ds4_gpu_stream_expert_cache_residency_drop(id<MTLBuffer> buffer) {
         if (![g_stream_expert_cache_residency_members containsObject:buffer]) return;
         [g_stream_expert_cache_residency_members removeObject:buffer];
         [g_stream_expert_cache_residency_set removeAllocation:buffer];
-        g_stream_expert_cache_residency_dirty = 1;
+        /* Hold the buffer alive until the removal is committed, so the set can
+         * never name an allocation that has been freed. */
+        if (!g_stream_expert_cache_residency_retired)
+            g_stream_expert_cache_residency_retired = [NSMutableArray array];
+        [g_stream_expert_cache_residency_retired addObject:buffer];
     }
 #else
     (void)buffer;
@@ -15248,25 +15276,46 @@ static void ds4_gpu_stream_expert_cache_residency_drop(id<MTLBuffer> buffer) {
  * dispatch needs no per-encoder bookkeeping at all. */
 static int g_stream_expert_cache_residency_on_queue;
 
+/* Publishing costs time proportional to the size of the set, so it happens at
+ * most once per token rather than once per layer -- committing on every layer
+ * cost 40% of DSpark's decode rate, because its verify batch installs entries
+ * continuously. Later layers of a token that installed something still defer:
+ * the first of them pays the one commit this token is allowed. */
+static void ds4_gpu_stream_expert_cache_residency_publish(void) {
+#if TARGET_OS_OSX
+    if (g_stream_expert_cache_residency_failed) return;
+    if (!g_stream_expert_cache_residency_set) return;
+    if (@available(macOS 15.0, *)) {
+        if (g_stream_expert_cache_residency_dirty ||
+            [g_stream_expert_cache_residency_retired count] != 0) {
+            [g_stream_expert_cache_residency_set commit];
+            [g_stream_expert_cache_residency_set requestResidency];
+            g_stream_expert_cache_residency_dirty = 0;
+            [g_stream_expert_cache_residency_retired removeAllObjects];
+        }
+        if (!g_stream_expert_cache_residency_on_queue &&
+            g_queue &&
+            [g_queue respondsToSelector:@selector(addResidencySet:)]) {
+            [g_queue addResidencySet:g_stream_expert_cache_residency_set];
+            g_stream_expert_cache_residency_on_queue = 1;
+        }
+    }
+#endif
+}
+
 static int ds4_gpu_stream_expert_cache_residency_ready(void) {
 #if TARGET_OS_OSX
     if (g_stream_expert_cache_residency_failed) return 0;
     if (!g_stream_expert_cache_residency_set) return 0;
     if (@available(macOS 15.0, *)) {
-        if (g_stream_expert_cache_residency_dirty) {
-            [g_stream_expert_cache_residency_set commit];
-            [g_stream_expert_cache_residency_set requestResidency];
-            g_stream_expert_cache_residency_dirty = 0;
+        if (g_stream_expert_cache_residency_dirty ||
+            !g_stream_expert_cache_residency_on_queue) {
+            if (g_stream_expert_cache_residency_published_this_token) return 0;
+            g_stream_expert_cache_residency_published_this_token = 1;
+            ds4_gpu_stream_expert_cache_residency_publish();
         }
-        if (!g_stream_expert_cache_residency_on_queue) {
-            if (!g_queue ||
-                ![g_queue respondsToSelector:@selector(addResidencySet:)]) {
-                return 0;
-            }
-            [g_queue addResidencySet:g_stream_expert_cache_residency_set];
-            g_stream_expert_cache_residency_on_queue = 1;
-        }
-        return 1;
+        return !g_stream_expert_cache_residency_dirty &&
+               g_stream_expert_cache_residency_on_queue;
     }
 #endif
     return 0;
@@ -15530,6 +15579,10 @@ static uint64_t g_stream_expert_defer_tokens, g_stream_expert_defer_redos;
 static uint64_t g_stream_expert_defer_layers;
 /* Set from the first deferred layer of a token until the token is checked. */
 static int g_stream_expert_defer_in_flight;
+/* A token commits to one mode at its first routed layer and keeps it. Mixing
+ * the two within a token would put a stopping layer -- which needs to evict --
+ * inside the window where a deferred layer's experts must not be freed. */
+static int g_stream_expert_defer_token_mode; /* 0 undecided, 1 defer, 2 stop */
 
 int ds4_gpu_stream_expert_defer_in_flight(void) {
     return g_stream_expert_defer_in_flight;
@@ -15561,7 +15614,9 @@ static id<MTLBuffer> ds4_gpu_stream_expert_defer_slot(uint32_t layer) {
 void ds4_gpu_stream_expert_defer_begin_token(int disabled) {
     g_stream_expert_defer_disabled_for_token = disabled ? 1 : 0;
     g_stream_expert_defer_in_flight = 0;
+    g_stream_expert_defer_token_mode = disabled ? 2 : 0;
     if (disabled) return;
+    g_stream_expert_cache_residency_published_this_token = 0;
     const NSUInteger bytes =
         (NSUInteger)DS4_METAL_STREAM_EXPERT_VALIDATE_WORDS * sizeof(uint32_t);
     for (uint32_t i = 0; i < g_stream_expert_defer_used &&
@@ -15578,6 +15633,7 @@ int ds4_gpu_stream_expert_defer_token_missed(void) {
     /* The token has been waited on by the caller before we get here, so no
      * kernel is still reading the bank: reopen it for eviction. */
     g_stream_expert_defer_in_flight = 0;
+    g_stream_expert_defer_token_mode = 0;
     for (uint32_t i = 0; i < g_stream_expert_defer_used &&
                          i < DS4_METAL_DEFER_MAX_LAYER; i++) {
         id<MTLBuffer> b = g_stream_expert_defer_status[i];
@@ -16042,7 +16098,12 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
             }
         }
         if (victim == UINT32_MAX) break;
+        const uint32_t before = g_stream_expert_cache_layer_count[layer];
         ds4_gpu_stream_expert_cache_clear_entry(layer, victim, 1);
+        /* clear_entry declines an entry it must not free (in flight, or a
+         * deferred token still reading the bank). Without this the loop would
+         * pick the same victim forever. */
+        if (g_stream_expert_cache_layer_count[layer] >= before) break;
     }
 }
 
@@ -16696,7 +16757,9 @@ static void ds4_gpu_stream_expert_cache_prune_global(
             }
         }
         if (victim_layer == UINT32_MAX || victim_expert == UINT32_MAX) break;
+        const uint32_t before = g_stream_expert_cache_entry_count;
         ds4_gpu_stream_expert_cache_clear_entry(victim_layer, victim_expert, 1);
+        if (g_stream_expert_cache_entry_count >= before) break;
     }
 }
 
@@ -17704,6 +17767,35 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         const int force_reuse =
             cache_budget != 0 && reserved_entries >= cache_budget;
 
+        /* Same deal as the batched loader: with the no-copy cache the expert
+         * already lives in the model's own pages, so the entry is a view of
+         * them. Falling through to the copy path here would hand pread a
+         * destination inside a read-only mapping, which fails with EFAULT --
+         * that is what broke DSpark, whose verify batch comes through this
+         * loader rather than the batched one. */
+        if (!gpu_copy_source && ds4_gpu_stream_expert_nocopy_enabled()) {
+            uint64_t gi = 0, ui = 0, di = 0;
+            gate_bufs[load_i] =
+                ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
+                                                     gate_abs_offsets[slot],
+                                                     gate_expert_bytes, &gi);
+            up_bufs[load_i] =
+                ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
+                                                     up_abs_offsets[slot],
+                                                     gate_expert_bytes, &ui);
+            down_bufs[load_i] =
+                ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
+                                                     down_abs_offsets[slot],
+                                                     down_expert_bytes, &di);
+            if (!gate_bufs[load_i] || !up_bufs[load_i] || !down_bufs[load_i]) {
+                return 0;
+            }
+            gate_inners[load_i] = (NSUInteger)gi;
+            up_inners[load_i] = (NSUInteger)ui;
+            down_inners[load_i] = (NSUInteger)di;
+            continue;
+        }
+
         if (!gpu_copy_source) {
             ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot],
                                                   gate_expert_bytes);
@@ -18310,6 +18402,34 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
 
             const int force_reuse =
                 cache_budget != 0 && reserved_entries >= cache_budget;
+            /* With the no-copy cache the expert is already in the model's own
+             * pages: wrap them instead of allocating a slot and reading into
+             * it, which would hand pread a read-only destination. */
+            if (ds4_gpu_stream_expert_nocopy_enabled()) {
+                uint64_t gi = 0, ui = 0, di = 0;
+                gate_bufs[n_loads] =
+                    ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
+                                                         unique_gate_offsets[u],
+                                                         gate_expert_bytes, &gi);
+                up_bufs[n_loads] =
+                    ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
+                                                         unique_up_offsets[u],
+                                                         gate_expert_bytes, &ui);
+                down_bufs[n_loads] =
+                    ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
+                                                         unique_down_offsets[u],
+                                                         down_expert_bytes, &di);
+                if (!gate_bufs[n_loads] || !up_bufs[n_loads] || !down_bufs[n_loads]) {
+                    ok = 0;
+                    break;
+                }
+                gate_inners[n_loads] = (NSUInteger)gi;
+                up_inners[n_loads] = (NSUInteger)ui;
+                down_inners[n_loads] = (NSUInteger)di;
+                load_unique[n_loads] = u;
+                n_loads++;
+                continue;
+            }
             /* The worker pool reads this entire batch below. Serial read-ahead
              * here waits for the same pages before parallel I/O can begin. */
             const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
@@ -42607,11 +42727,17 @@ int ds4_gpu_routed_moe_one_tensor(
                 g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
                 g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil &&
                 g_moe_stream_expert_cache_validate_pipeline != nil &&
+                g_stream_expert_defer_token_mode != 2 &&
                 ds4_gpu_stream_expert_cache_addr_buffers(layer_index,
                                                          &stream_gate_addr_buf,
                                                          &stream_up_addr_buf,
                                                          &stream_down_addr_buf) &&
                 ds4_gpu_stream_expert_cache_residency_ready();
+            /* Whatever the first routed layer decides, the rest of the token
+             * follows -- see g_stream_expert_defer_token_mode. */
+            if (g_stream_expert_defer_token_mode == 0) {
+                g_stream_expert_defer_token_mode = use_stream_expert_defer ? 1 : 2;
+            }
             if (getenv("DS4_METAL_V41_DEFER_DEBUG") && !use_stream_expert_defer) {
                 static int said = 0;
                 if (said < 6) {

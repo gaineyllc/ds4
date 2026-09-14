@@ -72040,8 +72040,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        /* One extra mapping is enough to uncover the target's model views. */
-        ds4_gpu_stream_expert_nocopy_block();
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         ds4_dspark_summary dspark = {0};
         e->support_kind =
