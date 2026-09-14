@@ -848,6 +848,18 @@ static uint64_t g_model_residency_count;
 static int g_model_residency_added_to_queue;
 static int g_glm_model_mode;
 static int g_ssd_streaming_mode;
+/*
+ * Rows per simdgroup for the V4.1 decode matvecs. Injected into the Metal
+ * preamble (N_R0_*) and used by the matching host dispatches, so the two can
+ * never disagree on how many rows a threadgroup covers -- a shader-only edit
+ * silently leaves rows uncomputed (and looks like a speedup). Measured on an
+ * M5 Max with 176 experts/layer resident: 1, 2 and 4 rows per simdgroup are
+ * within noise for all four kernels, so the upstream values stay.
+ */
+#define DS4_METAL_N_R0_IQ2_XXS_ADDR 4
+#define DS4_METAL_N_R0_Q2_K_SUM6    4
+#define DS4_METAL_N_R0_Q4_K_DENSE   2
+#define DS4_METAL_N_R0_Q4_K_ATTN_LOW 2
 /* Experts installed since the token began: the stopping path's evidence
  * that the bank is (not yet) warm enough for deferral to be worth betting on. */
 static uint64_t g_stream_expert_cache_installs_this_token;
@@ -4861,6 +4873,10 @@ static NSString *ds4_gpu_full_source(void) {
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
+    [source appendFormat:@"#define N_R0_IQ2_XXS_ADDR %d\n#define N_R0_Q2_K_SUM6 %d\n"
+                          "#define N_R0_Q4_K_DENSE %d\n#define N_R0_Q4_K_ATTN_LOW %d\n",
+                         DS4_METAL_N_R0_IQ2_XXS_ADDR, DS4_METAL_N_R0_Q2_K_SUM6,
+                         DS4_METAL_N_R0_Q4_K_DENSE, DS4_METAL_N_R0_Q4_K_ATTN_LOW];
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv([spec[0] UTF8String]);
         NSMutableArray<NSString *> *paths = [NSMutableArray array];
@@ -21079,11 +21095,11 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                     .nb13 = in_dim * n_tok * sizeof(float),
                     .ne0 = (int32_t)out_dim,
                     .ne1 = (int32_t)n_tok,
-                    .nr0 = 2,
+                    .nr0 = DS4_METAL_N_R0_Q4_K_DENSE,
                     .r2 = 1,
                     .r3 = 1,
                 };
-                const uint64_t rows_ptg = (uint64_t)nsg * 2u;
+                const uint64_t rows_ptg = (uint64_t)nsg * DS4_METAL_N_R0_Q4_K_DENSE;
 
                 id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
                 [enc setComputePipelineState:pipeline];
@@ -28249,7 +28265,7 @@ int ds4_gpu_attention_output_low_q4_K_slice_tensor(
                 .ne0 = (int32_t)rank,
                 .ne1 = (int32_t)group_cnt,
                 .nb1 = (uint64_t)rank * sizeof(float),
-                .nr0 = 2,
+                .nr0 = DS4_METAL_N_R0_Q4_K_ATTN_LOW,
             };
             const NSUInteger nsg = 2;
             id<MTLComputePipelineState> pipeline =
@@ -33791,6 +33807,10 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
         return 0;
     }
 
+    /* The address kernels are compiled with their own row count. */
+    ds4_gpu_mul_mv_id_args addr_args = *args;
+    addr_args.nr0 = DS4_METAL_N_R0_IQ2_XXS_ADDR;
+    args = &addr_args;
     const NSUInteger nr0 = (NSUInteger)args->nr0;
     const NSUInteger rows_per_group = rows_per_group_is_nr0 ? nr0 : nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
@@ -33926,6 +33946,10 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
         return 0;
     }
 
+    /* Compiled with N_R0_Q2_K_SUM6, not the generic routed row count. */
+    ds4_gpu_mul_mv_id_args sum6_args = *args;
+    sum6_args.nr0 = DS4_METAL_N_R0_Q2_K_SUM6;
+    args = &sum6_args;
     const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
 
@@ -33991,6 +34015,10 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
         return 0;
     }
 
+    /* The address kernels are compiled with their own row count. */
+    ds4_gpu_mul_mv_id_args addr_args = *args;
+    addr_args.nr0 = DS4_METAL_N_R0_IQ2_XXS_ADDR;
+    args = &addr_args;
     const NSUInteger nr0 = (NSUInteger)args->nr0;
     const NSUInteger rows_per_group = rows_per_group_is_nr0 ? nr0 : nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
@@ -34054,6 +34082,10 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
         return 0;
     }
 
+    /* Compiled with N_R0_Q2_K_SUM6, not the generic routed row count. */
+    ds4_gpu_mul_mv_id_args sum6_args = *args;
+    sum6_args.nr0 = DS4_METAL_N_R0_Q2_K_SUM6;
+    args = &sum6_args;
     const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
 

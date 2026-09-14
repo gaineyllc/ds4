@@ -161,14 +161,19 @@ static int request_order(const void *a, const void *b) {
 enum {
     DS4_ENGRAM_MAX_READERS = 64,
     /*
-     * Below this many rows, serial wins. A decode step asks for COLS=24 rows
-     * per table: measured on an M5 Max, routing that through the pool costs
-     * ~15% decode (13.8 -> 11.7 t/s) because waking the readers through one
-     * mutex twice per token dwarfs the ~2.4 ms of reads it parallelises.
-     * Prefill batches (up to 2048 x 24) amortise it and gain 1.3-2.4x.
-     * Override with DS4_ENGRAM_MIN_PARALLEL.
+     * Decode asks for COLS=24 rows per table per token and those reads sit
+     * on the critical path between one token's logits and the next token's
+     * first layer. Serial, they cost 2.2 ms/token on an M5 Max; through the
+     * pool 0.4-0.7 ms. That was a 15% loss (13.8 -> 11.7 t/s) when decode
+     * still drained the GPU at every routed layer and the reads hid behind
+     * those stalls; with the deferred expert path the token boundary is the
+     * stall, and the pool is worth +12% (42.8 -> 47.9 t/s). Decode-sized
+     * batches cap the width at DS4_ENGRAM_DECODE_READERS: the calibrated
+     * width targets prefill throughput, and waking more readers than rows
+     * pay for costs latency. Override with DS4_ENGRAM_MIN_PARALLEL.
      */
-    DS4_ENGRAM_MIN_PARALLEL_DEFAULT = 256,
+    DS4_ENGRAM_MIN_PARALLEL_DEFAULT = DS4_ENGRAM_COLS,
+    DS4_ENGRAM_DECODE_READERS = 16,
     DS4_ENGRAM_PROBE_READS = 192,    /* per width, per probe */
     DS4_ENGRAM_PAGE = 4096
 };
@@ -501,6 +506,8 @@ static bool engram_run_requests(const ds4_engram_table *t,
     int width = 1;
     if (count >= engram_min_parallel()) {
         width = engram_readers(t);
+        if (count < 256 && width > DS4_ENGRAM_DECODE_READERS &&
+            !getenv("DS4_ENGRAM_READERS")) width = DS4_ENGRAM_DECODE_READERS;
         if ((size_t)width > count) width = (int)count;
         if (width > 1 && engram_pool_start(engram_readers(t))) {
             /* Oversubscribe parts so a slow read cannot stall a whole slice,

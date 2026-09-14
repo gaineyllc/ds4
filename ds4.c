@@ -7912,14 +7912,20 @@ static bool weights_parse_keep_line(const char *line, uint32_t *layer,
     return true;
 }
 
+/* Parsed keep-sets, kept so the streaming bank can be seeded with exactly
+ * these experts before the first token (ds41_keep_seed). */
+static uint8_t  g_expert_keep_set[DS4_MAX_LAYER][DS4_MAX_EXPERT];
+static uint32_t g_expert_keep_count[DS4_MAX_LAYER];
+static bool     g_expert_keep_active;
+
 static void weights_apply_expert_keep(const ds4_weights *w, const ds4_model *m,
                                       uint32_t start, uint32_t end) {
     const char *path = getenv("DS4_EXPERT_KEEP");
     if (!path || !path[0]) return;
     FILE *f = fopen(path, "r");
     if (!f) ds4_die_errno("cannot open expert keep-list", path);
-    uint8_t keep[DS4_N_EXPERT];
-    float bias[DS4_N_EXPERT];
+    uint8_t keep[DS4_MAX_EXPERT];
+    float bias[DS4_MAX_EXPERT];
     char line[16384];
     uint32_t layers = 0, total_kept = 0;
     while (fgets(line, sizeof(line), f)) {
@@ -7940,13 +7946,18 @@ static void weights_apply_expert_keep(const ds4_weights *w, const ds4_model *m,
                 ds4_die("cannot apply expert keep-list to the router");
             }
         }
+        memcpy(g_expert_keep_set[il], keep, DS4_N_EXPERT);
+        g_expert_keep_count[il] = kept;
+        g_expert_keep_active = true;
         layers++;
         total_kept += kept;
     }
     fclose(f);
     if (layers) {
-        fprintf(stderr, "ds4: expert keep-list %s: %u layers, %.1f experts/layer kept of %u\n",
-                path, layers, (double)total_kept / layers, (unsigned)DS4_N_EXPERT);
+        fprintf(stderr, "ds4: expert keep-list %s: %u layers, %.1f experts/layer kept of %u "
+                "(%u experts, %.2f GiB at 9.49 MiB each)\n",
+                path, layers, (double)total_kept / layers, (unsigned)DS4_N_EXPERT,
+                total_kept, (double)total_kept * 9.49 / 1024.0);
     }
 }
 #endif
@@ -40662,6 +40673,9 @@ fail:
 #undef DS41_SCRATCH
 
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
+    static int twice = -1;
+    if (twice < 0) twice = getenv("DS4_METAL_V41_BF16_TWICE") != NULL;
+    if (twice && !ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16)) return false;
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
 
@@ -41998,6 +42012,7 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t count,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud);
+static bool ds41_keep_seed(const ds4_model *m, const ds4_weights *w);
 
 typedef struct {
     uint32_t pos;
@@ -42462,6 +42477,7 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
  * rolled back and decoded again. */
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
+    if (g->streaming && !ds41_keep_seed(m, w)) return false;
     static int defer = -1;
     if (defer < 0) defer = getenv("DS4_METAL_V41_DISABLE_DEFER_EXPERT_SYNC") == NULL;
     if (!defer || !g || !g->streaming || g->imatrix || g->quality || g->tp_world == 2)
@@ -42487,6 +42503,60 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         return false;
     }
     return ds41_graph_step_once(g, m, w, token, logits, 1);
+}
+
+/* With a keep-list the routed working set is known exactly and sized to fit
+ * the bank, so load all of it up front: a kept expert that only entered on
+ * first touch would still miss on every novel token and cost a redo. Once per
+ * process; the bank is global. */
+static bool ds41_keep_seed(const ds4_model *m, const ds4_weights *w) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    static bool done = false;
+    if (done || !g_expert_keep_active || getenv("DS4_METAL_DISABLE_KEEP_SEED")) return true;
+    const uint32_t slots = ds4_gpu_stream_expert_cache_configured_count();
+    uint32_t total = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) total += g_expert_keep_count[il];
+    if (!slots) {
+        fprintf(stderr, "ds4: expert keep-list seed deferred: bank not sized yet\n");
+        return true;
+    }
+    done = true;
+    if (total > slots) {
+        fprintf(stderr, "ds4: expert keep-list needs %u bank slots but the bank has %u: "
+                "expect misses; raise DS4_SSD_CACHE_PERCENT or keep fewer experts\n", total, slots);
+    }
+    int32_t experts[DS4_MAX_EXPERT];
+    uint32_t priority[DS4_MAX_EXPERT];
+    uint32_t seeded = 0;
+    const double t0 = now_sec();
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!g_expert_keep_count[il] || !l->ffn_gate_exps) continue;
+        uint32_t n = 0;
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            if (!g_expert_keep_set[il][e]) continue;
+            experts[n] = (int32_t)e;
+            priority[n] = metal_graph_streaming_builtin_hotness(1, 1);
+            n++;
+        }
+        const ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(m, l, il,
+            routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP,
+            routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD);
+        /* Host-side loader: the GPU-copy seeder needs the layer's expert
+         * region mapped as model views, which only the prefill sweep does. */
+        (void)priority;
+        for (uint32_t i = 0; i < n; i += 6u) {
+            const uint32_t cnt = n - i < 6u ? n - i : 6u;
+            if (!ds4_gpu_stream_expert_cache_seed_selected(&table, experts + i, cnt)) return false;
+        }
+        seeded += n;
+    }
+    fprintf(stderr, "ds4: expert keep-list seeded %u experts into the bank in %.1f s\n",
+            seeded, now_sec() - t0);
+#else
+    (void)m; (void)w;
+#endif
+    return true;
 }
 
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
@@ -43150,6 +43220,7 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t count,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud) {
+    if (g->streaming && !ds41_keep_seed(m, w)) return false;
     return ds41_graph_prefill_sweep(g, m, w, tokens, count, progress, progress_ud,
                                    total, cancel, cancel_ud, false, false);
 }
@@ -69317,6 +69388,16 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e, int ctx_siz
             e->prefill_chunk, true);
     /* GLM's larger fixed tensors and streaming windows need more margin. */
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) cache_percent = 86;
+    /* DS4_SSD_CACHE_PERCENT overrides the share of the recommended working
+     * set the bank may take: a dedicated box running a keep-list that must
+     * fit entirely can go higher than the default margin. */
+    {
+        const char *pct = getenv("DS4_SSD_CACHE_PERCENT");
+        if (pct && pct[0]) {
+            const long v = strtol(pct, NULL, 10);
+            if (v >= 10 && v <= 98) cache_percent = (uint32_t)v;
+        }
+    }
 #else
     (void)ctx_size;
 #endif
