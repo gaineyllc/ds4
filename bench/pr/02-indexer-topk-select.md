@@ -36,5 +36,6 @@ M5 Max 128 GiB, macOS 26.5, DeepSeek V4.1 Flash Q2, Metal SSD streaming.
 - Encoder timeline of a 869k-context decode: kernel_topk_select_hist 58 us x 7348 calls =
   428 ms over the prefill tail where the causal argsort was 3.4 ms per batch.
 - Decode: 435k rows / 3 tokens 3.0 -> 0.35 ms per call, 869k 2.7 -> 0.43 ms.
-- Greedy output at 16k with DSpark byte-identical with and without the select.
-- `./ds4_test --metal-kernels`: OK.
+- On upstream main + this change (branch pr/indexer-topk-select), V4.1 Flash Q2 under SSD streaming at
+  16k with a 23 GiB bank: greedy output byte-identical with and without the select; prefill of the 10k
+  prompt 169 -> 178 t/s (single runs). `./ds4_test --metal-kernels`: OK. `make test-metal-topk-select`: PASS.
