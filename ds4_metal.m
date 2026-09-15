@@ -18943,6 +18943,19 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             n_loads++;
         }
     }
+    if (ok && getenv("DS4_METAL_ROUTE_TRACE") != NULL) {
+        /* One line per layer: every row's selection, then which of the
+         * unique experts missed the bank. Feeds offline predictor studies. */
+        fprintf(stderr, "ds4: route layer=%u rows=%u sel=", layer, n_tokens);
+        for (uint64_t i = 0; i < n_ids; i++) {
+            fprintf(stderr, "%d%c", ids[i], (i + 1) % n_selected == 0 ? ';' : ',');
+        }
+        fprintf(stderr, " miss=");
+        for (uint32_t i = 0; i < n_loads; i++) {
+            fprintf(stderr, "%d,", unique_ids[load_unique[i]]);
+        }
+        fprintf(stderr, "\n");
+    }
     if (ok && n_loads != 0) {
         if (load_timing_t0 != 0.0) {
             const double now_ms = ds4_gpu_now_ms();
