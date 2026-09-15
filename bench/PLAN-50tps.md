@@ -395,6 +395,33 @@ at both lengths (encoder-first sweeps of 8192 rows; layers 0-19 over the whole p
 ## PR series (local topic branches on antirez/ds4 main 9139e2a, in worktree ../ds4-pr)
 1. pr/server-disk-store-rendered-lookup (2d206c2): the KV disk-store lookup fix + tok_roundtrip. `--server` OK.
 2. pr/indexer-topk-select (a372d4c): radix-select top-k + test. Byte-identical at 16k, `--metal-kernels` OK.
-Next: the decode-shaped indexer (rows + MMA kernels: needs 409f569/90a7561 rebased first), prefill rows
-release/reuse, rewind; then the RFC for the no-copy bank + deferral + V4.1 DSpark with the sweep numbers.
+3. pr/indexer-decode-kernels (6856a23): 409f569's indexer hunks + 90a7561 + the MMA kernel; identical output
+   at 16k across MMA/rows/one-row, scores agree to 5e-7, `--metal-kernels` OK.
+Next: prefill rows release/reuse, rewind; the RFC text is in bench/pr/04-rfc-streaming-decode.md.
 Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
+
+## Next levers at 1M, in order of expected gain (written Sep 15 19:20)
+1. DSpark acceptance. 1.73 tokens committed per cycle at block 5 is the multiplier on everything below: a
+   cycle's dense reads (~19 ms floor, ~40 ms today) are shared by however many rows the batch has, so extra
+   rows are cheap at 1M and longer blocks alone do not help (the marginal row is ~30 ms of expert reads and
+   indexer, and adds ~0.25 accepted tokens). What helps is accepting more of the same rows: tree drafts
+   (top-2 alternatives at the first uncertain positions, verified as extra rows at the same position; the
+   verifier commits a path instead of a prefix). Needs per-row attention over prefix+own path and a path
+   commit in the partial-commit code (ds4.c ~84720). Expected +30-50% on committed tokens per cycle.
+2. Expert matvecs (33 ms/cycle at ~27% of bandwidth): iq2_xxs pair_swiglu 510 us and q2_K sum6 317 us per
+   layer for ~12 unique experts x 9.5 MiB = 114 MiB -> 137 GB/s. Issue-bound (dequant tables); the table-
+   driven variants tried Sep 15 were slower. Next: process 2 rows per weight read where the batch has them
+   (the pair kernel reads each expert once per row today), and a q2_K sum6 that keeps the 6 experts' partial
+   sums in registers across the row loop.
+3. bf16 rounding + copies + norms as producer epilogues: 875 + 320 + 194 dispatches per cycle, ~15 ms GPU and
+   ~15 ms host. The mul_mv_ext family stores at one site (dense.metal kernel_mul_mv_ext_q4_f32_impl, the
+   `dst_f32[i01] = sumf[ir1]` line): a `round_bf16` flag in ds4_metal_args_mul_mv (trailing field, zero in
+   the positional initialisers of moe.metal) and in ds4_gpu_mul_mv_ext_args / ds4_gpu_q8_0_matvec_args on the
+   host, plumbed through ds41_matmul_batch's bf16 argument to ds4_gpu_matmul_q8_0_* and the projection_rows
+   paths; the same flag in kernel_rms_norm_mul_f32_4 for ds41_norm_batch. Byte-identity must hold (the
+   rounding is bit-exact wherever it is applied). The copies: let ds41_attention_batch's attention read the
+   window ring in place instead of staging through raw_prefill (3 of the 7 copies per layer).
+4. Indexer K read once per cycle for the 2-3 tokens (22 -> ~11 ms): f16 index cache (the GLM path has
+   cache_f16) and q for the batch's tokens in threadgroup memory.
+5. The host side (~65 ms/cycle at 869k): mostly the read-ahead of real misses (bank at 50% of the experts)
+   plus ~30 ms of encoding; (3) halves the encoding; the misses only shrink with RAM.
