@@ -343,5 +343,34 @@ at both lengths (encoder-first sweeps of 8192 rows; layers 0-19 over the whole p
   token is allowed goes at layer 0 while the installs come after it. Default stays pinned (threshold 0); the
   knob is there for prefill-dominated workloads. A 2k+128 turn is a wash either way; longer generations
   favour the pin, very short prefills favour it too.
-- Open question worth an experiment: wired memory grows by ~40 GiB when a 23 GiB bank is pinned. Either the
-  driver holds a second copy of no-copy pages, or the accounting double counts; a 15 GiB bank would tell.
+- Answered: wired memory grows 1:1 with the bank, not 2x (plain 16k decode, bank 25.4 / 41.5 / 56.9 GiB ->
+  wired 62 / 76 / 86 GiB average over the last 30 s; the 40 GiB delta in the sweep was the bank plus the
+  prefill reserve and the rest of the session). Same runs: plain decode 200 tokens after a cold 10k prefill is
+  7.4-7.7 t/s whatever the bank size -- the first couple of hundred tokens are the warm-up (installs, no
+  deferral), and the 14-15 t/s of the sweep is what a warm bank does (its frontiers accumulate 128 tokens each).
+- Per-feature ablation by ds4-bench (fresh 16k/48k prefill + 128 tokens) cannot see the decode features for
+  the same reason: every run is in warm-up. Standalone numbers on a quiet GPU instead: top-k select vs sort
+  65k 0.89 -> 0.37 ms, 435k 2.36 -> 0.40, 869k 3.34 -> 0.41, 32-row causal 4.94 -> 1.82 (4096 rows: 0.83 vs
+  0.71, k=1 at 129k: the sort wins 0.43 vs 0.85); indexer rows kernel vs MMA 435k x 3: 0.72 -> 0.50 ms/token,
+  869k: 1.45 -> 1.09 (the MMA kernel reads K at 445 GB/s, i.e. at the floor -- the earlier 3.6 -> 0.6 was
+  measured with the GPU shared, which hurt the old kernel more).
+
+## Sep 15 evening — clean 869k decode with the deferred batches in (backup off)
+- Server, 570k cold store hit -> 298503-token prefill in 562 s (531 t/s avg) -> 300 tokens: 10.2 t/s on the
+  first request, 8.7 / 8.0 / 8.7 on rewind-based repeats (swap had reached 0.8 GB; Cursor/Codex/Chrome
+  resident). Morning baseline under the backup: 10.7. No gain at 869k from the day's decode work.
+- Why: the bank at 1M is capped at 5078 entries (47 GiB) = ~127 of 256 experts per layer, and a verify batch
+  of ~4 rows routes to ~20 unique experts per layer, so a deferred batch misses with near certainty: 7 of 698
+  verify batches ran deferred, all 7 missed and were rerun with the stops, and the backoff kept the rest
+  stopping. Batched deferral needs a bank that holds nearly every expert the batch can route to -- true at 16k
+  with a 55 GiB bank and a warm LFU, not at 1M on a 128 GiB machine with 40 GB of other work resident.
+- Timeline (611 cycles, 1.73 tokens committed per cycle): GPU span 161 ms/cycle, kernel sum 143 ms, wall ~226
+  ms -> ~65 ms/cycle CPU-side and gaps. Kernels: indexer 21.9 ms (8.1 calls x 2.7 ms, i.e. the quiet-GPU MMA
+  rate), expert matvecs 33.1 (pair 20.4 + sum6 12.7), dense q8_0/f16/f32 matvecs ~40, attn_out_low 8.6,
+  copies 7.9 (320/cycle), bf16_linear 5.5 (875/cycle), indexed attention 4.9, rms_norm 1.8.
+- Where 50 t/s stands against physics: the dense weights are ~9 GiB per token at ~500 GB/s = ~19 ms of pure
+  reads per cycle, shared by the 1.7 rows of the cycle; experts ~4.5 GB per cycle = ~9 ms; the indexer's K read
+  ~11 ms at f16. With every kernel at the bandwidth floor and the host overhead gone, a cycle is ~55-60 ms for
+  ~1.7 tokens, i.e. ~30 t/s. 50 t/s at 1M needs that AND a DSpark that commits ~3 tokens per cycle (block 5,
+  currently 1.7 agreed). The gaps today: dense kernels at ~45% of bandwidth, expert kernels at ~27%, the
+  indexer re-reading K per token, ~15 ms of tiny dispatches, ~65 ms host-side.
