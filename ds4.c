@@ -77420,9 +77420,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         /* The bank gives back the batch rows this prefill sweeps, no more: a
          * short tail after a cache hit leaves most of them, and the experts
          * held in their place, alone. */
-        if (e->ssd_streaming && prompt->len > s->checkpoint.len)
+        if (e->ssd_streaming && prompt->len > s->checkpoint.len) {
+            ds4_gpu_stream_expert_cache_prefill_begin((uint32_t)(prompt->len - s->checkpoint.len));
             ds4_gpu_stream_expert_cache_cap_before_prefill(g->allocation_bytes -
                 ds41_graph_released_beyond(g, (uint32_t)(prompt->len - s->checkpoint.len)));
+        }
         ds41_graph_reuse_prefill_rows(g);
         ds41_encoder_acquire(g, &e->model, &e->weights,
             (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);

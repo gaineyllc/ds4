@@ -418,6 +418,8 @@ void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
 void ds4_gpu_stream_expert_cache_release_resident(void);
 void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes);
 void ds4_gpu_stream_expert_cache_cap_before_prefill(uint64_t context_bytes);
+/* Called with the number of new tokens a prefill is about to sweep. */
+void ds4_gpu_stream_expert_cache_prefill_begin(uint32_t new_tokens);
 void ds4_gpu_stream_note_support_bytes(uint64_t bytes);
 void ds4_gpu_stream_expert_prefetch_layer(uint32_t layer);
 int ds4_gpu_stream_expert_predicted_begin_load(uint32_t layer);

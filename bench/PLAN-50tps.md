@@ -325,3 +325,23 @@ at both lengths (encoder-first sweeps of 8192 rows; layers 0-19 over the whole p
   had held wired at 87 GiB with the compressor at 21 GiB and ~60 MB free for its whole duration.
 - Loop rule (Neil): `git fetch` before every commit; if origin/main moved, rebase, rebuild, rerun the 16k
   byte-identity check, then commit. As of 15:30 the branch is 0 behind / 57 ahead of antirez/ds4 main.
+
+## Sep 15 — antirez's regression sweep, branch vs main (ds4-bench, 2k→64k step 2k, 128 greedy tokens, no DSpark)
+- Same machine, same 23 GiB bank (`--ssd-streaming-cache-experts 30GB`, no-copy), backup off, Cursor/Codex/
+  Chrome/Hermes resident (~40 GB of other apps):
+  - generation: branch 14.7 t/s mean vs main 11.4 (+29%, every frontier; 49k: 17.3 vs 12.3).
+  - incremental prefill (each 2k chunk after 128 decode tokens): branch 76.6 t/s vs main 111.3 (−31%);
+    first token after prefill 330 ms vs 150.
+- The prefill loss is the bank pinned through the sweep (686bd53 publishes the residency set at seed time and
+  the set stays on the queue through decode): the per-layer expert reads (`map`) took 10–12 s per 2k chunk
+  against 7 s on main and 4–5 s with the bank unpinned (the reads come from the file cache when it has the
+  room; wired memory during the sweep was 60–76 GiB pinned vs 24–29 unpinned). Not the released prefill rows
+  (DS4_METAL_DISABLE_REUSABLE_TENSORS=1 changes nothing), not Engram.
+- Unpinning for short sweeps (`DS4_METAL_STREAM_EXPERT_PIN_PREFILL_TOKENS=32768`) gets prefill to 128–131 t/s
+  (above main) but decode then pages the bank back in: 3.7 s before the first token and ~8 t/s over the next
+  128 instead of ~15, and every later layer of those tokens runs with the stops because the one publish a
+  token is allowed goes at layer 0 while the installs come after it. Default stays pinned (threshold 0); the
+  knob is there for prefill-dominated workloads. A 2k+128 turn is a wash either way; longer generations
+  favour the pin, very short prefills favour it too.
+- Open question worth an experiment: wired memory grows by ~40 GiB when a 23 GiB bank is pinned. Either the
+  driver holds a second copy of no-copy pages, or the accounting double counts; a 15 GiB bank would tell.

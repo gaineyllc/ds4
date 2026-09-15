@@ -901,6 +901,8 @@ static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_cache_residency_drop(id<MTLBuffer> buffer);
 static void ds4_gpu_stream_expert_cache_residency_flush_retired(void);
+static void ds4_gpu_stream_expert_cache_residency_detach(void);
+static int g_stream_expert_cache_prefill_pins;
 static void ds4_gpu_stream_expert_cache_prune_global(uint32_t protect_layer,
                                                      const int32_t *protect_ids,
                                                      uint32_t n_protect);
@@ -14763,6 +14765,32 @@ void ds4_gpu_stream_expert_cache_cap_before_prefill(uint64_t context_bytes) {
     ds4_gpu_stream_expert_cache_nocopy_recap(context_bytes, "before prefill");
 }
 
+/* Whether the bank stays wired through a prefill sweep. It does by default:
+ * the sweep's own layer reads evict the early layers' pages from the file
+ * cache, and an unpinned bank is paged back in from SSD under decode's first
+ * tokens (3.7 s before the first token, then ~8 t/s instead of ~15 over the
+ * next 128, M5 Max 128 GiB, 23 GiB bank). The pin has a cost of its own on a
+ * RAM-tight machine: 2k-token continuations prefilled at 77 t/s with the
+ * bank wired against 128 with it unpinned (the layer reads lose file cache
+ * to it). DS4_METAL_STREAM_EXPERT_PIN_PREFILL_TOKENS=N unpins sweeps shorter
+ * than N tokens for workloads where prefill dominates. */
+void ds4_gpu_stream_expert_cache_prefill_begin(uint32_t new_tokens) {
+    if (!ds4_gpu_stream_expert_nocopy_enabled()) return;
+    static long threshold = -1;
+    if (threshold < 0) {
+        const char *env = getenv("DS4_METAL_STREAM_EXPERT_PIN_PREFILL_TOKENS");
+        threshold = 0;
+        if (env && env[0]) {
+            char *end = NULL;
+            errno = 0;
+            const long v = strtol(env, &end, 10);
+            if (errno == 0 && end != env && v >= 0) threshold = v;
+        }
+    }
+    g_stream_expert_cache_prefill_pins = new_tokens >= (uint64_t)threshold;
+    if (!g_stream_expert_cache_prefill_pins) ds4_gpu_stream_expert_cache_residency_detach();
+}
+
 void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes) {
     const uint64_t dense_bytes = g_stream_dense_bytes;
     if (ds4_gpu_stream_expert_nocopy_enabled()) {
@@ -15648,6 +15676,22 @@ static void ds4_gpu_stream_expert_cache_residency_publish(void) {
             [g_queue addResidencySet:g_stream_expert_cache_residency_set];
             g_stream_expert_cache_residency_on_queue = 1;
         }
+    }
+#endif
+}
+
+/* Take the set off the queue so the bank's pages are ordinary file-cache
+ * pages until decode publishes again: a short prefill sweep needs that RAM
+ * for its own layer reads more than decode needs the bank kept hot. Every
+ * dispatch that reads a view while the set is off names it (covers() is
+ * false), so nothing changes for correctness. */
+static void ds4_gpu_stream_expert_cache_residency_detach(void) {
+#if TARGET_OS_OSX
+    if (!g_stream_expert_cache_residency_set || !g_stream_expert_cache_residency_on_queue) return;
+    if (@available(macOS 15.0, *)) {
+        if (g_queue && [g_queue respondsToSelector:@selector(removeResidencySet:)])
+            [g_queue removeResidencySet:g_stream_expert_cache_residency_set];
+        g_stream_expert_cache_residency_on_queue = 0;
     }
 #endif
 }
@@ -19624,7 +19668,7 @@ static int ds4_gpu_stream_expert_cache_seed_experts_impl(
      * are still in the file cache; left until decode, the whole bank is
      * paged back in from SSD under the first ~40 verify cycles instead. */
     if (gpu_copy_source && ds4_gpu_stream_expert_nocopy_enabled() &&
-        (layer & 3u) == 3u) {
+        g_stream_expert_cache_prefill_pins && (layer & 3u) == 3u) {
         /* A commit walks the whole set, so pin every few layers rather than
          * every layer; the sweep's own reads keep that many layers cached.
          * Whatever a trailing layer leaves pending, decode's first publish
