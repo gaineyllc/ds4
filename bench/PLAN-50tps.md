@@ -294,3 +294,34 @@ at both lengths (encoder-first sweeps of 8192 rows; layers 0-19 over the whole p
   kernel_topk_select_hist 58 us x 7348 = 428 ms (was the causal argsort at 3.4 ms per batch).
 - The server's cold disk store of the 1M prompt now hits (c5ce06b): the second 869k prefill of the day went
   570401 -> 868904 in 13.7 min instead of the whole prompt in 25-38.
+
+## Sep 15 — deferred verify batches (no per-layer drain in the DSpark verify sweep)
+- A verify batch of up to 32 rows now takes the deferred route the one-row decoder takes: the address kernels
+  read the router's output and the per-layer GPU tables that install/evict keep current, the residency set
+  covers the bank, and the miss flag is read once at the end of the sweep. A batch that missed is rolled back
+  (`ds41_verify_rollback`, which now also repairs the 128-row windows from the rewind ring — see below) and
+  rerun with the stops in place, so nothing wrong is ever committed. The batch is not held to the one-row
+  warm streak (the drafter's own installs never let it reach 4); the backoff after a real miss still applies.
+- Two bugs found on the way, both pre-existing in spirit:
+  - `ds4_gpu_routed_moe_batch_tensor` never cleared `g_stream_expert_defer_dispatch` at entry (the one-row
+    paths do). Once a deferred batch set it, every later batch — the stopping rerun of a batch that missed,
+    and each verify batch after it — substituted the deferred entry list for the resources it had just
+    prepared: its experts were never marked in flight, `prune_global` could evict them under the running
+    dispatch, and the address kernels then skipped those experts without a stop to catch it. Symptom: after
+    the first deferred miss, "sweep, roll back, sweep" stopped being exact (logits off by up to 13, exactly
+    reproducible, KV state verified intact by hashing every persistent buffer across the rollback).
+  - A DSpark verify sweep of n rows lands in the window slots of positions [start-128, start-128+n) — the
+    oldest rows a token at `pos` still attends to — and a partial commit or rollback never restored them.
+    `ds41_verify_window_repair` (from the rewind ring) fixes it; the 16k reference outputs before this fix
+    were subtly wrong (they no longer match `run16k_old.txt.gen`, and should not).
+  - Also: a layer whose every selected expert is served from overflow views refused to encode (the in-flight
+    marker rejects an empty list); only reachable with a bank small enough to hold none of the layer.
+- Verification: `DS4_METAL_V41_BATCH_DEFER_CHECK=1` reruns every deferred batch with the stops and prints the
+  worst logit difference — 0 for every batch at 16k; 16k DSpark output with deferral is byte-identical to
+  `DS4_METAL_V41_DISABLE_BATCH_DEFER=1`. `DS4_METAL_V41_DEFER_DEBUG=1` prints the layer-0 gate decision.
+- Testing hygiene after the 14:33 hard lock: the 16k debug runs now use `DS4_SSD_CACHE_HEADROOM_GIB=52`
+  (a 36 GiB bank instead of 55; also exercises the miss path), and the watchdogs kill at wired>92 GiB /
+  compressor>20 GiB / swap>3 GB (ds4) and 96/24/3 (ds4-server). The lock came 6 minutes after a run that
+  had held wired at 87 GiB with the compressor at 21 GiB and ~60 MB free for its whole duration.
+- Loop rule (Neil): `git fetch` before every commit; if origin/main moved, rebase, rebuild, rerun the 16k
+  byte-identity check, then commit. As of 15:30 the branch is 0 behind / 57 ahead of antirez/ds4 main.

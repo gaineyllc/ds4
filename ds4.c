@@ -41060,28 +41060,57 @@ static bool ds41_raw_log_write(ds41_gpu_graph *g, uint32_t il, const ds4_gpu_ten
  * again, and the odd-row pair state is rewritten by the next even token; the
  * decode windows are rebuilt from the rewind ring, which must still hold the
  * rows before `pos`. `tokens` is the session's full token history. */
+/* Rebuild the decode windows' rows for positions [from, to) from the rewind
+ * ring; `written` is the highest position the ring has been written up to,
+ * so the rows must not have wrapped. */
+static bool ds41_window_restore(ds41_gpu_graph *g, uint32_t from, uint32_t to, uint32_t written) {
+    if (from >= to) return true;
+    if (!g->raw_log_rows || from < g->raw_log_from || written - from > g->raw_log_rows)
+        return false;
+    const uint64_t rb = 512u * sizeof(float);
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < 40; il++) {
+        for (uint32_t q = from; ok && q < to;) {
+            const uint32_t ls = q % g->raw_log_rows, ws = q % 128u;
+            uint32_t n = to - q;
+            if (n > g->raw_log_rows - ls) n = g->raw_log_rows - ls;
+            if (n > 128u - ws) n = 128u - ws;
+            ok = ds4_gpu_tensor_copy(g->window[il], (uint64_t)ws * rb,
+                                     g->raw_log[il], (uint64_t)ls * rb, (uint64_t)n * rb);
+            q += n;
+        }
+    }
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    return ok;
+}
+
+/* After a snapshot load the ring is empty; copy the windows' rows into it so
+ * the next verify rollback can repair them. */
+static void ds41_raw_log_seed_from_window(ds41_gpu_graph *g) {
+    const uint32_t pos = g->pos, need = pos < 128u ? pos : 128u;
+    if (!g->raw_log_rows || !need) return;
+    const uint64_t rb = 512u * sizeof(float);
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < 40; il++) {
+        for (uint32_t q = pos - need; ok && q < pos;) {
+            const uint32_t ls = q % g->raw_log_rows, ws = q % 128u;
+            uint32_t n = pos - q;
+            if (n > g->raw_log_rows - ls) n = g->raw_log_rows - ls;
+            if (n > 128u - ws) n = 128u - ws;
+            ok = ds4_gpu_tensor_copy(g->raw_log[il], (uint64_t)ls * rb,
+                                     g->window[il], (uint64_t)ws * rb, (uint64_t)n * rb);
+            q += n;
+        }
+    }
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (ok) g->raw_log_from = pos - need;
+}
+
 static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos) {
     if (!g->valid || pos > g->pos || (pos & 1u)) return false;
     if (pos < g->pos) {
         const uint32_t need = pos < 128u ? pos : 128u;
-        const uint32_t from = pos - need;
-        if (need && (!g->raw_log_rows || from < g->raw_log_from ||
-                     g->pos - from >= g->raw_log_rows)) return false;
-        const uint64_t rb = 512u * sizeof(float);
-        bool ok = ds4_gpu_begin_commands() != 0;
-        for (uint32_t il = 0; ok && il < 40 && need; il++) {
-            for (uint32_t q = from; ok && q < pos;) {
-                const uint32_t ls = q % g->raw_log_rows, ws = q % 128u;
-                uint32_t n = pos - q;
-                if (n > g->raw_log_rows - ls) n = g->raw_log_rows - ls;
-                if (n > 128u - ws) n = 128u - ws;
-                ok = ds4_gpu_tensor_copy(g->window[il], (uint64_t)ws * rb,
-                                         g->raw_log[il], (uint64_t)ls * rb, (uint64_t)n * rb);
-                q += n;
-            }
-        }
-        if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
-        if (!ok) return false;
+        if (need && !ds41_window_restore(g, pos - need, pos, g->pos)) return false;
     }
     g->pos = pos;
     ds4_engram_history_reset(&g->history);
@@ -42404,11 +42433,24 @@ static bool ds41_verify_snapshot(ds41_gpu_graph *g, ds41_verify_state *st) {
     return ds4_gpu_end_commands() && ok;
 }
 
+/* A batch of n rows from `start` lands in the window slots of positions
+ * [start - 128, start + n - 128): the oldest rows of the window a token at
+ * `pos` < start + n still attends to. Put those back from the rewind ring.
+ * Silently a no-op where the ring cannot (before it has 128 rows behind
+ * `pos`), which is what every rollback did before the ring existed. */
+static void ds41_verify_window_repair(ds41_gpu_graph *g, uint32_t pos, uint32_t swept_to) {
+    if (swept_to <= pos || pos < 128u || swept_to < 128u) return;
+    const uint32_t from = pos - 128u, to = swept_to - 128u < pos ? swept_to - 128u : pos;
+    (void)ds41_window_restore(g, from, to, swept_to);
+}
+
 static bool ds41_verify_rollback(ds41_gpu_graph *g, const ds41_verify_state *st) {
     if (!g || !st) return false;
+    const uint32_t swept_to = g->pos;
     g->pos = st->pos;
     g->history = st->history;
     g->valid = st->valid;
+    if (swept_to > st->pos) ds41_verify_window_repair(g, st->pos, swept_to);
     if (!g->defer_carry_ready) return false;
     if (!ds4_gpu_begin_commands()) return false;
     bool ok = true;
@@ -42423,12 +42465,16 @@ static bool ds41_verify_rollback(ds41_gpu_graph *g, const ds41_verify_state *st)
 
 /* Run the target over tokens[0..n) as one batch and report each row's greedy
  * continuation. On success the graph has advanced by n positions. */
-static bool ds41_verify_suffix_tops(ds41_gpu_graph *g, const ds4_model *m,
-                                    const ds4_weights *w, const int *tokens,
-                                    uint32_t n_tokens, int *row_tops,
-                                    float *last_logits) {
+static bool ds41_verify_suffix_tops_once(ds41_gpu_graph *g, const ds4_model *m,
+                                         const ds4_weights *w, const int *tokens,
+                                         uint32_t n_tokens, int *row_tops,
+                                         float *last_logits, int defer_disabled,
+                                         bool *missed) {
     if (!g || !g->valid || !tokens || !n_tokens || !g->dspark_logits) return false;
     if (n_tokens > g->prefill_cap || n_tokens > g->ctx - g->pos) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (g->streaming) ds4_gpu_stream_expert_defer_begin_token(defer_disabled);
+#endif
     g->dspark_verify_batch = true;
     for (uint32_t i = 0; i < 3; i++) g->verify_carry_valid[i] = false;
     static int rows_exact = -1;
@@ -42467,6 +42513,14 @@ static bool ds41_verify_suffix_tops(ds41_gpu_graph *g, const ds4_model *m,
     if (getenv("DS4_V41_DSPARK_DIAG"))
         fprintf(stderr, "ds4: dspark verify sweep=%.1fms head=%.1fms read=%.1fms rows=%u\n",
                 (tv1 - tv0) * 1000.0, (tv2 - tv1) * 1000.0, (now_sec() - tv2) * 1000.0, n_tokens);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* The logits read above waited for the sweep; the miss flag is final. */
+    if (ok && g->streaming && ds4_gpu_stream_expert_defer_token_missed()) {
+        *missed = true;
+        free(rows);
+        return true;
+    }
+#endif
     if (ok) {
         if (row_tops)
             for (uint32_t i = 0; i < n_tokens; i++)
@@ -42493,6 +42547,55 @@ static bool ds41_verify_suffix_tops(ds41_gpu_graph *g, const ds4_model *m,
     }
     free(rows);
     return ok;
+}
+
+
+
+/* A verify batch runs deferred first -- no stop at any layer to check expert
+ * residency -- and, if the GPU reports a layer ran short, is rolled back and
+ * rerun with the stops in place, so nothing wrong is ever committed. */
+static bool ds41_verify_suffix_tops(ds41_gpu_graph *g, const ds4_model *m,
+                                    const ds4_weights *w, const int *tokens,
+                                    uint32_t n_tokens, int *row_tops,
+                                    float *last_logits) {
+    static int defer = -1;
+    if (defer < 0) defer = getenv("DS4_METAL_V41_DISABLE_DEFER_EXPERT_SYNC") == NULL;
+    bool missed = false;
+    if (!defer || !g || !g->streaming || g->imatrix || g->quality || g->tp_world == 2)
+        return ds41_verify_suffix_tops_once(g, m, w, tokens, n_tokens, row_tops, last_logits, 1, &missed);
+    ds41_verify_state st;
+    if (!ds41_verify_snapshot(g, &st)) return false;
+    const uint64_t deferred_layers_before = ds4_gpu_stream_expert_defer_layers();
+    if (!ds41_verify_suffix_tops_once(g, m, w, tokens, n_tokens, row_tops, last_logits, 0, &missed))
+        return false;
+    /* DS4_METAL_V41_BATCH_DEFER_CHECK=1: rerun every deferred batch with the
+     * stops and report how far its logits were from the deferred ones. */
+    if (!missed && row_tops && getenv("DS4_METAL_V41_BATCH_DEFER_CHECK")) {
+        int tops1[DS4_DSPARK_MAX_BLOCK_SIZE + 2];
+        float *l1 = malloc((size_t)n_tokens * DS4_N_VOCAB * sizeof(float));
+        memcpy(tops1, row_tops, n_tokens * sizeof(int));
+        ds4_gpu_tensor_read(g->dspark_logits, 0, l1, (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(float));
+        if (!ds41_verify_rollback(g, &st)) { free(l1); g->valid = false; return false; }
+        if (!ds41_verify_suffix_tops_once(g, m, w, tokens, n_tokens, row_tops, last_logits, 1, &missed)) { free(l1); return false; }
+        float *l2 = malloc((size_t)n_tokens * DS4_N_VOCAB * sizeof(float));
+        ds4_gpu_tensor_read(g->dspark_logits, 0, l2, (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(float));
+        float worst = 0; uint32_t worst_row = 0;
+        for (uint32_t r = 0; r < n_tokens; r++) for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            const float d = fabsf(l1[r * DS4_N_VOCAB + i] - l2[r * DS4_N_VOCAB + i]);
+            if (d > worst) { worst = d; worst_row = r; }
+        }
+        int tops_same = memcmp(tops1, row_tops, n_tokens * sizeof(int)) == 0;
+        fprintf(stderr, "ds4: batch defer check rows=%u deferred_layers=%llu tops_same=%d worst_logit_diff=%g row=%u\n",
+                n_tokens, (unsigned long long)(ds4_gpu_stream_expert_defer_layers() - deferred_layers_before),
+                tops_same, worst, worst_row);
+        free(l1); free(l2);
+        return true;
+    }
+    if (!missed) return true;
+    if (getenv("DS4_V41_DSPARK_LOG"))
+        fprintf(stderr, "ds4: dspark verify batch missed an expert; rerunning with stops\n");
+    if (!ds41_verify_rollback(g, &st)) { g->valid = false; return false; }
+    return ds41_verify_suffix_tops_once(g, m, w, tokens, n_tokens, row_tops, last_logits, 1, &missed);
 }
 
 static bool ds41_read_spec_logits_row(ds41_gpu_graph *g, uint32_t row, float *out) {
@@ -64288,6 +64391,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                 g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
             g->pos = pos;
             g->raw_log_from = pos;
+            ds41_raw_log_seed_from_window(g);
             ds4_tokens_copy(&s->checkpoint, &tokens);
             s->checkpoint_valid = true;
         }
@@ -86203,6 +86307,7 @@ static int ds4_session_ds41_dspark_cycle(
         return 1;
     }
 
+    if (!exact) ds41_verify_window_repair(g, start + commit, g->pos);
     g->pos = start + commit;
     if (!exact) {
         /* The sweep hashed every proposed row into the Engram history; a

@@ -1060,6 +1060,12 @@ typedef struct {
     uint32_t slab_slot;
     uint8_t valid;
     uint8_t slab_backed;
+    /* Named by useResource in some dispatch since it was installed. The
+     * residency set alone did not make a fresh no-copy view readable by raw
+     * address (a deferred verify batch read garbage from entries the prefill
+     * seed had installed and no dispatch had named yet), so a deferred
+     * dispatch names every entry of the layer that has not been named. */
+    uint8_t gpu_named;
 } ds4_gpu_stream_expert_cache_entry;
 
 typedef struct {
@@ -15500,6 +15506,28 @@ static void ds4_gpu_stream_expert_cache_zero_addr_slot(uint32_t layer, uint32_t 
 /* Set while the V4.1 MoE encodes a layer whose routing the host never read.
  * The six entries are unknown, so residency comes from the cache-wide set. */
 static int g_stream_expert_defer_dispatch;
+/* Expert slots a batch pointed into a transient overflow view (see
+ * ds4_gpu_stream_expert_cache_prepare_selected_batch); zeroed once the token
+ * that used them is done, so the table again says "not in the bank". */
+static uint32_t g_stream_expert_overflow_slots[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint32_t g_stream_expert_overflow_slot_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+
+static void ds4_gpu_stream_expert_clear_overflow_slots(void) {
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t i = 0; i < g_stream_expert_overflow_slot_count[layer]; i++) {
+            const uint32_t expert = g_stream_expert_overflow_slots[layer][i];
+            if (!g_stream_expert_cache[layer][expert].valid)
+                ds4_gpu_stream_expert_cache_zero_addr_slot(layer, expert);
+        }
+        g_stream_expert_overflow_slot_count[layer] = 0;
+    }
+}
+/* A deferred verify batch does not know its routing, so it names every entry
+ * of the layer the residency set has not published yet: an entry installed
+ * since the last commit is a member the driver has not made resident, and a
+ * raw-address read of it returned garbage (logits off by up to 13). */
+static ds4_gpu_stream_expert_cache_entry *g_stream_expert_defer_batch_entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint32_t g_stream_expert_defer_batch_count;
 
 static id g_stream_expert_cache_residency_set;
 static NSMutableSet *g_stream_expert_cache_residency_members;
@@ -15673,6 +15701,12 @@ static int ds4_gpu_stream_expert_cache_residency_ready(void) {
             !g_stream_expert_cache_residency_on_queue) {
             if (g_stream_expert_cache_residency_published_this_token) return 0;
             g_stream_expert_cache_residency_published_this_token = 1;
+            if (getenv("DS4_METAL_V41_DEFER_DEBUG"))
+                fprintf(stderr, "ds4: residency_ready publish dirty=%d on_queue=%d members=%lu pending=%lu retired=%lu\n",
+                        g_stream_expert_cache_residency_dirty, g_stream_expert_cache_residency_on_queue,
+                        (unsigned long)[g_stream_expert_cache_residency_members count],
+                        (unsigned long)[g_stream_expert_cache_residency_pending count],
+                        (unsigned long)[g_stream_expert_cache_residency_retired count]);
             ds4_gpu_stream_expert_cache_residency_publish();
         }
         return !g_stream_expert_cache_residency_dirty &&
@@ -15868,6 +15902,7 @@ static int ds4_gpu_stream_full_expert_addr_table_prepare(
         entry->up_inner = (NSUInteger)up_inner;
         entry->down_inner = (NSUInteger)down_inner;
         entry->valid = 1;
+        entry->gpu_named = 0;
 
         if (!ds4_gpu_stream_expert_cache_ensure_addr_buffers(layer)) {
             ds4_gpu_stream_full_expert_addr_clear_layer(layer);
@@ -15962,6 +15997,7 @@ typedef struct {
     uint64_t    gate_offset, up_offset, down_offset;
     uint64_t    gate_expert_bytes, down_expert_bytes;
     uint32_t    n_total_expert, n_expert;
+    uint32_t    n_rows;         /* rows of n_expert ids each (a verify batch) */
     int         valid;
 } ds4_gpu_stream_expert_defer_note;
 
@@ -15996,9 +16032,11 @@ static void ds4_gpu_stream_expert_defer_note_layer(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
         uint32_t n_total_expert,
-        uint32_t n_expert) {
+        uint32_t n_expert,
+        uint32_t n_rows) {
     if (layer >= DS4_METAL_DEFER_MAX_LAYER) return;
     ds4_gpu_stream_expert_defer_note *n = &g_stream_expert_defer_notes[layer];
+    n->n_rows = n_rows ? n_rows : 1u;
     n->selected_buf = selected_buf;
     n->selected_off = selected_off;
     n->model_map = model_map;
@@ -16113,6 +16151,7 @@ static void ds4_gpu_stream_expert_defer_note_outcome(int missed) {
 void ds4_gpu_stream_expert_defer_begin_token(int disabled) {
     g_stream_expert_defer_disabled_for_token = disabled ? 1 : 0;
     g_stream_expert_defer_in_flight = 0;
+    ds4_gpu_stream_expert_clear_overflow_slots();
     /* The previous token is done with the set: let its evictions go. */
     ds4_gpu_stream_expert_cache_residency_flush_retired();
     g_stream_expert_defer_token_mode = disabled ? 2 : 0;
@@ -16142,6 +16181,9 @@ void ds4_gpu_stream_expert_defer_begin_token(int disabled) {
         g_stream_expert_defer_cold_skipped++;
         g_stream_expert_defer_token_mode = 2;
         g_stream_expert_defer_token_mode_last = 2;
+        /* A verify batch may still defer (it has its own rollback); let it
+         * publish the set once like a deferred token would. */
+        g_stream_expert_cache_residency_published_this_token = 0;
         return;
     }
     g_stream_expert_defer_token_mode_last = disabled ? 2 : 1;
@@ -16208,7 +16250,9 @@ static void ds4_gpu_stream_expert_defer_replay_routing(void) {
          * read out of shared memory, not a synchronisation point. */
         const uint8_t *base = (const uint8_t *)[n->selected_buf contents];
         if (!base) continue;
-        memcpy(ids, base + n->selected_off, (size_t)n_expert * sizeof(ids[0]));
+        for (uint32_t row = 0; row < n->n_rows; row++) {
+        memcpy(ids, base + n->selected_off + (size_t)row * n_expert * sizeof(ids[0]),
+               (size_t)n_expert * sizeof(ids[0]));
 
         int usable = 1;
         for (uint32_t i = 0; i < n_expert; i++) {
@@ -16251,6 +16295,7 @@ static void ds4_gpu_stream_expert_defer_replay_routing(void) {
                 ds4_gpu_stream_expert_cache_prune_global(layer, ids, n_expert);
                 pruned_globally = 1;
             }
+        }
         }
     }
 }
@@ -17522,6 +17567,7 @@ ds4_gpu_stream_expert_cache_install_loaded(
         e->slab_slot = 0;
     }
     e->valid = 1;
+    e->gpu_named = 0;
     g_stream_expert_cache_layer_count[layer]++;
     if (g_stream_expert_cache_entry_count < UINT32_MAX) {
         g_stream_expert_cache_entry_count++;
@@ -19267,6 +19313,11 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                     ok = 0;
                     break;
                 }
+                /* The slot now points into a view that lives only for this
+                 * batch; a deferred dispatch trusting the table later would
+                 * read a stale address. Cleared at the next token boundary. */
+                if (g_stream_expert_overflow_slot_count[layer] < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT)
+                    g_stream_expert_overflow_slots[layer][g_stream_expert_overflow_slot_count[layer]++] = expert;
                 view_served++;
                 continue;
             }
@@ -34274,13 +34325,26 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
         args->nei0 <= 0 || args->nei0 > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
         args->nei1 <= 0 ||
         args->ne02 <= 0 || args->ne02 > 384) {
+        fprintf(stderr, "ds4: addr pair encode refused: cb=%d pipe=%d n_entries=%u overflow=%d addrs=%d/%d nei0=%d nei1=%d ne02=%d\n",
+                (int)(cb != nil), (int)(pipeline != nil), n_entries, (int)(overflow_gate != nil),
+                (int)(gate_addrs != nil), (int)(up_addrs != nil), args ? args->nei0 : -1, args ? args->nei1 : -1, args ? args->ne02 : -1);
         return 0;
     }
-    if (g_stream_expert_defer_dispatch) n_entries = 0;
-    for (uint32_t i = 0; i < n_entries; i++) {
-        if (!entries[i] || !entries[i]->gate_buffer || !entries[i]->up_buffer) return 0;
+    if (g_stream_expert_defer_dispatch) {
+        entries = g_stream_expert_defer_batch_entries;
+        n_entries = g_stream_expert_defer_batch_count;
     }
-    if (!g_stream_expert_defer_dispatch &&
+    for (uint32_t i = 0; i < n_entries; i++) {
+        if (!entries[i] || !entries[i]->gate_buffer || !entries[i]->up_buffer) {
+            fprintf(stderr, "ds4: addr pair encode: entry %u/%u lost its buffers (valid=%d defer_dispatch=%d slab=%d gate=%d up=%d)\n", i, n_entries,
+                    entries[i] ? (int)entries[i]->valid : -1, g_stream_expert_defer_dispatch,
+                    entries[i] ? (int)entries[i]->slab_backed : -1,
+                    entries[i] ? (int)(entries[i]->gate_buffer != nil) : -1,
+                    entries[i] ? (int)(entries[i]->up_buffer != nil) : -1);
+            return 0;
+        }
+    }
+    if (!g_stream_expert_defer_dispatch && n_entries != 0 &&
         !ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
                                                            n_entries,
                                                            0)) {
@@ -34310,9 +34374,10 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
     [enc setBuffer:weights    offset:weights_off atIndex:9];
     [enc setBuffer:ds4_gpu_stream_expert_miss_flag() offset:0 atIndex:10];
     for (uint32_t i = 0; i < n_entries; i++) {
-        if (!ds4_gpu_stream_expert_cache_residency_covers(entries[i]->gate_buffer))
+        const int name_all = !entries[i]->gpu_named;
+        if (name_all || !ds4_gpu_stream_expert_cache_residency_covers(entries[i]->gate_buffer))
             [enc useResource:entries[i]->gate_buffer usage:MTLResourceUsageRead];
-        if (!ds4_gpu_stream_expert_cache_residency_covers(entries[i]->up_buffer))
+        if (name_all || !ds4_gpu_stream_expert_cache_residency_covers(entries[i]->up_buffer))
             [enc useResource:entries[i]->up_buffer usage:MTLResourceUsageRead];
     }
     /* Overflow experts are addressed straight into the mapped model views
@@ -34418,11 +34483,14 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
         args->ne02 <= 0 || args->ne02 > 384) {
         return 0;
     }
-    if (g_stream_expert_defer_dispatch) n_entries = 0;
+    if (g_stream_expert_defer_dispatch) {
+        entries = g_stream_expert_defer_batch_entries;
+        n_entries = g_stream_expert_defer_batch_count;
+    }
     for (uint32_t i = 0; i < n_entries; i++) {
         if (!entries[i] || !entries[i]->down_buffer) return 0;
     }
-    if (!g_stream_expert_defer_dispatch &&
+    if (!g_stream_expert_defer_dispatch && n_entries != 0 &&
         !ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
                                                            n_entries,
                                                            0)) {
@@ -34445,7 +34513,10 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
     [enc setBuffer:ids   offset:ids_off  atIndex:4];
     [enc setBuffer:ds4_gpu_stream_expert_miss_flag() offset:0 atIndex:5];
     for (uint32_t i = 0; i < n_entries; i++) {
+        if (g_stream_expert_defer_dispatch && entries[i]->gpu_named &&
+            ds4_gpu_stream_expert_cache_residency_covers(entries[i]->down_buffer)) continue;
         [enc useResource:entries[i]->down_buffer usage:MTLResourceUsageRead];
+        entries[i]->gpu_named = 1;   /* the pair kernel named gate/up just before */
     }
     if (overflow_down) [enc useResource:overflow_down usage:MTLResourceUsageRead];
     if (threadgroup_bytes != 0) {
@@ -43847,6 +43918,16 @@ int ds4_gpu_routed_moe_one_tensor(
                  * and a missing expert sends this token down the redo path. */
                 use_stream_expert_addr_table = true;
                 g_stream_expert_defer_dispatch = 1;
+                g_stream_expert_defer_batch_count = 0;
+                for (uint32_t x = 0; x < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; x++) {
+                    ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer_index][x];
+                    if (e->valid && e->gate_buffer && e->up_buffer && e->down_buffer &&
+                        (!e->gpu_named ||
+                         !ds4_gpu_stream_expert_cache_residency_covers(e->gate_buffer) ||
+                         !ds4_gpu_stream_expert_cache_residency_covers(e->up_buffer) ||
+                         !ds4_gpu_stream_expert_cache_residency_covers(e->down_buffer)))
+                        g_stream_expert_defer_batch_entries[g_stream_expert_defer_batch_count++] = e;
+                }
                 g_stream_expert_defer_in_flight = 1;
                 g_stream_expert_defer_layers++;
                 g_stream_expert_defer_layers_this_token++;
@@ -43865,7 +43946,8 @@ int ds4_gpu_routed_moe_one_tensor(
                                                        gate_expert_bytes,
                                                        down_expert_bytes,
                                                        n_total_expert,
-                                                       n_expert);
+                                                       n_expert,
+                                                       1u);
             } else if (use_iq2_full_expert_addr_table) {
                 selected_id_source = "gpu-full-addr";
                 selected_ids_available = false;
@@ -45473,6 +45555,14 @@ int ds4_gpu_routed_moe_batch_tensor(
         bool                   *mid_is_f16,
         bool                    force_resident) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Set by the deferred branch below for this call's own encodes and, like
+     * the one-row paths, cleared here: left set, every later batch -- the
+     * stopping rerun of a batch that missed, and each verify batch after it
+     * -- substituted the deferred entry list for the resources it had just
+     * prepared, so its experts were never marked in flight, the pruner could
+     * evict them under the dispatch, and the address kernels then skipped
+     * those experts without a stop to catch it. */
+    g_stream_expert_defer_dispatch = 0;
     /* TP sharding (see ds4_gpu_routed_moe_one_tensor): bind from the owned
      * expert range and rebase ids in the kernels. */
     uint32_t first_expert = 0;
@@ -46145,7 +46235,93 @@ int ds4_gpu_routed_moe_batch_tensor(
                                   "kernel_mul_mm_id_iq2_xxs_cached_f32", false);
             if (!gate_mm_pipeline || !down_mm_pipeline) return 0;
         }
+        /* A verify batch over a warm bank takes the deferred route the
+         * single-token decoder takes: no drain to read the router, no host
+         * address build -- the address kernels read the router's output and
+         * the tables install/evict keep current, and raise the miss flag if
+         * an expert is absent, in which case the caller rolls the batch back
+         * and reruns it with the stops in place. Forty drains per verify
+         * cycle were ~40 ms of the ~230 ms cycle at 869k. */
+        bool batch_deferred = false;
         if (use_cached_batch) {
+            static int batch_defer_env = -1;
+            if (batch_defer_env < 0)
+                batch_defer_env = getenv("DS4_METAL_V41_DISABLE_BATCH_DEFER") == NULL;
+            batch_deferred = batch_defer_env &&
+                use_iq2_batch_selected_addr &&
+                ds4_gpu_stream_batch_pipelined() &&
+                ds4_gpu_stream_expert_defer_enabled() &&
+                g_batch_cb != nil &&
+                layer_index < DS4_METAL_DEFER_MAX_LAYER &&
+                n_expert == 6u && n_tokens <= 32u &&
+                g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil &&
+                ds4_gpu_stream_expert_miss_flag() != nil &&
+                /* Unlike a single token, a batch is not held to the warm
+                 * streak: between verify cycles the drafter's own steps
+                 * install now and then, which never let the streak reach
+                 * four, while a batch that misses costs one rerun. The
+                 * backoff after real misses still applies. */
+                (layer_index == 0 ?
+                     (!g_stream_expert_defer_disabled_for_token &&
+                      g_stream_expert_defer_cooldown == 0) :
+                     g_stream_expert_defer_token_mode == 1) &&
+                ds4_gpu_stream_expert_cache_addr_buffers(layer_index,
+                                                         &stream_gate_addr_buf,
+                                                         &stream_up_addr_buf,
+                                                         &stream_down_addr_buf) &&
+                ds4_gpu_stream_expert_cache_residency_ready();
+            if (ds4_gpu_stream_batch_pipelined() && layer_index == 0)
+                g_stream_expert_defer_token_mode = batch_deferred ? 1 : 2;
+            if (getenv("DS4_METAL_V41_DEFER_DEBUG") && layer_index == 0)
+                fprintf(stderr, "ds4: batch gate L0: deferred=%d pipelined=%d enabled=%d disabled_for_token=%d cooldown=%u tokens=%u mode_after=%d layers=%llu\n",
+                        (int)batch_deferred, ds4_gpu_stream_batch_pipelined(), ds4_gpu_stream_expert_defer_enabled(),
+                        g_stream_expert_defer_disabled_for_token, g_stream_expert_defer_cooldown, n_tokens,
+                        g_stream_expert_defer_token_mode, (unsigned long long)g_stream_expert_defer_layers);
+            if (getenv("DS4_METAL_V41_DEFER_DEBUG") && !batch_deferred && ds4_gpu_stream_batch_pipelined()) {
+                static int said = 0;
+                if ((said++ % 400) == 0) {
+                    fprintf(stderr,
+                            "ds4: batch defer gate: sel_addr=%d enabled=%d batch=%d layer=%u n_expert=%u tokens=%u "
+                            "pipe_sum=%d miss=%d mode=%d addrbufs=%d residency=%d streak=%u installs=%u\n",
+                            (int)use_iq2_batch_selected_addr, ds4_gpu_stream_expert_defer_enabled(),
+                            (int)(g_batch_cb != nil), layer_index, n_expert, n_tokens,
+                            (int)(g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil),
+                            (int)(ds4_gpu_stream_expert_miss_flag() != nil),
+                            g_stream_expert_defer_token_mode,
+                            ds4_gpu_stream_expert_cache_addr_buffers(layer_index, &stream_gate_addr_buf, &stream_up_addr_buf, &stream_down_addr_buf),
+                            ds4_gpu_stream_expert_cache_residency_ready(),
+                            g_stream_expert_defer_warm_streak, (unsigned)g_stream_expert_cache_installs_this_token);
+                }
+            }
+        }
+        if (batch_deferred) {
+            g_batch_prof_t[0] = g_batch_prof_t[1] = g_batch_prof_t[2] = ds4_gpu_now_ms();
+            stream_resource_count = 0;
+            g_stream_expert_defer_batch_count = 0;
+            for (uint32_t x = 0; x < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; x++) {
+                ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer_index][x];
+                if (e->valid && e->gate_buffer && e->up_buffer && e->down_buffer &&
+                    (!e->gpu_named ||
+                     !ds4_gpu_stream_expert_cache_residency_covers(e->gate_buffer) ||
+                     !ds4_gpu_stream_expert_cache_residency_covers(e->up_buffer) ||
+                     !ds4_gpu_stream_expert_cache_residency_covers(e->down_buffer)))
+                    g_stream_expert_defer_batch_entries[g_stream_expert_defer_batch_count++] = e;
+            }
+            stream_unique = n_expert * n_tokens;
+            g_stream_expert_defer_dispatch = 1;
+            g_stream_expert_defer_in_flight = 1;
+            g_stream_expert_defer_layers++;
+            g_stream_expert_defer_layers_this_token++;
+            if (layer_index + 1u > g_stream_expert_defer_used)
+                g_stream_expert_defer_used = layer_index + 1u;
+            ds4_gpu_stream_expert_defer_note_layer(layer_index, selectedbuf,
+                                                   ds4_gpu_tensor_offset(selected),
+                                                   model_map, model_size,
+                                                   gate_offset, up_offset, down_offset,
+                                                   gate_expert_bytes, down_expert_bytes,
+                                                   n_total_expert, n_expert, n_tokens);
+        }
+        if (!batch_deferred && use_cached_batch) {
             const int had_batch = g_batch_cb != nil;
             g_batch_prof_t[0] = ds4_gpu_now_ms();
             if (had_batch && ds4_gpu_end_commands() == 0) {
