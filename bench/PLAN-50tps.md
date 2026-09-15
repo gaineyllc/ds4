@@ -118,3 +118,44 @@ Same 77-token prompt, 300-700 generated tokens, -c 16384, DS4_SSD_CACHE_AUTO_PCT
   target (no gain at this batch size), decode-bank pct 80 (same as 62: the 7606 dynamic cap binds).
 - Bank: pct 50 -> 62 (6039 -> 7488 entries, 98 GiB wired incl. everything) took 700-token DSpark 17.2 -> 20.2 t/s
   with no swap growth on this machine; 50 stays the default in code.
+
+## Sep 15 — no-copy bank memory (two panics), miss cost floor, 16k numbers
+Prompt: README + engram source, 5723 tokens (the earlier "11.6k" figure was a miscount); also a 14.4k-token prompt.
+DSpark, -c 16384, 400 tokens, DS4_SSD_CACHE_AUTO_PCT=50 unless noted. All variants byte-identical output.
+- PANICS: two watchdog-timeout kernel panics (memory starvation). Under DS4_METAL_STREAM_EXPERT_NOCOPY the
+  layer-major prefill still seeded its keep-lists through the GPU-copy loader into mlocked slabs (~70 GiB, "could not
+  mlock all buffers... locked so far 69.70 GiB"); the decode cap then evicted those entries without freeing anything and
+  every miss added a view on top: wired = 70 GiB dead slabs + bank + 24 GiB static, whatever the pct. pct 62 "worked"
+  before only because prompt-era hotness never let the slab entries go; the hotness-decay fix (f35fec9) let them go
+  and the growth started at once. Fix 686bd53: the seed makes views too (no slabs in no-copy mode), the decode cap is
+  applied before prefill, seeded pages are pinned during the sweep (residency publish every 4 layers), seed once
+  after the last sweep. Wired: 82 GiB at pct 50 (56 GiB bank), 91 GiB at pct 58 (65 GiB bank). Baseline OS wired is
+  ~12 GiB; the machine has ~20 GB of other apps, so pct 58-62 leaves little slack -- 50 stays the code default.
+- Hotness aging for the multi-row path (f35fec9): misses/layer 1.8 -> 0.8, verify 118 -> 98 ms, 15.8 -> 18.3 t/s.
+- Numbers (5.7k prompt): overall 18.3 t/s (pct 50) / 19.6 t/s (pct 58); steady state 22-24 t/s. 14.4k prompt: 15.8
+  overall, 18-22 steady (attention +0.1 ms/layer). First ~45 cycles are slower (1.5-2 misses/layer: the seed's
+  keep-list is only ~78% of what decode routes to).
+- Per layer, 3 rows, steady (CB_TIMES + batch prof): GPU 1.5 ms (cbA routed 0.5-0.6, cbB attention..router 0.9-1.0),
+  host turnaround 0.21 ms with no miss, and +1.36 ms per miss-layer (view creation ~0.3, driver page-in ~0.85 of which
+  SSD ~0.65). Sweep ~97 ms = 60 GPU + 8 turnaround + ~30 misses; draft 7.7 ms (5.8 GPU: 3 stages + vocab head for
+  5 rows; 1.9 Markov loop: one GPU round trip per row). 2.4 tokens/cycle -> 22-23 t/s.
+- Misses are the SSD: pread microbench 0.6-0.7 ms per expert (9.5 MiB, ~15 GB/s aggregate, 0.29 ms from page cache).
+  Tried and rejected, all byte-identical: (a) parallel warm preads into scratch before the driver page-in: driver
+  880 -> 242 us/miss but +1 ms host -> 13.8 t/s; (b) wired, resident miss pool with sync preads: prep 0.4 -> 1.05 ms
+  (I/O now on the host) -> 111-122 ms verify; (c) same pool with GCD async preads and an MTLSharedEvent wait before the
+  routed dispatch: host prep 0.25 ms but drain +0.5 ms per miss -> 108-124 ms verify. The driver's page-in is already
+  the cheapest way to move a miss; the only miss lever left is fewer misses (bank size) -- patch kept at
+  bench/miss-pool.patch on the machine for reference.
+- Prediction is dead: DS4_METAL_ROUTE_TRACE dump over 281 cycles: misses are not predicted by the previous layer's
+  experts (L-1 -> L transition table, top-32: 7.5% recall) nor by token id affinity (10%); by construction the
+  predictable experts are already bank hits. Prefetch cannot help.
+- More draft rows do not pay: DS4_V41_DSPARK_MIN_SURVIVAL=0.4 -> 4.0 rows/cycle, 2.62 accepted, but misses 1.7/layer
+  and verify 145 ms -> 17-19 t/s (0.6: 3.0 rows, 2.16 accepted, 97 ms).
+- Bank size: pct 40 (45 GiB) misses 1.65/layer, 17 t/s; pct 50 0.87, 18.3; pct 58 0.59, 19.6.
+- GPU: 585 GB/s measured peak (compute read). Bytes per 3-row cycle ~13 GB (dense 7.2, experts 5.3) = 22 ms at peak
+  vs 55-59 ms GPU span: kernels run at ~40% of bandwidth overall; ~10 ms/cycle of that is tiny kernels (bf16 rounding
+  900/cycle, copies 255/cycle, norms, hc). That, and the vocab head + Markov loop in the draft, is what is left to
+  chase on this architecture; the miss floor and the per-layer router sync bound the rest.
+- Ceiling estimate at 16k, full quality, one node: GPU 55 -> ~35 ms with kernel work, misses ~25 ms at pct 58,
+  turnaround 8, draft ~5 => ~75 ms per ~2.4 tokens => ~30 t/s. 50 t/s needs the experts resident (two nodes) or a
+  different accept rate (the drafter is Q2-mismatched: 2.2-2.4 tokens/cycle).
