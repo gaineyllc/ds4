@@ -167,6 +167,10 @@ extern "C" void ds4_gpu_stream_expert_cache_cap_before_prefill(uint64_t context_
     (void)context_bytes;
 }
 
+extern "C" void ds4_gpu_stream_expert_cache_prefill_begin(uint32_t new_tokens) {
+    (void)new_tokens;
+}
+
 extern "C" void ds4_gpu_stream_note_support_bytes(uint64_t bytes) {
     (void)bytes;
 }
