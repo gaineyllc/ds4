@@ -194,3 +194,12 @@ at both lengths (encoder-first sweeps of 8192 rows; layers 0-19 over the whole p
 - The prefill tail after a cache hit is slow: 461 rows took 32 s at 125k, 1060 rows 26 s at 394k. The rows go
   through the layer sweep in 32-row index batches (packed scores 2.7 ms + causal argsort 3.4 ms per batch per index
   layer) plus the decoder-suffix rebuild; ~20 ms per row against 1.7 ms per row for the 8192-row sweeps. Not fixed.
+- Full-length run, 869k tokens of ds4.c (the whole file), server + disk checkpoints, DSpark, headroom 32 GiB:
+  prefill 529 t/s average over 744k new tokens (23.5 min), decode 10.7 t/s over 120 tokens (11-15 steady, verify
+  130-180 ms, 1.3 misses/layer with a 42 GiB bank of 4521 entries), wired peak 84 GiB, swap flat. Coherent output.
+  Before this session's fixes the same run would have been ~2-3 t/s (indexer) or a panic (bank budget).
+- What bounds 1M decode now: the indexer at ~3-4 ms per call x 8 (kernel is ~10x off its instruction budget --
+  register-heavy transpose-reduce, worth a second pass), misses at 1.3/layer because 25 GiB of context buffers come
+  out of the bank (block_mask alone is prefill_cap x ctx/8 *floats* = 4.3 GiB; as bits it would be 0.5 GiB), and
+  the same per-layer sync and GPU inefficiency as at 16k. A tail sweep after a cache hit costs 15-30 s at any long
+  context: whole-model read (~12 s at 9 GB/s) + residency commits for the seed (~2 s) + GPU idle during page-in.
