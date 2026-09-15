@@ -14563,6 +14563,14 @@ static uint32_t ds4_gpu_stream_expert_decode_target_slots(uint64_t dense_bytes,
     return (target == 0 || target >= cur) ? 0 : target;
 }
 
+/* The no-copy bank is capped, never shrunk: applying the decode cap before
+ * prefill keeps the seed from installing views that decode would only evict,
+ * so the bank pinned during prefill is the bank decode runs with. */
+void ds4_gpu_stream_expert_cache_cap_before_prefill(uint64_t context_bytes) {
+    if (!ds4_gpu_stream_expert_nocopy_enabled()) return;
+    ds4_gpu_stream_expert_cache_shrink_for_decode(context_bytes);
+}
+
 void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes) {
     const uint64_t dense_bytes = g_stream_dense_bytes;
     if (g_stream_expert_cache_decode_shrunk) return;
@@ -18045,6 +18053,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
     }
     missing_mask &= (1u << n_selected) - 1u;
     if (missing_mask == 0) return 1;
+    const int nocopy = ds4_gpu_stream_expert_nocopy_enabled();
     if (g_stream_expert_pending_load.active &&
         n_selected <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED) {
         if (ds4_gpu_stream_expert_pending_load_matches(model_map,
@@ -18151,7 +18160,8 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
             (ds4_gpu_stream_expert_reusable_buffers){ nil, nil, nil, 0, 0, 0 };
     }
     uint32_t batch_reuse_count = 0;
-    if (cache_budget != 0 &&
+    if (!nocopy &&
+        cache_budget != 0 &&
         reserved_entries >= cache_budget &&
         n_loads > 1 &&
         ds4_gpu_stream_expert_batch_reuse_enabled(gate_expert_bytes,
@@ -18183,8 +18193,14 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
          * them. Falling through to the copy path here would hand pread a
          * destination inside a read-only mapping, which fails with EFAULT --
          * that is what broke DSpark, whose verify batch comes through this
-         * loader rather than the batched one. */
-        if (!gpu_copy_source && ds4_gpu_stream_expert_nocopy_enabled()) {
+         * loader rather than the batched one.
+         *
+         * The GPU-copy seed (layer-major prefill keep-lists) takes the same
+         * branch: seeding into slabs under the no-copy cache left ~70 GiB of
+         * mlocked slab pages allocated for the whole session -- the decode
+         * cap then evicted the slab-backed entries without freeing a byte,
+         * and every miss it installed as a view came on top. */
+        if (nocopy) {
             uint64_t gi = 0, ui = 0, di = 0;
             gate_bufs[load_i] =
                 ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
@@ -18308,7 +18324,9 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
     uint64_t read_bytes = 0;
     double read_ms = 0.0;
     int ok = 1;
-    if (gpu_copy_source) {
+    if (nocopy) {
+        /* Views: nothing to read or copy, the pages are the model's own. */
+    } else if (gpu_copy_source) {
         if (!g_batch_cb ||
             gate_expert_bytes > (uint64_t)NSUIntegerMax ||
             down_expert_bytes > (uint64_t)NSUIntegerMax) {
@@ -18392,7 +18410,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
     }
 
-    if (gpu_copy_source &&
+    if (gpu_copy_source && !nocopy &&
         getenv("DS4_METAL_STREAMING_PREFILL_CACHE_SEED_PROFILE") != NULL) {
         fprintf(stderr,
                 "ds4: Metal streaming expert GPU cache copy layer=%u "
@@ -18400,7 +18418,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
                 layer,
                 n_loads,
                 ds4_gpu_gib(read_bytes));
-    } else if (!gpu_copy_source &&
+    } else if (!gpu_copy_source && !nocopy &&
                getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL) {
         fprintf(stderr,
                 "ds4: Metal streaming expert parallel pread layer=%u experts=%u tensors=%u "
@@ -19347,6 +19365,28 @@ static int ds4_gpu_stream_expert_cache_seed_experts_impl(
     ds4_gpu_stream_expert_cache_prune_global(layer,
                                              expert_ids,
                                              protect_n);
+    /* Seeded no-copy views point at pages the prefill sweep has just read.
+     * Publishing the residency set now lets the driver pin them while they
+     * are still in the file cache; left until decode, the whole bank is
+     * paged back in from SSD under the first ~40 verify cycles instead. */
+    if (gpu_copy_source && ds4_gpu_stream_expert_nocopy_enabled() &&
+        (layer & 3u) == 3u) {
+        /* A commit walks the whole set, so pin every few layers rather than
+         * every layer; the sweep's own reads keep that many layers cached.
+         * Whatever a trailing layer leaves pending, decode's first publish
+         * takes. */
+        const double t0 = ds4_gpu_now_ms();
+        ds4_gpu_stream_expert_cache_residency_publish();
+        if (getenv("DS4_METAL_STREAMING_PREFILL_CACHE_SEED_PROFILE") != NULL) {
+            fprintf(stderr,
+                    "ds4: Metal streaming expert seed views layer=%u experts=%u "
+                    "entries=%u residency commit=%.3f ms\n",
+                    layer,
+                    n_experts,
+                    g_stream_expert_cache_entry_count,
+                    ds4_gpu_now_ms() - t0);
+        }
+    }
     return 1;
 }
 

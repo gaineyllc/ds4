@@ -163,6 +163,10 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 
+extern "C" void ds4_gpu_stream_expert_cache_cap_before_prefill(uint64_t context_bytes) {
+    (void)context_bytes;
+}
+
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_resident_cache_release();
 }
