@@ -272,3 +272,25 @@ at both lengths (encoder-first sweeps of 8192 rows; layers 0-19 over the whole p
   again as a text prefix of the same prompt, so the 25-minute prefill repeats after every restart; only the store
   of the exact p100k prompt hits. Not investigated. Watchdog note: watch3.sh's compressor limit was raised 25 -> 40
   GiB after it killed a run at comp=26G with swap flat (wired 79G) -- the 1M graph's idle buffers get compressed.
+
+## Sep 15 — 869k decode timeline (GPU shared with a running Synology backup; relative shares only)
+- Encoder timeline over 300 tokens at 869k (kernel sum 143 ms of a 163 ms GPU span per verify cycle; ~227 ms
+  wall per cycle, so ~60 ms/cycle is CPU-side: per-layer turnaround 0.5 ms + prepare 0.5 ms x 40, the 7 ms
+  draft, the head):
+  - 23.4 ms  kernel_dsv41_indexer_scores_decode (the new MMA kernel), 8 calls of ~2.9 ms for 2-3 tokens over
+    435k/869k rows: every token re-reads the key cache (222-445 MB per call per token), so it sits near the
+    per-token bandwidth floor. Reading K once per cycle needs q for 2-3 tokens in threadgroup memory, which at
+    16 KiB/token fp32 does not fit beside the C tiles; an f16 index cache (the GLM path has cache_f16 already)
+    would halve both the traffic and the q footprint. Next step if the indexer is worth another ~12 ms/cycle.
+  - 34.4 ms  routed expert matvecs (iq2_xxs pair_swiglu 21.1 + q2_K sum6 13.3): ~12 unique experts x 9.5 MiB
+    per layer in 0.86 ms = ~23% of peak bandwidth. The largest single item and the same inefficiency as at 16k.
+  - ~40 ms   dense/attention matvecs (q8_0 r1_2 11.8, attn_out_low 9.1, q8_0 r1_3 6.1, f16 9.2, f32 4.0, ...).
+  - 7.6 ms   kernel_cpy_contig_u32_4, 291 copies per cycle (7 per layer: window, rewind ring, pair state,
+    cache rows); 4.9 ms kernel_dsv41_bf16_linear, 871 per cycle (22 per layer, 5.6 us each); 1.8 ms rms_norm.
+    ~14 ms/cycle of tiny dispatches that could fold into their producers.
+  - 5.5 ms   indexed attention; the top-k select is now invisible (its kernels are below the 16-line cut).
+- Prefill tail of the same run (last 3000 command buffers): kernel_dsv41_indexer_scores_packed 8.2 ms per
+  call (2404 ms of 7395), the mixed attention dual 30 ms per call, expert mm_id 15 ms per call;
+  kernel_topk_select_hist 58 us x 7348 = 428 ms (was the causal argsort at 3.4 ms per batch).
+- The server's cold disk store of the 1M prompt now hits (c5ce06b): the second 869k prefill of the day went
+  570401 -> 868904 in 13.7 min instead of the whole prompt in 25-38.
