@@ -42889,7 +42889,11 @@ static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
             if (frequency[i] > frequency[best]) best = i;
         if (!frequency[best]) break;
         experts[n] = (int32_t)best;
-        priority[n] = metal_graph_streaming_builtin_hotness(target - n, target);
+        /* A modest preference only: route hotness decays by half every 16
+         * decode tokens, and a seed ranked 32 kept decode's own experts (a
+         * few rows of hotness each) out of the bank for the first ~45 verify
+         * cycles. Ranks 1..8 hand the bank over within a decay or two. */
+        priority[n] = 1u + (uint32_t)(7ull * (target - n) / target);
         n++;
         frequency[best] = 0;
     }
