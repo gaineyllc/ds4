@@ -291,3 +291,92 @@ kernel void kernel_dsv41_indexer_scores_packed(
     }
 }
 #endif
+
+// DSpark Markov head, walked on the GPU. The block's rows are drafted in one
+// pass but the Markov correction of row r is keyed on the token chosen at row
+// r-1, so the reference walks the rows in order. Chaining gather -> bias
+// matvec -> biased argmax per row inside one command buffer keeps that walk
+// off the host: the previous token lives in a one-word buffer between steps.
+struct ds4_metal_args_dspark_argmax {
+    uint vocab;
+    uint slot;
+    uint n_groups;
+    uint chunk;
+};
+
+kernel void kernel_dspark_markov_gather(
+        constant uint &rank,
+        device const float *w1,
+        device const uint *prev,
+        device float *emb,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid < rank) emb[tid] = w1[(ulong)prev[0] * rank + tid];
+}
+
+// argmax of row + bias with the host's tie rule: the first index that holds
+// the maximum wins (strict greater-than replaces). Each thread scans a
+// contiguous span, each threadgroup reduces its threads in index order.
+kernel void kernel_dspark_argmax_partial(
+        constant ds4_metal_args_dspark_argmax &args,
+        device const float *row,
+        device const float *bias,
+        device float *part_val,
+        device uint *part_idx,
+        uint tg [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint tpg [[threads_per_threadgroup]]) {
+    threadgroup float sv[1024];
+    threadgroup uint si[1024];
+    const uint start = tg * args.chunk;
+    const uint end = min(args.vocab, start + args.chunk);
+    const uint per = (args.chunk + tpg - 1u) / tpg;
+    const uint s = start + tid * per;
+    const uint e = min(end, s + per);
+    float bv = 0.0f;
+    uint bi = 0xffffffffu;
+    if (s < e) {
+        bv = row[s] + bias[s];
+        bi = s;
+        for (uint v = s + 1u; v < e; v++) {
+            const float x = row[v] + bias[v];
+            if (x > bv) { bv = x; bi = v; }
+        }
+    }
+    sv[tid] = bv;
+    si[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = tpg / 2u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            const uint j = tid + off;
+            if (si[j] != 0xffffffffu && (si[tid] == 0xffffffffu || sv[j] > sv[tid])) {
+                sv[tid] = sv[j];
+                si[tid] = si[j];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        part_val[tg] = sv[0];
+        part_idx[tg] = si[0];
+    }
+}
+
+kernel void kernel_dspark_argmax_reduce(
+        constant ds4_metal_args_dspark_argmax &args,
+        device const float *part_val,
+        device const uint *part_idx,
+        device uint *prev,
+        device uint *tokens,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0u) return;
+    float bv = part_val[0];
+    uint bi = part_idx[0];
+    for (uint g = 1u; g < args.n_groups; g++) {
+        if (part_idx[g] != 0xffffffffu && (bi == 0xffffffffu || part_val[g] > bv)) {
+            bv = part_val[g];
+            bi = part_idx[g];
+        }
+    }
+    prev[0] = bi;
+    tokens[args.slot] = bi;
+}

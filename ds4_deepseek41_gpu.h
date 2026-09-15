@@ -64,6 +64,14 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            uint32_t width, uint32_t rows, float eps);
 /* Pool complete pairs and retain the last unpaired projection in previous_*.
  * start is the absolute token position, including earlier chunks. */
+int ds4_gpu_dspark_markov_gather(ds4_gpu_tensor *emb, const void *model_map,
+                                 uint64_t model_size, uint64_t w1_offset,
+                                 uint64_t w1_bytes, uint32_t rank,
+                                 const ds4_gpu_tensor *prev);
+int ds4_gpu_dspark_argmax_add(const ds4_gpu_tensor *logits, uint64_t row_offset,
+                              const ds4_gpu_tensor *bias, uint32_t vocab,
+                              ds4_gpu_tensor *partials, ds4_gpu_tensor *prev,
+                              ds4_gpu_tensor *tokens, uint32_t slot);
 int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
                       const ds4_gpu_tensor *kv, const ds4_gpu_tensor *scores,
                       ds4_gpu_tensor *previous_kv, ds4_gpu_tensor *previous_scores,

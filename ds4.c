@@ -40395,6 +40395,8 @@ typedef struct {
     ds4_gpu_tensor *dspark_dbg_hc;   /* DS4_V41_DSPARK_CHECK only */
     ds4_gpu_tensor *dspark_logits;   /* block_size rows of the vocabulary */
     ds4_gpu_tensor *dspark_markov_emb, *dspark_markov_bias;
+    /* GPU-side Markov walk: previous token, chosen tokens, argmax partials. */
+    ds4_gpu_tensor *dspark_markov_prev, *dspark_markov_tokens, *dspark_markov_partials;
     ds4_gpu_tensor *dspark_carry_kv[4], *dspark_carry_score[4];
     /* Rollback copy of the compressor carry for a deferred token. The
      * DSpark buffers above serve the same purpose for speculation, but
@@ -40504,6 +40506,9 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_tensor_free(g->dspark_logits);
     ds4_gpu_tensor_free(g->dspark_markov_emb);
     ds4_gpu_tensor_free(g->dspark_markov_bias);
+    ds4_gpu_tensor_free(g->dspark_markov_prev);
+    ds4_gpu_tensor_free(g->dspark_markov_tokens);
+    ds4_gpu_tensor_free(g->dspark_markov_partials);
     ds4_gpu_tensor_free(g->dspark_hc_mean_rows);
     ds4_gpu_tensor_free(g->dspark_target_hidden_rows);
     for (uint32_t i = 0; i < 4; i++) {
@@ -41906,14 +41911,47 @@ static bool ds41_dspark_head(ds41_gpu_graph *g, const ds4_model *m,
         if (hid && !ds4_gpu_tensor_read(g->batch.x, 0, hid,
                 (uint64_t)count * DS4_N_EMBD * sizeof(float))) { free(hid); hid = NULL; }
     }
+    /* The walk itself runs on the GPU when the Markov head is present: one
+     * command buffer chains gather -> bias matvec -> biased argmax for every
+     * row, and the host reads back just the chosen tokens. Without the head
+     * (or with it disabled) the rows are plain argmaxes read back one by one,
+     * as before. */
+    const bool gpu_walk = last->markov_w1 && last->markov_w2 &&
+        last->markov_w1->type == DS4_TENSOR_F32 && !getenv("DS4_V41_DSPARK_NO_MARKOV") &&
+        !getenv("DS4_V41_DSPARK_HOST_MARKOV");
+    uint32_t walked[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    if (gpu_walk) {
+        const uint32_t rank = (uint32_t)last->markov_w1->dim[0];
+        const uint32_t prev0 = (uint32_t)previous;
+        ok = previous >= 0 && (uint64_t)previous < last->markov_w1->dim[1] &&
+             count <= DS4_DSPARK_MAX_BLOCK_SIZE + 1u &&
+             ds4_gpu_tensor_write(g->dspark_markov_prev, 0, &prev0, sizeof(prev0)) &&
+             ds4_gpu_begin_commands();
+        for (uint32_t r = 0; ok && r < count; r++) {
+            ok = ds4_gpu_dspark_markov_gather(g->dspark_markov_emb, g->dspark_model->map,
+                     g->dspark_model->size, last->markov_w1->abs_offset,
+                     last->markov_w1->bytes, rank, g->dspark_markov_prev) &&
+                 metal_graph_matmul_plain_tensor(g->dspark_markov_bias, g->dspark_model,
+                     last->markov_w2, rank, DS4_N_VOCAB, g->dspark_markov_emb, 1) &&
+                 ds4_gpu_dspark_argmax_add(g->dspark_logits,
+                     (uint64_t)r * DS4_N_VOCAB * sizeof(float), g->dspark_markov_bias,
+                     DS4_N_VOCAB, g->dspark_markov_partials, g->dspark_markov_prev,
+                     g->dspark_markov_tokens, r);
+        }
+        ok = ok && ds4_gpu_end_commands() &&
+             ds4_gpu_tensor_read(g->dspark_markov_tokens, 0, walked, (uint64_t)count * sizeof(uint32_t));
+        if (!ok && ds4_gpu_commands_active()) (void)ds4_gpu_end_commands();
+    }
     for (uint32_t r = 0; ok && r < count; r++) {
-        ok = ds4_gpu_begin_commands() &&
-             ds41_dspark_markov(g, dw, r, previous) &&
-             ds4_gpu_end_commands() &&
-             ds4_gpu_tensor_read(g->dspark_logits,
-                 (uint64_t)r * DS4_N_VOCAB * sizeof(float), row,
-                 (uint64_t)DS4_N_VOCAB * sizeof(float));
-        if (!ok) break;
+        if (!gpu_walk) {
+            ok = ds4_gpu_begin_commands() &&
+                 ds41_dspark_markov(g, dw, r, previous) &&
+                 ds4_gpu_end_commands() &&
+                 ds4_gpu_tensor_read(g->dspark_logits,
+                     (uint64_t)r * DS4_N_VOCAB * sizeof(float), row,
+                     (uint64_t)DS4_N_VOCAB * sizeof(float));
+            if (!ok) break;
+        }
         if (hid && cw && mw1) {
             const uint32_t rank = (uint32_t)last->markov_w1->dim[0];
             double acc = 0.0;
@@ -41925,7 +41963,7 @@ static bool ds41_dspark_head(ds41_gpu_graph *g, const ds4_model *m,
             if (getenv("DS4_V41_DSPARK_DIAG"))
                 fprintf(stderr, "ds4: dspark draft row=%u prev=%d confidence=%.3f\n", r, previous, c);
         }
-        previous = (int)ds41_dspark_argmax(row);
+        previous = gpu_walk ? (int)walked[r] : (int)ds41_dspark_argmax(row);
         const uint32_t slot = late ? r + 1u : r;
         if (slot >= (uint32_t)(sizeof(g->dspark_draft) / sizeof(g->dspark_draft[0]))) break;
         g->dspark_draft[slot] = previous;
@@ -42071,7 +42109,12 @@ static bool ds41_dspark_configure(ds41_gpu_graph *g, const ds4_model *dm,
         (uint64_t)dw->markov_rank * sizeof(float));
     g->dspark_markov_bias = ds4_gpu_tensor_alloc(
         (uint64_t)DS4_N_VOCAB * sizeof(float));
-    if (!g->dspark_logits || !g->dspark_markov_emb || !g->dspark_markov_bias) return false;
+    g->dspark_markov_prev = ds4_gpu_tensor_alloc(sizeof(uint32_t));
+    g->dspark_markov_tokens = ds4_gpu_tensor_alloc(
+        (uint64_t)(dw->block_size + 1u) * sizeof(uint32_t));
+    g->dspark_markov_partials = ds4_gpu_tensor_alloc(2u * 64u * sizeof(uint32_t));
+    if (!g->dspark_logits || !g->dspark_markov_emb || !g->dspark_markov_bias ||
+        !g->dspark_markov_prev || !g->dspark_markov_tokens || !g->dspark_markov_partials) return false;
     /* A verify batch is at most the committed token plus the proposal; the
      * prompt's tail seeds the drafter's whole key window. */
     g->dspark_capture_cap = dw->block_size + 1u > DS4_DSPARK_WINDOW ?
