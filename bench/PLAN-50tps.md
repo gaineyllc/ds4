@@ -83,3 +83,38 @@
   ~13 misses x 1.2 ms per token) => ~20-25 t/s at 16k ctx, ~12-15 t/s at 1M ctx (bank ~6300 slots).
   50 t/s at full quality on this model needs the experts resident: second M5 Max over TB5 (TP splits experts and heads,
   halving bytes/token per node; deferral must be made TP-safe: g->tp_world != 2 gates) or a model that fits.
+
+## 18:50 — OOM root cause, and the shape of the answer
+- "layer 0 failed at position 555" in the full-model eval = kIOGPUCommandBufferCallbackErrorOutOfMemory. Cause: the eval
+  ran with DS4_SSD_CACHE_AUTO_PCT=100 (no decode-bank shrink) and the bank churned; the pre-session binary OOMs even
+  earlier (prefill of the 2nd question) under the same setting. Not a leak from this session; the decode shrink is a
+  necessary safety margin whenever the bank churns. Keep-list runs (no churn, seeded set 65 GiB) ran 12 questions fine.
+- Two-node (TB5 TP) is the credible path to 50 t/s at full quality: each node holds its half of the experts fully
+  resident (71 GiB), per-node bytes/token ~5.5 GB, plus ~4-8 ms/token of per-layer exchanges. What the engine needs for
+  that: an "all-resident" decode mode = keep_seed for every owned expert at startup + address-table kernels with no early
+  loads, no drains, no snapshot/redo (deferral is currently gated off under tp_world==2).
+- Multi-row decode (ds4-server --batched-session N, DSpark verify) runs ~5x slower per token than single-row; it is the
+  prerequisite for both concurrent serving and speculative decoding and is untouched.
+
+## Sep 14/15 — MTP (DSpark) at 16k, no pruning (Neil's redirect)
+Same 77-token prompt, 300-700 generated tokens, -c 16384, DS4_SSD_CACHE_AUTO_PCT=62 unless noted. Plain decode 15-18 t/s.
+- DSpark 4.3 -> ~20 t/s (short prompt), 13 -> 16.7 t/s with an 11.6k-token prompt (plain 10.7 there). Commits:
+  2fdef63 (drafter views, verify pipelining, residency-set coverage, carry restore for odd commits),
+  971192a (bank bound under multi-row decode + readahead), 39db472 (reference anchor layout, window keys for every
+  position, confidence-scheduled verify length), 4148653 (row-sharing kernels, draft early stop, compute-copy).
+- Root causes found: (1) drafter HC kernels ran on the 8k-row prefill buffer (60 ms/draft); (2) verify drained the GPU
+  twice per layer and useResource'd every expert per submission (driver 2-6 ms/layer); (3) the multi-row path never
+  pruned the no-copy bank -> 9.7k entries / 90 GiB wired -> swap thrash mid-run (also the likely eval OOM);
+  (4) odd-length commits discarded (31-44% of cycles); (5) draft block anchored one row off vs DeepSeek's model.py;
+  (6) window keys never written for prompt/fallback positions; (7) indexed attention for 2-6 rows ran 8-16 workgroups
+  (0.7 ms/layer at 10k ctx) -> use the 12-way split kernel like single-token decode does.
+- Acceptance is Q2-bound, not a bug: drafter confidence head predicts 0.78 for row 0, target accepts 0.57; where the
+  drafter is >=0.8 sure it is right 84% of the time. Same numbers at the first DSpark commit (43aa82e) on this prompt.
+  Confidence-scheduled verify (min survival 0.6) keeps ~2.1 tokens/cycle at ~70 ms/2-row sweep.
+- Where a 2-row verify goes (short ctx, per layer): GPU 1.05 ms (routed 0.32, attention+hc 0.72), sync 0.4, misses
+  0.2 x 1.8 ms, prepare 0.1. Sweep 70 ms + draft 8 ms per ~2.1 tokens. At 11.6k ctx: +~1.3 ms/layer attention before
+  the split fix, ~+0.5 after.
+- Tried and rejected: spinning on cb.status (slower), userspace page-touch prefault of misses (20 ms/expert), attnQ4K
+  target (no gain at this batch size), decode-bank pct 80 (same as 62: the 7606 dynamic cap binds).
+- Bank: pct 50 -> 62 (6039 -> 7488 entries, 98 GiB wired incl. everything) took 700-token DSpark 17.2 -> 20.2 t/s
+  with no swap growth on this machine; 50 stays the default in code.
