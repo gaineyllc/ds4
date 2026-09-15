@@ -31947,8 +31947,12 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             !decode_one_token && !g_quality_mode && ds4_gpu_mpp_available() &&
             (n_head == 64u || n_head == 32u) &&
             top_k == 512u && window == 128u && head_dim == 512u;
-        const uint32_t decode_splits =
-            decode_one_token && !g_quality_mode ? 12u : 1u;
+        /* A handful of rows (a decode step, a DSpark verify batch) leaves the
+         * per-row kernels with 8-16 workgroups for 2k+ selected keys each:
+         * latency-bound, ~0.7 ms per layer at 10k context. Split the key
+         * range across workgroups for them as decode already does. */
+        const bool decode_like = n_tokens <= 8u && !g_quality_mode;
+        const uint32_t decode_splits = decode_like ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
         id<MTLComputePipelineState> attn_pipeline =
             split_decode ?
@@ -31981,7 +31985,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          * them in score order, avoiding a chronological sort dispatch.
          * --quality restores the sorted order for stricter reproducibility.
          */
-        const bool skip_decode_sort = !g_quality_mode && decode_one_token;
+        const bool skip_decode_sort = !g_quality_mode && decode_like;
         if (!skip_decode_sort &&
             !ds4_gpu_ensure_scratch_buffer(&g_indexed_topk_buffer,
                                              &g_indexed_topk_bytes,
