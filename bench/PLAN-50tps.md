@@ -170,3 +170,27 @@ DSpark, -c 16384, 400 tokens, DS4_SSD_CACHE_AUTO_PCT=50 unless noted. All varian
   kernels as one; (3) the hc F16 matvecs (68 outputs, K=7168) dispatch 3 threadgroups with nxpsg=8 -- nxpsg=32 would be
   ~10x faster but changes the summation order; (4) the 5 attention publish copies per layer merged; (5) a chunked
   Markov walk that stops at the survival cutoff instead of drafting all 5 rows.
+
+## Sep 15 — 1M context (Neil: "the real target is 1M context, 16k is practically useless")
+Setup: ds4-server on port 8010 with --kv-disk-dir so a long prefill is paid once (a 125k checkpoint is 0.8 GB and
+loads in 0.2 s; continued/shutdown saves of longer sessions were not reusable as prompt prefixes because the stored
+text includes the generated THINKING tokens). Prompts: ds4.c heads, 125k and 394k tokens. Prefill runs 540-600 t/s
+at both lengths (encoder-first sweeps of 8192 rows; layers 0-19 over the whole prompt, then the decoder).
+- Third panic: at -c 1048576 the context buffers are 25 GiB (block_mask alone is prefill_cap x ctx/8 = 4.3 GiB) and
+  the bank budget reserved only dense+context, not the support model, the OS or other apps: anonymous memory went to
+  150 GB (compressor 50 GB, swap 100 GB) within 90 s. Fixed in 409f569: reserve support model + 24 GiB headroom
+  (DS4_SSD_CACHE_HEADROOM_GIB), pct default 70 of the rest (= the old 50 at 16k; 45-48 GiB bank at 1M).
+- The 1M decode wall was the DSA indexer: the decode kernels (kernel_glm_indexer_scores_batch for verify rows,
+  kernel_glm_indexer_score_one_direct for single rows) run one threadgroup per compressed row and re-read the token's
+  16 KiB indexer q per row. 125k ctx: 6 ms per call x 8 index layers = 49 ms of a 110 ms sweep; linear in context,
+  so ~400 ms per step at 1M (2-3 t/s). Routing decode through the tiled kernel (409f569): 3.5 ms per call at 394k.
+  Then a decode-specific kernel (kernel_dsv41_indexer_scores_decode): q for the token in threadgroup memory, each
+  simdgroup streams its rows once, 8 rows per pass so the simd_sum chains overlap: 2.2 ms per call at 394k with
+  2-row passes, see below for 8-row. A first attempt holding K^T as simdgroup-matrix fragments across the head loop
+  spilled and ran 20 ms per call. Output identical in every variant (555-char thinking prefix at 394k, 400 tokens at
+  16k byte-identical).
+- Decode at 394k after the indexer fix: verify ~115-125 ms (16k: ~97), 11.5-13 t/s vs 5-6 before; remaining
+  context-proportional kernels: the indexer (18 ms/cycle), argsort causal shuffle 1.7 ms, indexed attention 2.6 ms.
+- The prefill tail after a cache hit is slow: 461 rows took 32 s at 125k, 1060 rows 26 s at 394k. The rows go
+  through the layer sweep in 32-row index batches (packed scores 2.7 ms + causal argsort 3.4 ms per batch per index
+  layer) plus the decoder-suffix rebuild; ~20 ms per row against 1.7 ms per row for the 8192-row sweeps. Not fixed.
