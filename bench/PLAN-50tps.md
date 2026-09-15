@@ -391,3 +391,10 @@ at both lengths (encoder-first sweeps of 8192 rows; layers 0-19 over the whole p
   the copies into their producers attacks both.
 - gentext.py's hash column is Python's per-process string hash (useless); the `cmp` of the .gen files is
   what the identity checks used, and prof5/prof7/prof8 (read-ahead on/off) are byte-identical.
+
+## PR series (local topic branches on antirez/ds4 main 9139e2a, in worktree ../ds4-pr)
+1. pr/server-disk-store-rendered-lookup (2d206c2): the KV disk-store lookup fix + tok_roundtrip. `--server` OK.
+2. pr/indexer-topk-select (a372d4c): radix-select top-k + test. Byte-identical at 16k, `--metal-kernels` OK.
+Next: the decode-shaped indexer (rows + MMA kernels: needs 409f569/90a7561 rebased first), prefill rows
+release/reuse, rewind; then the RFC for the no-copy bank + deferral + V4.1 DSpark with the sweep numbers.
+Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
