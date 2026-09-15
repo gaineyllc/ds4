@@ -11948,11 +11948,25 @@ static void trace_write_cache_diag(
     }
 }
 
-static int live_prefix_rewind_target(bool backend_can_rewind,
+/* Where a live session can drop back to instead of being rebuilt. GLM DSA
+ * rewinds to any position but only for a prompt that is a strict prefix of
+ * the live tokens (the last prompt token is re-evaluated for its logits).
+ * V4.1 (align 2: its compressed caches hold token pairs) also rewinds below a
+ * prompt that diverged from the live tokens, so re-asking with the last
+ * message edited costs the edited tail, not the whole 1M-token prefix. */
+static int live_prefix_rewind_target(bool backend_can_rewind, int align,
                                      int old_pos, int prompt_len, int common) {
-    if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
-    if (common != prompt_len) return -1;
-    return prompt_len - 1;
+    if (!backend_can_rewind || prompt_len <= 1 || common <= 0) return -1;
+    int target;
+    if (common == prompt_len) {
+        if (prompt_len >= old_pos) return -1;
+        target = prompt_len - 1;
+    } else {
+        if (align < 2 || common >= old_pos) return -1;
+        target = common;
+    }
+    if (align > 1) target -= target % align;
+    return target >= align ? target : -1;
 }
 
 static void trace_time(FILE *fp) {
@@ -13399,6 +13413,31 @@ static void *decode_worker_main(void *arg) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+/* Rewind the live session to `rewind_to` for this request; returns the
+ * cached prefix length on success, 0 when the backend could not keep the
+ * state and the prompt has to be rebuilt. */
+static int live_prefix_rewind(server *s, server_slot *slot, const job *j,
+                              int old_pos, int rewind_to, bool multimodal) {
+    pthread_mutex_lock(&s->inference_mu);
+    ds4_session_rewind(slot->session, rewind_to);
+    const bool rewind_valid =
+        ds4_session_common_prefix(slot->session, &j->req.prompt) == rewind_to &&
+        (!multimodal ||
+         ds4_session_vision_prefix_matches(slot->session, j->req.images,
+                                          j->req.image_count));
+    pthread_mutex_unlock(&s->inference_mu);
+    if (rewind_valid) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: rewound live prefix from %d to %d; %d prompt tokens will be reevaluated",
+                   old_pos, rewind_to, j->req.prompt.len - rewind_to);
+        return rewind_to;
+    }
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: live prefix rewind from %d to %d requires rebuild",
+               old_pos, rewind_to);
+    return 0;
+}
+
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
@@ -13406,6 +13445,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     pthread_mutex_lock(&s->inference_mu);
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
+    const bool ds41_live = ds4_engine_is_deepseek41(s->engine);
     const bool live_vision_match =
         ds4_session_vision_prefix_matches(slot->session,
                                          j->req.images, j->req.image_count);
@@ -21126,12 +21166,19 @@ static void test_model_metadata_clamps_completion_to_context(void) {
 }
 
 static void test_live_prefix_rewind_target(void) {
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
-    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
-    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 1, 17, 8, 8) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(true, 1, 49826, 48379, 48379) == 48378);
+    TEST_ASSERT(live_prefix_rewind_target(false, 1, 17, 8, 8) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 1, 17, 8, 7) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 1, 8, 8, 8) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 1, 17, 1, 1) == -1);
+    /* V4.1: pair-aligned, and below a diverging prompt too. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 8, 8) == 6);
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 869024, 868904, 868904) == 868902);
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 20, 9) == 8);
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 8, 7) == 6);
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 20, 17) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 2, 17, 3, 1) == -1);
 }
 
 static void test_client_socket_nonblocking_flag(void) {
