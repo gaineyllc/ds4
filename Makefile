@@ -139,6 +139,9 @@ tests/test_metal_rewind: tests/test_metal_rewind.o $(CORE_OBJS)
 test-metal-rewind: tests/test_metal_rewind
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_rewind
 
+tests/tok_roundtrip: tests/tok_roundtrip.c $(CORE_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/tok_roundtrip.c $(CORE_OBJS) $(METAL_LDLIBS)
+
 tests/test_metal_topk_select: tests/test_metal_topk_select.m ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_metal_topk_select.m ds4_metal.o ds4_image.o $(METAL_LDLIBS)
 
