@@ -41139,6 +41139,9 @@ typedef struct {
     uint32_t defer_snapshot_pos;
     ds4_engram_history defer_snapshot_history;
     bool defer_snapshot_valid;
+    /* More prompt follows this sweep: its keep-list seed would only be
+     * evicted by the next sweep's, so the bank is seeded once, at the end. */
+    bool prefill_more_pending;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -43330,7 +43333,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
             if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
             const double t_done = profile ? now_sec() : 0;
-            if (ok && !encoder_only && off + count == total_count)
+            if (ok && !encoder_only && off + count == total_count &&
+                !g->prefill_more_pending)
                 ok = ds41_prefill_seed(g, m, &w->layer[il], il, count);
             if (engram_prefetched && ds41_engram_layer(il) && off + count == total_count &&
                 !ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
@@ -77116,6 +77120,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             return 1;
         }
     }
+#ifndef DS4_NO_GPU
+    if (s && s->engine && s->engine->ssd_streaming) {
+        ds4_gpu_stream_expert_cache_cap_before_prefill(
+                s->ds41_graph.allocation_bytes);
+    }
+#endif
     int rc = s && s->engine && s->engine->tp.active && prompt && prompt->len > 0 ?
         ds4_session_sync_lockstep(s, prompt, err, errlen) :
         ds4_session_sync_internal(s, prompt, err, errlen);
@@ -77450,6 +77460,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             /* Never add an encoder sweep just to defer the decoder. A short
              * remainder finishes the pending decoder here, then runs normally. */
             const bool layer_major = count > 1u;
+            g->prefill_more_pending = remaining > count;
             const bool ok = short_count ?
                 ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
                 layer_major ?
