@@ -17054,7 +17054,10 @@ static void ds4_gpu_stream_expert_cache_prune_global(
                  expert++) {
                 ds4_gpu_stream_expert_cache_entry *e =
                     &g_stream_expert_cache[layer][expert];
+                /* A dispatch still running reads the address table live, so
+                 * an entry it names must not be zeroed under it. */
                 if (!e->valid ||
+                    ds4_gpu_stream_expert_cache_entry_inflight(e) ||
                     ds4_gpu_stream_expert_cache_entry_protected(layer,
                                                                 expert,
                                                                 protect_layer,
@@ -18746,6 +18749,12 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 down_inners[n_loads] = (NSUInteger)di;
                 load_unique[n_loads] = u;
                 n_loads++;
+                /* The driver pages a no-copy expert in when the dispatch is
+                 * submitted, one expert after another; ask the kernel for
+                 * the pages now so the misses of a layer overlap instead. */
+                ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u], gate_expert_bytes);
+                ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u], gate_expert_bytes);
+                ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u], down_expert_bytes);
                 continue;
             }
             /* The worker pool reads this entire batch below. Serial read-ahead
@@ -19013,6 +19022,14 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 t_done - t_read,
                 ds4_gpu_gib(logical_bytes));
     }
+    /* Installs above do not evict. The one-row path prunes after every
+     * routed layer; without this the bank of a multi-row decode (a DSpark
+     * verify batch, a batched session) grew without bound -- 9.7k no-copy
+     * entries, 90 GiB wired, on a 6k-entry budget -- until the machine
+     * swapped. Evicted entries stay alive through the residency set's
+     * retired list until the sweep's end drain, so an in-flight dispatch is
+     * never cut off. */
+    ds4_gpu_stream_expert_cache_prune_global(layer, unique_ids, unique_count);
     return 1;
 }
 
