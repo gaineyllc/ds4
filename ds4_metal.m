@@ -423,6 +423,7 @@ static id<MTLComputePipelineState> g_get_rows_q4_K_pipeline;
 static id<MTLComputePipelineState> g_repeat_f32_pipeline;
 static id<MTLComputePipelineState> g_concat_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f32_pipeline;
+static id<MTLComputePipelineState> g_cpy_contig_u32_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f16_pipeline;
 static id<MTLComputePipelineState> g_cpy_contig_f32_f16_pipeline;
 static id<MTLComputePipelineState> g_cpy_f16_f32_pipeline;
@@ -7199,6 +7200,12 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_cpy_contig_u32_4"];
+        g_cpy_contig_u32_pipeline = fn ? [g_device newComputePipelineStateWithFunction:fn error:&error] : nil;
+        if (!g_cpy_contig_u32_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_cpy_contig_u32_4 pipeline unavailable; copies use blits\n");
+        }
+
         fn = [library newFunctionWithName:@"kernel_cpy_f32_f32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_cpy_f32_f32 function not found\n");
@@ -9451,6 +9458,31 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
     if (bytes == 0) return 1;
     if (!g_batch_cb) return 0;
+
+    /* A word-aligned copy stays in the batch's open compute encoder: a blit
+     * costs three encoder boundaries, more than a small copy itself, and a
+     * decode step or verify layer makes several. A serial encoder orders its
+     * dispatches, so the copy sees every earlier write; the concurrent
+     * section tracks nothing and keeps the blit. */
+    const uint64_t s_abs = s.offset + src_offset, d_abs = d.offset + dst_offset;
+    if (g_cpy_contig_u32_pipeline && !g_batch_encoder_concurrent &&
+        (bytes & 3u) == 0 && (s_abs & 3u) == 0 && (d_abs & 3u) == 0 &&
+        bytes / 4u <= UINT32_MAX && (d.buffer != s.buffer || d_abs + bytes <= s_abs ||
+                                     s_abs + bytes <= d_abs) &&
+        getenv("DS4_METAL_DISABLE_COMPUTE_COPY") == NULL) {
+        const uint32_t n = (uint32_t)(bytes / 4u);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_cpy_contig_u32_pipeline];
+        [enc setBytes:&n length:sizeof(n) atIndex:0];
+        [enc setBuffer:s.buffer offset:(NSUInteger)s_abs atIndex:1];
+        [enc setBuffer:d.buffer offset:(NSUInteger)d_abs atIndex:2];
+        const NSUInteger groups = ((NSUInteger)n + 3u) / 4u;
+        const NSUInteger tg = groups < 256u ? (groups ? groups : 1u) : 256u;
+        [enc dispatchThreads:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+        return 1;
+    }
 
     /* C inference callers have no surrounding autorelease pool. In particular,
      * validation-layer blit bookkeeping otherwise accumulates across tokens. */
@@ -22431,6 +22463,18 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
     if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
     return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
         weight_offset, width, outputs, in, rows, true);
+}
+
+/* Same projection with the row-sharing kernels (weights read once for all
+ * rows) where the rows need not match the one-row arithmetic exactly. */
+int ds4_gpu_dsv41_projection_rows_shared(ds4_gpu_tensor *out,
+                                        const void *model_map, uint64_t model_size,
+                                        uint64_t weight_offset, uint32_t width,
+                                        uint32_t outputs, uint32_t rows,
+                                        const ds4_gpu_tensor *in) {
+    if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
+    return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
+        weight_offset, width, outputs, in, rows, false);
 }
 
 int ds4_gpu_matmul_f16_pair_tensor(

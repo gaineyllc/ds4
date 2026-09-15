@@ -84,6 +84,28 @@ kernel void kernel_cpy_contig_f32_f16_4(
     }
 }
 
+// Contiguous byte copy in 4-byte words, so a copy inside a command batch can
+// stay in the open compute encoder instead of opening a blit encoder for it
+// (three encoder boundaries per copy on Apple GPUs cost more than the copy).
+kernel void kernel_cpy_contig_u32_4(
+        constant uint & n,
+        device const uint * src,
+        device       uint * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint i = gid * 4u;
+    if (i >= n) {
+        return;
+    }
+    const uint remaining = n - i;
+    if (remaining >= 4u) {
+        ((device packed_uint4 *)dst)[gid] = ((device const packed_uint4 *)src)[gid];
+        return;
+    }
+    for (uint lane = 0; lane < remaining; ++lane) {
+        dst[i + lane] = src[i + lane];
+    }
+}
+
 kernel void kernel_cpy_contig_f16_f32_4(
         constant uint & n,
         device const half  * src,

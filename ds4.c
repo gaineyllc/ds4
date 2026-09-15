@@ -40719,7 +40719,8 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
-        ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
+        ok = (g_ds41_batch_rows_shared ? ds4_gpu_dsv41_projection_rows_shared :
+                                         ds4_gpu_dsv41_projection_rows)(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32) {
         ok = true;
@@ -41267,8 +41268,9 @@ static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool bf16) {
     if (weight->type == DS4_TENSOR_F16)
-        return ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
-            (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], count, in) &&
+        return (g_ds41_batch_rows_shared ? ds4_gpu_dsv41_projection_rows_shared :
+                                           ds4_gpu_dsv41_projection_rows)(out, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], count, in) &&
             (!bf16 || ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[1], count, DS4_V41_BF16));
     return ds41_matmul_batch(out, m, weight, in, count, bf16);
 }
@@ -41852,12 +41854,27 @@ static bool ds41_dspark_markov(ds41_gpu_graph *g, const ds4_dspark_weights *dw,
     return ok;
 }
 
+/* Verify (and draft) only the prefix whose cumulative drafter confidence
+ * stays above this: under streaming each extra row costs a fixed share of a
+ * decode (more unique experts, more misses), so a row unlikely to be reached
+ * and accepted is not worth verifying. DS4_V41_DSPARK_MIN_SURVIVAL overrides. */
+static double ds41_dspark_min_survival(void) {
+    static double v = -1.0;
+    if (v < 0.0) {
+        const char *env = getenv("DS4_V41_DSPARK_MIN_SURVIVAL");
+        v = env ? atof(env) : 0.6;
+    }
+    return v;
+}
+
 static bool ds41_dspark_head(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, const ds4_dspark_weights *dw,
                              int token, int forced_first, uint32_t count) {
+    const double th0 = now_sec();
     if (!ds41_output_projection(g, g->dspark_logits, m, w, g->batch.norm, count))
         return false;
     if (!ds4_gpu_end_commands()) return false;
+    const double th1 = now_sec();
     float *row = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     if (!row) return false;
     bool ok = true;
@@ -41867,6 +41884,7 @@ static bool ds41_dspark_head(ds41_gpu_graph *g, const ds4_model *m,
      * path anchors on the committed token and rows propose from there. */
     const bool late = forced_first >= 0;
     int previous = late ? forced_first : token;
+    double survival = 1.0;
     g->dspark_draft_len = 0;
     if (late) { g->dspark_draft[0] = forced_first; g->dspark_draft_len = 1; }
     /* Diagnostics: the drafter's own confidence head (sigmoid of w . [h_r ;
@@ -41901,7 +41919,7 @@ static bool ds41_dspark_head(ds41_gpu_graph *g, const ds4_model *m,
             const float c = (float)(1.0 / (1.0 + exp(-acc)));
             /* Indexed like dspark_draft: the confidence of draft[slot]. */
             g->dspark_confidence[late ? r + 1u : r] = c;
-            if (getenv("DS4_V41_DSPARK_LOG"))
+            if (getenv("DS4_V41_DSPARK_DIAG"))
                 fprintf(stderr, "ds4: dspark draft row=%u prev=%d confidence=%.3f\n", r, previous, c);
         }
         previous = (int)ds41_dspark_argmax(row);
@@ -41909,9 +41927,16 @@ static bool ds41_dspark_head(ds41_gpu_graph *g, const ds4_model *m,
         if (slot >= (uint32_t)(sizeof(g->dspark_draft) / sizeof(g->dspark_draft[0]))) break;
         g->dspark_draft[slot] = previous;
         g->dspark_draft_len = slot + 1u;
+        /* Each row costs a GPU round trip for its Markov correction; stop
+         * once the cycle would not verify the next row anyway. */
+        survival *= g->dspark_confidence[slot];
+        if (late && survival < ds41_dspark_min_survival()) break;
     }
     free(hid);
     free(row);
+    if (getenv("DS4_V41_DSPARK_DIAG"))
+        fprintf(stderr, "ds4: dspark head stages+proj=%.1fms markov_loop=%.1fms\n",
+                (th1 - th0) * 1000.0, (now_sec() - th1) * 1000.0);
     return ok;
 }
 
@@ -42259,8 +42284,10 @@ static bool ds41_verify_suffix_tops(ds41_gpu_graph *g, const ds4_model *m,
     if (rows_exact < 0) rows_exact = getenv("DS4_METAL_V41_ROWS_EXACT") != NULL;
     g_ds41_batch_rows_shared = !rows_exact;
     ds4_gpu_stream_expert_batch_pipeline(1);
+    const double tv0 = now_sec();
     const bool swept =
         ds41_graph_prefill(g, m, w, tokens, n_tokens, NULL, NULL, 0, NULL, NULL);
+    const double tv1 = now_sec();
     ds4_gpu_stream_expert_batch_pipeline(0);
     g_ds41_batch_rows_shared = false;
     g->dspark_verify_batch = false;
@@ -42281,17 +42308,21 @@ static bool ds41_verify_suffix_tops(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(residual);
     if (!collapsed) return false;
+    const double tv2 = now_sec();
     float *rows = malloc((size_t)n_tokens * DS4_N_VOCAB * sizeof(float));
     if (!rows) return false;
     bool ok = ds4_gpu_tensor_read(g->dspark_logits, 0, rows,
         (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(float)) != 0;
+    if (getenv("DS4_V41_DSPARK_DIAG"))
+        fprintf(stderr, "ds4: dspark verify sweep=%.1fms head=%.1fms read=%.1fms rows=%u\n",
+                (tv1 - tv0) * 1000.0, (tv2 - tv1) * 1000.0, (now_sec() - tv2) * 1000.0, n_tokens);
     if (ok) {
         if (row_tops)
             for (uint32_t i = 0; i < n_tokens; i++)
                 row_tops[i] = (int)ds41_dspark_argmax(rows + (size_t)i * DS4_N_VOCAB);
         /* Diagnostics: the target's confidence in each row's top token and
          * the rank it gives the drafter's proposal for that position. */
-        if (row_tops && getenv("DS4_V41_DSPARK_LOG")) {
+        if (row_tops && getenv("DS4_V41_DSPARK_DIAG")) {
             for (uint32_t i = 0; i + 1u < n_tokens; i++) {
                 const float *lr = rows + (size_t)i * DS4_N_VOCAB;
                 const float top = lr[row_tops[i]];
@@ -42386,16 +42417,27 @@ static bool ds41_dspark_draft_pending(ds41_gpu_graph *g, const ds4_model *m,
             fprintf(stderr, "ds4: dspark pending draft dropped: capture_valid=%d\n", (int)g->dspark_capture_valid);
         return false;
     }
-    if (!ds4_gpu_begin_commands()) return false;
-    if (!ds41_dspark_stage0(g, g->dspark_model, g->dspark_w) ||
-        !ds41_dspark_draft_at(g, m, w, g->dspark_pending_token, next_token,
-                              g->dspark_pending_pos) ||
-        !ds41_dspark_head(g, m, w, g->dspark_w, g->dspark_pending_token, next_token,
-                          g->dspark_w->block_size)) {
+    const double t0 = now_sec();
+    /* Draft rows are speculative: the row-sharing kernels are fine here. */
+    static int rows_exact = -1;
+    if (rows_exact < 0) rows_exact = getenv("DS4_METAL_V41_ROWS_EXACT") != NULL;
+    g_ds41_batch_rows_shared = !rows_exact;
+    bool ok = ds4_gpu_begin_commands() &&
+        ds41_dspark_stage0(g, g->dspark_model, g->dspark_w) &&
+        ds41_dspark_draft_at(g, m, w, g->dspark_pending_token, next_token,
+                             g->dspark_pending_pos);
+    const double t1 = now_sec();
+    ok = ok && ds41_dspark_head(g, m, w, g->dspark_w, g->dspark_pending_token, next_token,
+                                g->dspark_w->block_size);
+    g_ds41_batch_rows_shared = false;
+    if (!ok) {
         if (ds4_gpu_commands_active()) (void)ds4_gpu_end_commands();
         g->dspark_draft_len = 0;
         return false;
     }
+    if (getenv("DS4_V41_DSPARK_DIAG"))
+        fprintf(stderr, "ds4: dspark draft stages(encode)=%.1fms head=%.1fms rows=%u\n",
+                (t1 - t0) * 1000.0, (now_sec() - t1) * 1000.0, g->dspark_draft_len);
     return true;
 }
 
@@ -85813,15 +85855,7 @@ static int ds4_session_ds41_dspark_cycle(
     int tops[DS4_DSPARK_MAX_BLOCK_SIZE + 1];
     rows[0] = first_token;
     uint32_t n = 1;
-    /* Verify only the prefix the drafter itself expects to survive: under
-     * streaming each extra row costs a fixed share of a full decode (more
-     * unique experts, more misses), so a row whose chance of being reached
-     * and accepted is below that share is not worth verifying. */
-    static float min_survival = -1.0f;
-    if (min_survival < 0.0f) {
-        const char *env = getenv("DS4_V41_DSPARK_MIN_SURVIVAL");
-        min_survival = env ? (float)atof(env) : 0.6f;
-    }
+    const double min_survival = ds41_dspark_min_survival();
     double survival = 1.0;
     if (g->dspark_draft_len && g->dspark_draft[0] == first_token) {
         for (uint32_t i = 1; i < g->dspark_draft_len && n < limit; i++) {

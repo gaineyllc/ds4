@@ -119,6 +119,11 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  uint64_t weight_offset, uint32_t width,
                                  uint32_t outputs, uint32_t rows,
                                  const ds4_gpu_tensor *in);
+int ds4_gpu_dsv41_projection_rows_shared(ds4_gpu_tensor *out,
+                                 const void *model_map, uint64_t model_size,
+                                 uint64_t weight_offset, uint32_t width,
+                                 uint32_t outputs, uint32_t rows,
+                                 const ds4_gpu_tensor *in);
 /* Gather 512-wide F32 KV rows; IDs must come from top-k over source_rows. */
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
