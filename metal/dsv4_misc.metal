@@ -7106,3 +7106,103 @@ kernel void kernel_dsv4_router_usage_accum(
     atomic_fetch_add_explicit(&stats[base], 1u, memory_order_relaxed);
     atomic_fetch_add_explicit(&stats[base + 1u], (uint)(w * 65536.0f), memory_order_relaxed);
 }
+
+// Indexer scores for one decode token over a long context. The per-row
+// kernels above re-read the token's whole q (16 KiB) for every compressed
+// row; here q for the token sits in threadgroup memory once per threadgroup
+// and each simdgroup streams its rows of the key cache once, two rows per
+// pass so every q read serves both. Lane l holds dims 4l..4l+3 of a row; the
+// per-head dot is a simd_sum. Called once per token of a decode step.
+struct ds4_metal_args_dsv41_indexer_decode {
+    uint n_rows;
+    uint token;            // which token of the batch: q/weights/scores row
+    uint pos0;
+    uint row_group_size;
+    uint rows_per_sg;
+    uint n_head;
+    uint64_t q_token_stride;
+    uint64_t weights_token_stride;
+    uint64_t score_token_stride;
+    float scale;
+};
+
+kernel void kernel_dsv41_indexer_scores_decode(
+        constant ds4_metal_args_dsv41_indexer_decode & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint D = 128;
+    constexpr uint SGS = 8;
+    threadgroup float *qtg = shared;              // n_head x D
+    threadgroup float *wtg = qtg + 32u * D;       // n_head
+    const uint n_head = min(args.n_head, 32u);
+
+    device const float *qt = (device const float *)(q + (uint64_t)args.token * args.q_token_stride);
+    for (uint i = tid; i < n_head * D; i += SGS * 32u) qtg[i] = qt[i];
+    if (tid < n_head) {
+        wtg[tid] = ((device const float *)(weights + (uint64_t)args.token * args.weights_token_stride))[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint group = max(args.row_group_size, 1u);
+    const uint visible = min((args.pos0 + args.token + 1u) / group, args.n_rows);
+    device const float4 *keys = (device const float4 *)indexer_key_cache;
+    device float *dst = (device float *)(scores + (uint64_t)args.token * args.score_token_stride);
+
+    const uint row_begin = (tgpig * SGS + (uint)sg) * args.rows_per_sg;
+    const uint row_end = min(row_begin + args.rows_per_sg, args.n_rows);
+    // Per row: every lane forms its 4-dim partial of all 32 head dots, then a
+    // transpose-reduce (16+8+4+2+1 shuffles) leaves each lane with one head's
+    // full dot instead of 32 five-step simd_sums; the relu/weight step is then
+    // per lane and one more simd_sum finishes the row. Two rows per pass.
+    for (uint row = row_begin; row < row_end; row += 2u) {
+        const bool two = row + 1u < row_end;
+        const float4 k0 = keys[(uint64_t)row * (D / 4) + lane];
+        const float4 k1 = two ? keys[(uint64_t)(row + 1u) * (D / 4) + lane] : float4(0.0f);
+        float v0[32], v1[32];
+        for (uint h = 0; h < 32u; h++) {
+            const float4 q4 = h < n_head ? *((threadgroup const float4 *)(qtg + h * D) + lane) : float4(0.0f);
+            v0[h] = dot(k0, q4);
+            v1[h] = dot(k1, q4);
+        }
+        // After step with offset o, lane keeps the half of its values selected
+        // by bit o of its index, summed with the partner's matching half.
+#define DS41_IDX_STEP(o, n) \
+        { \
+            const bool upper = (lane & (o)) != 0u; \
+            for (uint i = 0; i < (n); i++) { \
+                const float s0 = upper ? v0[i] : v0[i + (n)]; \
+                const float s1 = upper ? v1[i] : v1[i + (n)]; \
+                const float r0 = simd_shuffle_xor(s0, (ushort)(o)); \
+                const float r1 = simd_shuffle_xor(s1, (ushort)(o)); \
+                v0[i] = (upper ? v0[i + (n)] : v0[i]) + r0; \
+                v1[i] = (upper ? v1[i + (n)] : v1[i]) + r1; \
+            } \
+        }
+        DS41_IDX_STEP(16u, 16u)
+        DS41_IDX_STEP(8u, 8u)
+        DS41_IDX_STEP(4u, 4u)
+        DS41_IDX_STEP(2u, 2u)
+        DS41_IDX_STEP(1u, 1u)
+#undef DS41_IDX_STEP
+        // v0[0] now holds the full dot for head = bit-reversed(lane) in the
+        // sense of the keep rule above: the kept half at offset o was the
+        // upper one iff bit o of lane is set, so the head index is lane.
+        const uint head = lane;
+        const float w = head < n_head ? wtg[head] : 0.0f;
+        float a0 = max(v0[0] * args.scale, 0.0f) * w;
+        float a1 = max(v1[0] * args.scale, 0.0f) * w;
+        a0 = simd_sum(a0);
+        a1 = simd_sum(a1);
+        if (lane == 0) {
+            dst[row] = row < visible ? a0 : -INFINITY;
+            if (two) dst[row + 1u] = row + 1u < visible ? a1 : -INFINITY;
+        }
+    }
+}
