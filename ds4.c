@@ -43011,6 +43011,22 @@ static bool ds41_keep_seed(const ds4_model *m, const ds4_weights *w) {
 
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
  * routes take precedence over the rest of the prompt's popular experts. */
+static bool ds41_prefill_seed_wanted(const ds41_gpu_graph *g) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Opt-in: the encoder sweeps of a long prompt seed layers 0-19 once (a
+     * quarter of the cap is 2500 entries at 1M, ~125 per encoder layer) and
+     * the last sweep seeds every layer. Measured inconclusive so far: a
+     * 125k prefill ran 296 s with it and 339 s without, but the first sweep
+     * alone swung 435-720 t/s between identical runs with the page cache. */
+    if (!g->streaming || !getenv("DS4_METAL_STREAMING_PREFILL_EARLY_SEED")) return false;
+    const uint32_t cap = ds4_gpu_stream_expert_cache_configured_count();
+    return cap && ds4_gpu_stream_expert_cache_current_count() < cap / 4u;
+#else
+    (void)g;
+    return false;
+#endif
+}
+
 static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, uint32_t il, uint32_t count) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -43707,8 +43723,15 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (!pipelined && ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
             if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
             const double t_done = profile ? now_sec() : 0;
-            if (ok && !encoder_only && !g->dspark_verify_batch && off + count == total_count &&
-                !g->prefill_more_pending)
+            /* The bank is seeded from the last sweep, so decode inherits the
+             * experts the prompt's tail routed to. A long prompt also seeds
+             * while the bank is still mostly empty: every sweep re-reads the
+             * whole model, and the experts the bank holds resident are the
+             * part of that read that comes from RAM instead of the SSD (a
+             * fresh 869k prefill ran 25% slower than one over a bank a
+             * previous session had filled). */
+            if (ok && !g->dspark_verify_batch && off + count == total_count &&
+                ((!encoder_only && !g->prefill_more_pending) || ds41_prefill_seed_wanted(g)))
                 ok = ds41_prefill_seed(g, m, &w->layer[il], il, count);
             if (engram_prefetched && ds41_engram_layer(il) && off + count == total_count &&
                 !ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;

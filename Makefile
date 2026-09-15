@@ -139,6 +139,9 @@ tests/test_metal_rewind: tests/test_metal_rewind.o $(CORE_OBJS)
 test-metal-rewind: tests/test_metal_rewind
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_rewind
 
+tests/test_metal_topk_select: tests/test_metal_topk_select.m ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_metal_topk_select.m ds4_metal.o ds4_image.o $(METAL_LDLIBS)
+
 speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
