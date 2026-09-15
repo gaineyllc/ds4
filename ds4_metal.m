@@ -14928,8 +14928,10 @@ static void ds4_gpu_stream_expert_cache_note_frequency_hotness(
     }
 }
 
-static void ds4_gpu_stream_expert_cache_note_token(uint32_t layer_index) {
+static void ds4_gpu_stream_expert_cache_note_tokens(uint32_t layer_index,
+                                                    uint32_t n_tokens) {
     if (!g_ssd_streaming_mode ||
+        n_tokens == 0 ||
         g_stream_expert_cache_decode_tokens == UINT64_MAX) {
         return;
     }
@@ -14938,8 +14940,16 @@ static void ds4_gpu_stream_expert_cache_note_token(uint32_t layer_index) {
     if (layer_index < g_stream_expert_cache_first_decode_layer)
         g_stream_expert_cache_first_decode_layer = layer_index;
     if (layer_index != g_stream_expert_cache_first_decode_layer) return;
-    g_stream_expert_cache_decode_tokens++;
+    if (g_stream_expert_cache_decode_tokens > UINT64_MAX - 1 - n_tokens) {
+        g_stream_expert_cache_decode_tokens = UINT64_MAX - 1;
+    } else {
+        g_stream_expert_cache_decode_tokens += n_tokens;
+    }
     ds4_gpu_stream_expert_cache_maybe_decay_route_hotness();
+}
+
+static void ds4_gpu_stream_expert_cache_note_token(uint32_t layer_index) {
+    ds4_gpu_stream_expert_cache_note_tokens(layer_index, 1);
 }
 
 static int ds4_gpu_stream_compact_addr_requested(void) {
@@ -18700,6 +18710,12 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         }
     }
     if (ok) {
+        /* The multi-row path must advance the same aging clock the single-row
+         * routed kernels do: without it, route hotness never decays while a
+         * verify/prefill batch is the only thing routing, so prompt-era
+         * frequency counts keep stale experts resident and every freshly
+         * loaded expert (hotness ~ rows) is the first prune victim. */
+        ds4_gpu_stream_expert_cache_note_tokens(layer, n_tokens);
         ds4_gpu_stream_expert_cache_note_frequency_hotness(layer,
                                                            frequency,
                                                            n_total_expert);
