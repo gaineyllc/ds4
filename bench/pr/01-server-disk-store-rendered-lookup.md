@@ -21,4 +21,4 @@ M5 Max 128 GiB, macOS 26.5, DeepSeek V4.1 Flash Q2, `--ssd-streaming -c 1048576
 --kv-disk-dir ... --kv-cache-cold-max-tokens 2000000`. The second 869k-token prefill of
 the day resumed from the 570401-token cold store and prefilled 570401 -> 868904 in 13.7
 min, where before the change every restart re-prefilled the whole prompt (25-38 min).
-`./ds4_test --server`: OK. No kernel or backend code touched.
+`./ds4_test --server`: OK on upstream main + this change (branch pr/server-disk-store-rendered-lookup). No kernel or backend code touched.
