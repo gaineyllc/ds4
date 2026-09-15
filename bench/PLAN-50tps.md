@@ -374,3 +374,20 @@ at both lengths (encoder-first sweeps of 8192 rows; layers 0-19 over the whole p
   ~1.7 tokens, i.e. ~30 t/s. 50 t/s at 1M needs that AND a DSpark that commits ~3 tokens per cycle (block 5,
   currently 1.7 agreed). The gaps today: dense kernels at ~45% of bandwidth, expert kernels at ~27%, the
   indexer re-reading K per token, ~15 ms of tiny dispatches, ~65 ms host-side.
+
+## Sep 15 evening — where the host-side time of a verify sweep goes (16k, 36 GiB bank, stops)
+- `DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_PROFILE=1` now splits the per-layer preparation:
+  hot/loop/res, loads (no-copy installs), wrap (3 views per install), ra (3 F_RDADVISE per install), install.
+  Per routed layer of a 3.25-row batch: 14.6 unique experts, 3.42 installs, prepare 1.3-1.5 ms of which
+  read-ahead 1.35 ms (0.4 ms per install), the three view creations 0.07 ms per install, the rest ~0.
+  The read-ahead is real I/O issue, not waste: with it disabled prepare drops to 0.36 ms but the GPU faults
+  the pages in serially and the drain goes 2.7 -> 7.1 ms per layer (sweep 206 -> 400 ms, 10.7 -> 5.8 t/s).
+  A mincore gate before the advise made it worse (0.25 ms per mincore call, and the pages are not in core).
+- So at 16k with a 36 GiB bank every verify sweep still reads ~1.3 GB of experts (3.4 misses x 9.5 MiB x 40
+  layers); the same run with a 55 GiB bank earlier in the day had ~0 misses. The bank size is the whole game
+  for misses, and 36 -> 55 GiB is the difference between 23% and ~0% miss rate per layer for 3-row batches.
+- The other host cost, ~0.75 ms per layer between drains, is the encode of the layer's ~50 dispatches in
+  ds4.c (~30 ms per sweep) -- the same tiny dispatches that cost ~15 ms of GPU time. Fusing bf16 rounding and
+  the copies into their producers attacks both.
+- gentext.py's hash column is Python's per-process string hash (useless); the `cmp` of the .gen files is
+  what the identity checks used, and prof5/prof7/prof8 (read-ahead on/off) are byte-identical.

@@ -18976,6 +18976,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                  ids,
                                  n_ids * sizeof(ids[0]));
     const double t_read = profile ? ds4_gpu_now_ms() : 0.0;
+    double prof_wrap_ms = 0.0, prof_ra_ms = 0.0, prof_install_ms = 0.0;
 
     bool seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
     uint32_t frequency[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { 0 };
@@ -19018,6 +19019,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                            frequency,
                                                            n_total_expert);
     }
+    const double t_hot = profile ? ds4_gpu_now_ms() : 0.0;
     /*
      * When the layer's unique selected set does not fit the cache budget, the
      * extra experts are addressed straight into whole-tensor mapped model views
@@ -19122,6 +19124,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
              * it, which would hand pread a read-only destination. */
             if (ds4_gpu_stream_expert_nocopy_enabled()) {
                 uint64_t gi = 0, ui = 0, di = 0;
+                const double tw0 = profile ? ds4_gpu_now_ms() : 0.0;
                 gate_bufs[n_loads] =
                     ds4_gpu_wrap_model_exact_range_owned(model_map, model_size,
                                                          unique_gate_offsets[u],
@@ -19143,12 +19146,14 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 down_inners[n_loads] = (NSUInteger)di;
                 load_unique[n_loads] = u;
                 n_loads++;
+                const double tw1 = profile ? ds4_gpu_now_ms() : 0.0;
                 /* The driver pages a no-copy expert in when the dispatch is
                  * submitted, one expert after another; ask the kernel for
                  * the pages now so the misses of a layer overlap instead. */
                 ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u], gate_expert_bytes);
                 ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u], gate_expert_bytes);
                 ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u], down_expert_bytes);
+                if (profile) { prof_wrap_ms += tw1 - tw0; prof_ra_ms += ds4_gpu_now_ms() - tw1; }
                 continue;
             }
             /* The worker pool reads this entire batch below. Serial read-ahead
@@ -19266,6 +19271,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                     read_ms);
         }
         if (ok) {
+            const double ti0 = profile ? ds4_gpu_now_ms() : 0.0;
             for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
                 const uint32_t u = load_unique[load_i];
                 const uint32_t expert = (uint32_t)unique_ids[u];
@@ -19291,6 +19297,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 }
                 unique_entries[u] = entry;
             }
+            if (profile) prof_install_ms = ds4_gpu_now_ms() - ti0;
         }
         if (load_timing_t0 != 0.0) {
             load_install_ms = ds4_gpu_now_ms() - load_timing_t0;
@@ -19300,6 +19307,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         }
     }
     if (tasks) free(tasks);
+    const double t_loop = profile ? ds4_gpu_now_ms() : 0.0;
     if (ok) {
         for (uint32_t u = 0; u < unique_count; u++) {
             ds4_gpu_stream_expert_cache_entry *entry = unique_entries[u];
@@ -19426,12 +19434,14 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         }
         fprintf(stderr,
                 "ds4: Metal streaming prefill batch selected addr layer=%u "
-                "tokens=%u unique=%u read=%.3f ms wrap=%.3f ms bytes=%.2f GiB\n",
+                "tokens=%u unique=%u read=%.3f ms wrap=%.3f ms (hot=%.3f loop=%.3f res=%.3f loads=%u wrap=%.3f ra=%.3f install=%.3f) bytes=%.2f GiB\n",
                 layer,
                 n_tokens,
                 *n_resources,
                 t_read - t0,
                 t_done - t_read,
+                t_hot - t_read, t_loop - t_hot, t_done - t_loop, n_loads,
+                prof_wrap_ms, prof_ra_ms, prof_install_ms,
                 ds4_gpu_gib(logical_bytes));
     }
     /* Installs above do not evict. The one-row path prunes after every
