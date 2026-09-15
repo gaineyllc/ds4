@@ -40428,6 +40428,9 @@ typedef struct {
     /* More prompt follows this sweep: its keep-list seed would only be
      * evicted by the next sweep's, so the bank is seeded once, at the end. */
     bool prefill_more_pending;
+    /* Bytes of batch and carry rows advised back to the OS after the last
+     * prefill (ds41_graph_release_prefill_rows); 0 while they are in use. */
+    uint64_t prefill_rows_released;
     int dspark_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1];
     uint32_t dspark_hist_len, dspark_hist_pos0;
     ds4_engram_history dspark_hist_history0;
@@ -40643,7 +40646,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
 #undef DS41_ALLOC
 #define DS41_BATCH_ALLOC(name, count) \
     if (!(g->batch.name = (!strcmp(#name, "engram_rows") || !strcmp(#name, "selected_comp") ? \
-            ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc)( \
+            ds4_gpu_tensor_alloc_managed : ds4_gpu_tensor_alloc_reusable)( \
                 (uint64_t)(count) * g->prefill_cap * 4u))) goto fail;
     DS41_PREFILL_STORAGE(DS41_BATCH_ALLOC)
     /* Engram projection ends before HC normalization. HC normalization
@@ -40679,7 +40682,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     if (!ds4_gpu_tensor_fill_f32(g->batch.block_mask, 0,
         (uint64_t)g->prefill_cap * ((g->ctx + 7u) / 8u))) goto fail;
 #define DS41_CARRY_ALLOC(name, count, format) \
-    if (g->carry_cap && !(g->carry.name = ds4_gpu_tensor_alloc( \
+    if (g->carry_cap && !(g->carry.name = ds4_gpu_tensor_alloc_reusable( \
             (uint64_t)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap * sizeof(float)))) goto fail;
     DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
 #undef DS41_CARRY_ALLOC
@@ -43253,6 +43256,50 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
  * travel down the stack with their token, while only source layers append KV.
  * A failed partial chunk cannot be snapshotted: its layers have different
  * frontiers, so the caller must rebuild from its retained token history. */
+/* Batch rows past the drafter's verify window, and every carry row, are
+ * written only by a prompt sweep, so between prefills their pages can go back
+ * to the OS: at 1M context that is ~9 GiB of batch rows and 3 GiB of carry
+ * otherwise idle through decode, memory the streaming expert bank can hold
+ * experts in instead. The rows are reclaimed before the next sweep that
+ * reaches them; whatever the OS took back refaults zero-filled, which every
+ * such row is rewritten over before it is read. */
+#define DS41_RESIDENT_ROWS 64u
+static uint64_t ds41_graph_release_prefill_rows(ds41_gpu_graph *g) {
+    if (!g->batch.residual || g->prefill_rows_released ||
+        g->prefill_cap <= DS41_RESIDENT_ROWS || getenv("DS4_METAL_KEEP_PREFILL_ROWS"))
+        return 0;
+    uint64_t released = 0;
+#define DS41_BATCH_RELEASE(name, count) \
+    released += ds4_gpu_tensor_release_pages(g->batch.name, \
+        (uint64_t)DS41_RESIDENT_ROWS * (count) * 4u, \
+        (uint64_t)(g->prefill_cap - DS41_RESIDENT_ROWS) * (count) * 4u);
+    DS41_PREFILL_STORAGE(DS41_BATCH_RELEASE)
+#undef DS41_BATCH_RELEASE
+#define DS41_CARRY_RELEASE(name, count, format) \
+    if (g->carry.name) released += ds4_gpu_tensor_release_pages(g->carry.name, 0, \
+        ds4_gpu_tensor_bytes(g->carry.name));
+    DS41_CARRY_ROWS(DS41_CARRY_RELEASE)
+#undef DS41_CARRY_RELEASE
+    g->prefill_rows_released = released;
+    if (released && getenv("DS4_METAL_ALLOC_LOG"))
+        fprintf(stderr, "ds4: prefill rows released %.2f GiB\n", (double)released / 1073741824.0);
+    return released;
+}
+
+static void ds41_graph_reuse_prefill_rows(ds41_gpu_graph *g) {
+    if (!g->prefill_rows_released) return;
+#define DS41_BATCH_REUSE(name, count) \
+    ds4_gpu_tensor_reuse_pages(g->batch.name, (uint64_t)DS41_RESIDENT_ROWS * (count) * 4u, \
+        (uint64_t)(g->prefill_cap - DS41_RESIDENT_ROWS) * (count) * 4u);
+    DS41_PREFILL_STORAGE(DS41_BATCH_REUSE)
+#undef DS41_BATCH_REUSE
+#define DS41_CARRY_REUSE(name, count, format) \
+    if (g->carry.name) ds4_gpu_tensor_reuse_pages(g->carry.name, 0, ds4_gpu_tensor_bytes(g->carry.name));
+    DS41_CARRY_ROWS(DS41_CARRY_REUSE)
+#undef DS41_CARRY_REUSE
+    g->prefill_rows_released = 0;
+}
+
 static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t total_count,
                               ds4_session_progress_fn progress, void *progress_ud,
@@ -43263,6 +43310,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
+    if (total_count > DS41_RESIDENT_ROWS) ds41_graph_reuse_prefill_rows(g);
     g->dspark_batch_mask = 0;
     g->dspark_batch_rows = 0;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
@@ -76817,6 +76865,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         ds4_gpu_stream_expert_cache_cap_before_prefill(
                 s->ds41_graph.allocation_bytes);
     }
+    if (s) ds41_graph_reuse_prefill_rows(&s->ds41_graph);
 #endif
     int rc = s && s->engine && s->engine->tp.active && prompt && prompt->len > 0 ?
         ds4_session_sync_lockstep(s, prompt, err, errlen) :
@@ -76825,9 +76874,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     /* Prefill is done and decode is next: hand the wired expert bank back to
      * the OS if this machine is in the RAM-limited regime, so the file cache
      * can serve decode-miss expert reads at RAM speed instead of SSD speed. */
-    if (rc == 0 && s && s->engine && s->engine->ssd_streaming) {
-        ds4_gpu_stream_expert_cache_shrink_for_decode(
-                s->ds41_graph.allocation_bytes);
+    if (rc == 0 && s) {
+        const uint64_t released = ds41_graph_release_prefill_rows(&s->ds41_graph);
+        if (s->engine && s->engine->ssd_streaming)
+            ds4_gpu_stream_expert_cache_shrink_for_decode(
+                    s->ds41_graph.allocation_bytes - released);
     }
     if (rc == 0) glm_debug_dump_prefill_logits(s->logits);
     if (rc == 0) {

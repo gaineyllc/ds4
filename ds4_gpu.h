@@ -47,6 +47,13 @@ void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
+/* Row scratch a backend may hand back to the OS between uses: pages inside
+ * the range are undefined (old or zero) once released until reused, so only
+ * rows rewritten before they are read qualify. Release returns the bytes it
+ * gave back; 0 where the backend keeps the memory. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_reusable(uint64_t bytes);
+uint64_t ds4_gpu_tensor_release_pages(ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
+void ds4_gpu_tensor_reuse_pages(ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);

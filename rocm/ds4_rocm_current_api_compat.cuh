@@ -171,6 +171,19 @@ extern "C" void ds4_gpu_stream_note_support_bytes(uint64_t bytes) {
     (void)bytes;
 }
 
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_reusable(uint64_t bytes) {
+    return ds4_gpu_tensor_alloc(bytes);
+}
+
+extern "C" uint64_t ds4_gpu_tensor_release_pages(ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    (void)tensor; (void)offset; (void)bytes;
+    return 0;
+}
+
+extern "C" void ds4_gpu_tensor_reuse_pages(ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    (void)tensor; (void)offset; (void)bytes;
+}
+
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_resident_cache_release();
 }

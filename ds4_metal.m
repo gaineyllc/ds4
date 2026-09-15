@@ -885,6 +885,9 @@ static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_cache_residency_drop(id<MTLBuffer> buffer);
 static void ds4_gpu_stream_expert_cache_residency_flush_retired(void);
+static void ds4_gpu_stream_expert_cache_prune_global(uint32_t protect_layer,
+                                                     const int32_t *protect_ids,
+                                                     uint32_t n_protect);
 static void ds4_gpu_stream_expert_cache_residency_commit_stats(double *ms, uint64_t *commits, uint64_t *members);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
@@ -1115,6 +1118,9 @@ static id<MTLBuffer> g_stream_expert_validate_status_buffer;
 @property(nonatomic, assign) uint64_t offset;
 @property(nonatomic, assign) uint64_t bytes;
 @property(nonatomic, assign) uint8_t owner;
+/* Set on buffers built over the tensor's own anonymous mapping, whose pages
+ * can be advised back to the OS between uses (ds4_gpu_tensor_release_pages). */
+@property(nonatomic, assign) uint8_t reusable;
 @end
 
 @implementation DS4MetalTensor
@@ -9369,6 +9375,93 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return ds4_gpu_tensor_alloc(bytes);
 }
 
+/* A shared buffer over the tensor's own anonymous mapping: Metal's allocator
+ * ignores madvise on the memory it hands out, whereas pages of a mapping the
+ * process owns can be marked reusable and taken back by the OS under
+ * pressure, then refault (zero-filled, or unchanged when never reclaimed) the
+ * next time the rows are written. Small tensors are not worth a mapping. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_reusable(uint64_t bytes) {
+    const uint64_t page = (uint64_t)getpagesize();
+    if (bytes < (1ull << 20) || getenv("DS4_METAL_DISABLE_REUSABLE_TENSORS"))
+        return ds4_gpu_tensor_alloc(bytes);
+    if (!g_initialized && !ds4_gpu_init()) return NULL;
+    if (bytes > (uint64_t)NSUIntegerMax - page) return NULL;
+    const uint64_t mapped = (bytes + page - 1) / page * page;
+    void *mem = mmap(NULL, (size_t)mapped, PROT_READ | PROT_WRITE,
+                     MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (mem == MAP_FAILED) {
+        fprintf(stderr, "ds4: reusable tensor mapping of %.1f MiB failed (%s); using a Metal allocation\n",
+                (double)bytes / 1048576.0, strerror(errno));
+        return ds4_gpu_tensor_alloc(bytes);
+    }
+
+    @autoreleasepool {
+        DS4MetalTensor *tensor = [DS4MetalTensor new];
+        tensor.buffer = [g_device newBufferWithBytesNoCopy:mem
+                                                    length:(NSUInteger)mapped
+                                                   options:MTLResourceStorageModeShared
+                                               deallocator:^(void *ptr, NSUInteger len) {
+                                                   munmap(ptr, (size_t)len);
+                                               }];
+        if (!tensor.buffer) {
+            fprintf(stderr, "ds4: Metal refused a %.1f MiB no-copy tensor; using a Metal allocation\n",
+                    (double)bytes / 1048576.0);
+            munmap(mem, (size_t)mapped);
+            return ds4_gpu_tensor_alloc(bytes);
+        }
+        tensor.offset = 0;
+        tensor.bytes = bytes;
+        tensor.owner = 1;
+        tensor.reusable = 1;
+        ds4_gpu_alloc_log("tensor(reusable)", bytes);
+        uint64_t live_snap = 0;
+        uint64_t peak_snap = 0;
+        pthread_mutex_lock(&g_tensor_mu);
+        const int tracked = ds4_gpu_tensor_track_alloc_locked(
+                (__bridge const void *)tensor,
+                bytes,
+                &live_snap,
+                &peak_snap);
+        pthread_mutex_unlock(&g_tensor_mu);
+        if (!tracked) {
+            fprintf(stderr, "ds4: failed to track Metal tensor allocation\n");
+            tensor.buffer = nil;
+            return NULL;
+        }
+        return (__bridge_retained ds4_gpu_tensor *)tensor;
+    }
+}
+
+/* Whole pages inside [offset, offset + bytes) of a reusable tensor. */
+static uint64_t ds4_gpu_tensor_page_span(const ds4_gpu_tensor *tensor,
+                                         uint64_t offset, uint64_t bytes,
+                                         uint8_t **start) {
+    if (!tensor) return 0;
+    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+    if (!obj.reusable || !obj.buffer || offset > obj.bytes || bytes > obj.bytes - offset)
+        return 0;
+    const uint64_t page = (uint64_t)getpagesize();
+    uint8_t *base = (uint8_t *)[obj.buffer contents] + obj.offset;
+    uintptr_t lo = ((uintptr_t)base + offset + page - 1) & ~(uintptr_t)(page - 1);
+    uintptr_t hi = ((uintptr_t)base + offset + bytes) & ~(uintptr_t)(page - 1);
+    if (hi <= lo) return 0;
+    *start = (uint8_t *)lo;
+    return (uint64_t)(hi - lo);
+}
+
+uint64_t ds4_gpu_tensor_release_pages(ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    uint8_t *start = NULL;
+    const uint64_t len = ds4_gpu_tensor_page_span(tensor, offset, bytes, &start);
+    if (len == 0) return 0;
+    return madvise(start, (size_t)len, MADV_FREE_REUSABLE) == 0 ? len : 0;
+}
+
+void ds4_gpu_tensor_reuse_pages(ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes) {
+    uint8_t *start = NULL;
+    const uint64_t len = ds4_gpu_tensor_page_span(tensor, offset, bytes, &start);
+    if (len != 0) (void)madvise(start, (size_t)len, MADV_FREE_REUSE);
+}
+
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     (void)kv_cache_bytes;
     (void)context_bytes;
@@ -14608,16 +14701,52 @@ static uint32_t ds4_gpu_stream_expert_decode_target_slots(uint64_t dense_bytes,
     return (target == 0 || target >= cur) ? 0 : target;
 }
 
-/* The no-copy bank is capped, never shrunk: applying the decode cap before
- * prefill keeps the seed from installing views that decode would only evict,
- * so the bank pinned during prefill is the bank decode runs with. */
+/* The no-copy bank is only ever a cap on entry count, so the cap can follow
+ * the context reserve: applied before prefill (with the batch rows counted
+ * in) it keeps the seed from installing views decode would only evict, and
+ * recomputed after prefill with the rows the graph released it lets decode
+ * grow the bank into that memory. A smaller cap prunes at once, while no
+ * dispatch is in flight, so the rows refault into memory the bank gave up. */
+static void ds4_gpu_stream_expert_cache_nocopy_recap(uint64_t context_bytes,
+                                                     const char *when) {
+    if (!ds4_gpu_stream_expert_slab_enabled()) return;
+    const uint32_t before = g_stream_expert_cache_mlock_budget_cap;
+    /* Size from the requested budget, not from the cap in force. */
+    g_stream_expert_cache_mlock_budget_cap = 0;
+    const uint32_t target =
+        ds4_gpu_stream_expert_decode_target_slots(g_stream_dense_bytes, context_bytes);
+    g_stream_expert_cache_mlock_budget_cap = before;
+    if (target == 0 && (before == 0 || !g_stream_expert_cache_decode_shrunk)) return;
+    if (target == before) return;
+    g_stream_expert_cache_mlock_budget_cap = target;
+    g_stream_expert_cache_decode_shrunk = 1;
+    if (target != 0 && target < g_stream_expert_cache_entry_count) {
+        ds4_gpu_stream_expert_cache_prune_global(UINT32_MAX, NULL, 0);
+        ds4_gpu_stream_expert_cache_residency_flush_retired();
+    }
+    if (target == 0) {
+        fprintf(stderr, "ds4: streaming expert cache cap lifted %s\n", when);
+        return;
+    }
+    fprintf(stderr,
+            "ds4: streaming expert cache capped %s: %u no-copy entries "
+            "(%.2f GiB of the model's own pages held resident, %u installed)\n",
+            when, target,
+            ds4_gpu_gib((uint64_t)target * g_stream_expert_cache_expert_bytes),
+            g_stream_expert_cache_entry_count);
+}
+
 void ds4_gpu_stream_expert_cache_cap_before_prefill(uint64_t context_bytes) {
     if (!ds4_gpu_stream_expert_nocopy_enabled()) return;
-    ds4_gpu_stream_expert_cache_shrink_for_decode(context_bytes);
+    ds4_gpu_stream_expert_cache_nocopy_recap(context_bytes, "before prefill");
 }
 
 void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes) {
     const uint64_t dense_bytes = g_stream_dense_bytes;
+    if (ds4_gpu_stream_expert_nocopy_enabled()) {
+        ds4_gpu_stream_expert_cache_nocopy_recap(context_bytes, "for decode");
+        return;
+    }
     if (g_stream_expert_cache_decode_shrunk) return;
     if (!ds4_gpu_stream_expert_slab_enabled()) return;
 
@@ -37696,7 +37825,11 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
             return 0;
         }
 
-        const bool force_scalar = g_quality_mode;
+        /* DS4_METAL_V41_INDEX_SCALAR=1 keeps every decode-sized call on the
+         * scalar kernel (the tiled one sums in a different order). */
+        static int scalar_env = -1;
+        if (scalar_env < 0) scalar_env = getenv("DS4_METAL_V41_INDEX_SCALAR") != NULL;
+        const bool force_scalar = g_quality_mode || (scalar_env && n_tokens < 8u);
         const bool use_tiled_f32 = tiled_f32;
         /* The scalar kernel runs one 32-thread threadgroup per (row, token)
          * and re-reads the token's whole q per row: at 125k tokens of V4.1
