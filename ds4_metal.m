@@ -843,6 +843,11 @@ typedef struct {
 } ds4_gpu_stream_expert_timing_snapshot;
 static ds4_gpu_stream_expert_timing_snapshot g_stream_expert_timing_last_report;
 static int g_stream_prefill_batch_selected_addr_building;
+static double g_batch_prof_t[4], g_batch_prof_last; /* DS4_METAL_STREAMING_BATCH_PROFILE */
+/* Is this buffer already resident through the committed expert residency set?
+ * Such a buffer needs no useResource: from the driver's point of view a
+ * per-command-buffer resource list is the expensive part of a submission. */
+static int ds4_gpu_stream_expert_cache_residency_covers(id<MTLBuffer> buffer);
 static int g_glm_stream_expert_addr_table_building;
 static uint64_t g_model_residency_count;
 static int g_model_residency_added_to_queue;
@@ -1408,7 +1413,7 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
-        if (n_printed < 400) {
+        if (n_printed < (getenv("DS4_METAL_CB_TIMES_MAX") ? (uint64_t)atoll(getenv("DS4_METAL_CB_TIMES_MAX")) : 400u)) {
             n_printed++;
             fprintf(stderr,
                     "ds4: cb %s: driver %.0f us, queue-wait %.0f us, gpu %.0f us, gap-from-prev-gpu-end %.0f us\n",
@@ -15258,6 +15263,8 @@ static int g_stream_expert_defer_dispatch;
 
 static id g_stream_expert_cache_residency_set;
 static NSMutableSet *g_stream_expert_cache_residency_members;
+/* Members added since the last commit: resident only once it happens. */
+static NSMutableSet *g_stream_expert_cache_residency_pending;
 /*
  * Additions and removals are not symmetric. A buffer that was just added is not
  * safe to read until the set is committed, so a pending addition must stop a
@@ -15304,6 +15311,9 @@ static void ds4_gpu_stream_expert_cache_residency_note(id<MTLBuffer> buffer) {
         }
         if ([g_stream_expert_cache_residency_members containsObject:buffer]) return;
         [g_stream_expert_cache_residency_members addObject:buffer];
+        if (!g_stream_expert_cache_residency_pending)
+            g_stream_expert_cache_residency_pending = [NSMutableSet set];
+        [g_stream_expert_cache_residency_pending addObject:buffer];
         [g_stream_expert_cache_residency_set addAllocation:buffer];
         g_stream_expert_cache_residency_dirty = 1;
     }
@@ -15318,6 +15328,7 @@ static void ds4_gpu_stream_expert_cache_residency_drop(id<MTLBuffer> buffer) {
     if (@available(macOS 15.0, *)) {
         if (![g_stream_expert_cache_residency_members containsObject:buffer]) return;
         [g_stream_expert_cache_residency_members removeObject:buffer];
+        [g_stream_expert_cache_residency_pending removeObject:buffer];
         [g_stream_expert_cache_residency_set removeAllocation:buffer];
         /* Hold the buffer alive until the removal is committed, so the set can
          * never name an allocation that has been freed. */
@@ -15361,6 +15372,7 @@ static void ds4_gpu_stream_expert_cache_residency_publish(void) {
              * t/s -- the bank wins the memory it should have been sharing. */
             g_stream_expert_cache_residency_dirty = 0;
             [g_stream_expert_cache_residency_retired removeAllObjects];
+            [g_stream_expert_cache_residency_pending removeAllObjects];
         }
         if (!g_stream_expert_cache_residency_on_queue &&
             g_queue &&
@@ -15392,8 +15404,24 @@ static void ds4_gpu_stream_expert_cache_residency_flush_retired(void) {
         g_stream_expert_cache_residency_commit_members =
             [g_stream_expert_cache_residency_members count];
         [g_stream_expert_cache_residency_retired removeAllObjects];
+        [g_stream_expert_cache_residency_pending removeAllObjects];
     }
 #endif
+}
+
+static int ds4_gpu_stream_expert_cache_residency_covers(id<MTLBuffer> buffer) {
+#if TARGET_OS_OSX
+    if (!buffer || g_stream_expert_cache_residency_failed ||
+        !g_stream_expert_cache_residency_set || !g_stream_expert_cache_residency_on_queue)
+        return 0;
+    if (@available(macOS 15.0, *)) {
+        return [g_stream_expert_cache_residency_members containsObject:buffer] &&
+               ![g_stream_expert_cache_residency_pending containsObject:buffer];
+    }
+#else
+    (void)buffer;
+#endif
+    return 0;
 }
 
 static int ds4_gpu_stream_expert_cache_residency_ready(void) {
@@ -15791,6 +15819,26 @@ static int ds4_gpu_stream_expert_defer_enabled(void) {
     return enabled &&
            !g_stream_expert_defer_disabled_for_token &&
            g_stream_expert_defer_cooldown == 0;
+}
+
+/* See ds4_gpu.h. Only honoured with the no-copy bank: slab-backed entries are
+ * recycled by pread, which must not overwrite pages an in-flight dispatch is
+ * still reading. */
+static int g_stream_batch_pipeline;
+
+void ds4_gpu_stream_expert_batch_pipeline(int on) {
+    g_stream_batch_pipeline = on ? 1 : 0;
+    /* Publish the bank once per sweep: a routed dispatch then names only the
+     * entries installed since (see ds4_gpu_stream_expert_cache_residency_covers),
+     * instead of every expert it reads -- the driver's per-submission cost of
+     * that list was several milliseconds per layer, more than the dispatch. */
+    if (on && ds4_gpu_stream_expert_nocopy_enabled()) {
+        ds4_gpu_stream_expert_cache_residency_publish();
+    }
+}
+
+static int ds4_gpu_stream_batch_pipelined(void) {
+    return g_stream_batch_pipeline && ds4_gpu_stream_expert_nocopy_enabled();
 }
 
 /* Will this token's routed layers run deferred? True from token begin, so the
@@ -33830,8 +33878,10 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
     [enc setBuffer:weights    offset:weights_off atIndex:9];
     [enc setBuffer:ds4_gpu_stream_expert_miss_flag() offset:0 atIndex:10];
     for (uint32_t i = 0; i < n_entries; i++) {
-        [enc useResource:entries[i]->gate_buffer usage:MTLResourceUsageRead];
-        [enc useResource:entries[i]->up_buffer usage:MTLResourceUsageRead];
+        if (!ds4_gpu_stream_expert_cache_residency_covers(entries[i]->gate_buffer))
+            [enc useResource:entries[i]->gate_buffer usage:MTLResourceUsageRead];
+        if (!ds4_gpu_stream_expert_cache_residency_covers(entries[i]->up_buffer))
+            [enc useResource:entries[i]->up_buffer usage:MTLResourceUsageRead];
     }
     /* Overflow experts are addressed straight into the mapped model views
      * when a layer's unique selected set exceeds the cache budget. */
@@ -33900,7 +33950,8 @@ static int ds4_gpu_encode_mul_mv_addr_iq2(
         id<MTLBuffer> b = resource_kind == 0 ? entries[i]->gate_buffer :
                           resource_kind == 1 ? entries[i]->up_buffer :
                                                entries[i]->down_buffer;
-        [enc useResource:b usage:MTLResourceUsageRead];
+        if (!ds4_gpu_stream_expert_cache_residency_covers(b))
+            [enc useResource:b usage:MTLResourceUsageRead];
     }
     if (overflow_resource) [enc useResource:overflow_resource usage:MTLResourceUsageRead];
     if (threadgroup_bytes != 0) {
@@ -45567,10 +45618,12 @@ int ds4_gpu_routed_moe_batch_tensor(
         }
         if (use_cached_batch) {
             const int had_batch = g_batch_cb != nil;
+            g_batch_prof_t[0] = ds4_gpu_now_ms();
             if (had_batch && ds4_gpu_end_commands() == 0) {
                 return 0;
             }
             g_stream_prefill_batch_selected_addr_building++;
+            g_batch_prof_t[1] = ds4_gpu_now_ms();
             if (!ds4_gpu_stream_expert_cache_prepare_selected_batch(
                         model_map,
                         model_size,
@@ -45597,6 +45650,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                 return 0;
             }
             g_stream_prefill_batch_selected_addr_building--;
+            g_batch_prof_t[2] = ds4_gpu_now_ms();
             if (stream_unique == 0) {
                 ds4_gpu_stream_expert_cache_clear_layer(layer_index);
                 fprintf(stderr,
@@ -46325,13 +46379,37 @@ int ds4_gpu_routed_moe_batch_tensor(
             return 0;
         }
 
+        g_batch_prof_t[3] = ds4_gpu_now_ms();
         if (!ds4_gpu_finish_command_buffer(cb, owned, "routed batch MoE")) {
             if (use_cached_batch) {
                 ds4_gpu_stream_expert_cache_clear_layer(layer_index);
             }
             return 0;
         }
-        if (use_cached_batch) {
+        if (use_cached_batch && !owned && ds4_gpu_stream_batch_pipelined()) {
+            /* Start the routed dispatch now and keep encoding the next layer
+             * behind it; the next layer's router read drains everything. */
+            if (ds4_gpu_end_commands_async() == 0 || ds4_gpu_begin_commands() == 0) {
+                ds4_gpu_stream_expert_cache_clear_layer(layer_index);
+                return 0;
+            }
+            static int prof = -1;
+            if (prof < 0) prof = getenv("DS4_METAL_STREAMING_BATCH_PROFILE") != NULL;
+            if (prof) {
+                /* drain: the router read-back wait (previous routed dispatch
+                 * plus this layer's pre-router work); prepare: cache lookups
+                 * and installs; encode: the two dispatches; since_last: the
+                 * host encoding of everything between routed dispatches. */
+                const double now = ds4_gpu_now_ms();
+                fprintf(stderr, "ds4: batch prof layer=%u rows=%u unique=%u drain=%.3f prepare=%.3f "
+                        "encode=%.3f commit=%.3f since_last=%.3f ms\n",
+                        layer_index, n_tokens, stream_unique,
+                        g_batch_prof_t[1] - g_batch_prof_t[0], g_batch_prof_t[2] - g_batch_prof_t[1],
+                        g_batch_prof_t[3] - g_batch_prof_t[2], now - g_batch_prof_t[3],
+                        g_batch_prof_last ? g_batch_prof_t[0] - g_batch_prof_last : 0.0);
+                g_batch_prof_last = now;
+            }
+        } else if (use_cached_batch) {
             if (!owned) {
                 if (ds4_gpu_end_commands() == 0) {
                     ds4_gpu_stream_expert_cache_clear_layer(layer_index);

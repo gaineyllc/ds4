@@ -209,6 +209,11 @@ int ds4_gpu_router_bias_override(const void *map, uint64_t bias_offset,
                                  const float *bias, uint32_t n_expert);
 /* 1 when the current token is expected to run its routed layers deferred. */
 int ds4_gpu_stream_expert_defer_expected(void);
+/* Multi-row routed batches normally drain the GPU after each layer's dispatch
+ * so the next layer's preparation may reuse cache slots. With the no-copy
+ * bank every entry is its own retained buffer, so a caller that drains at the
+ * end of its sweep can pipeline the layers instead. */
+void ds4_gpu_stream_expert_batch_pipeline(int on);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
