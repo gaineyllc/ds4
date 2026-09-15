@@ -2912,6 +2912,7 @@ static void print_size(uint64_t bytes) {
 #define DS4_DSPARK_MAX_TARGET_LAYERS 8
 #define DS4_DSPARK_MAX_STAGES 8
 #define DS4_DSPARK_MAX_BLOCK_SIZE 16
+#define DS4_DSPARK_WINDOW 128u /* committed positions the drafter attends to */
 #if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
 /* Seed plus five drafts needs five intermediate compressor frontiers. */
 #define DS4_SPEC_PREFIX_SLOTS 5
@@ -40426,7 +40427,8 @@ typedef struct {
     uint32_t dspark_hist_len, dspark_hist_pos0;
     ds4_engram_history dspark_hist_history0;
     uint64_t dspark_verify_rows, dspark_verify_agree;
-    int dspark_draft[DS4_DSPARK_MAX_BLOCK_SIZE];
+    int dspark_draft[DS4_DSPARK_MAX_BLOCK_SIZE + 1];
+    float dspark_confidence[DS4_DSPARK_MAX_BLOCK_SIZE + 1]; /* drafter's own acceptance estimate per draft[] */
     /* Deferred proposal: the capture is taken when a row commits, but the
      * block is only drafted once the next token is known, so that token can
      * seed row 1 of the block (teacher forcing) and pin the Markov chain. */
@@ -40693,6 +40695,15 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
 
+/* A batched session keeps every row's Q8_0 reductions identical to the
+ * one-row decode (rows are separate conversations, and the batch size must
+ * not change what any of them says). A DSpark verify batch has no such
+ * contract -- its rows are one conversation's speculative continuation and
+ * its state is committed as computed -- so it may use the row-sharing
+ * kernels, which read each weight once for all rows instead of once per row.
+ * DS4_METAL_V41_ROWS_EXACT=1 keeps the per-row kernels there too. */
+static bool g_ds41_batch_rows_shared;
+
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
@@ -40700,7 +40711,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     bool ok;
     /* Small decode batches retain scalar reductions before BF16 and sparse
      * routing boundaries. Preserve Metal's separate vocabulary-head dispatch. */
-    if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS &&
+    if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && !g_ds41_batch_rows_shared &&
 #ifdef __APPLE__
         outputs != DS4_N_VOCAB &&
 #endif
@@ -41739,15 +41750,16 @@ static bool ds41_dspark_draft_at(ds41_gpu_graph *g, const ds4_model *m,
     ds41_prefill_row *b = &g->batch;
     const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
 
-    /* Row 0 continues the committed token; the rest start from the noise
-     * token the drafter was trained to fill in. When the token after row 0
-     * is already known (the target chose it from the committed row's
-     * logits), row 1 is seeded with it instead of noise: the block's
-     * attention then reads the true continuation rather than guessing it. */
+    /* The reference (forward_spec) drafts from the anchor: the token the
+     * target has sampled but not yet run, whose predecessor's hidden state
+     * feeds main_proj and keys the window at pos. Row 0 is that anchor and
+     * every other row the noise token the drafter was trained to fill in;
+     * row r's logits propose the token after row r. With late drafting the
+     * anchor is next_token; the eager path, which drafts before it is known,
+     * anchors on the committed token itself instead. */
+    const int anchor = next_token >= 0 ? next_token : token;
     for (uint32_t i = 0; i < count; i++) {
-        const uint32_t id = i == 0 ? (uint32_t)token :
-                            (i == 1 && next_token >= 0) ? (uint32_t)next_token :
-                            dw->noise_token_id;
+        const uint32_t id = i == 0 ? (uint32_t)anchor : dw->noise_token_id;
         ds4_gpu_tensor *row = ds4_gpu_tensor_view(b->residual,
             (uint64_t)i * hc_bytes, hc_bytes);
         if (!row) return false;
@@ -41849,8 +41861,30 @@ static bool ds41_dspark_head(ds41_gpu_graph *g, const ds4_model *m,
     float *row = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     if (!row) return false;
     bool ok = true;
-    int previous = token;
+    /* The Markov chain starts from the anchor (forward_head: output_ids[0]
+     * is the input token). Late drafting knows the anchor -- draft[0] is
+     * it, and rows 0..count-1 propose the count tokens after it; the eager
+     * path anchors on the committed token and rows propose from there. */
+    const bool late = forced_first >= 0;
+    int previous = late ? forced_first : token;
     g->dspark_draft_len = 0;
+    if (late) { g->dspark_draft[0] = forced_first; g->dspark_draft_len = 1; }
+    /* Diagnostics: the drafter's own confidence head (sigmoid of w . [h_r ;
+     * W1[x_{r-1}]]) on the collapsed pre-norm hidden, as the reference
+     * computes it. Compared with the target's verdicts it tells whether the
+     * drafter is unsure or merely disagreed with. */
+    const ds4_dspark_stage_weights *last = &dw->stage[dw->n_stages - 1u];
+    float *hid = NULL; const float *cw = NULL; const float *mw1 = NULL;
+    for (uint32_t r = 0; r < DS4_DSPARK_MAX_BLOCK_SIZE + 1u; r++) g->dspark_confidence[r] = 1.0f;
+    if (last->confidence_proj &&
+        last->confidence_proj->type == DS4_TENSOR_F32 && last->markov_w1 &&
+        last->markov_w1->type == DS4_TENSOR_F32) {
+        hid = malloc((size_t)count * DS4_N_EMBD * sizeof(float));
+        cw = (const float *)tensor_data(g->dspark_model, last->confidence_proj);
+        mw1 = (const float *)tensor_data(g->dspark_model, last->markov_w1);
+        if (hid && !ds4_gpu_tensor_read(g->batch.x, 0, hid,
+                (uint64_t)count * DS4_N_EMBD * sizeof(float))) { free(hid); hid = NULL; }
+    }
     for (uint32_t r = 0; ok && r < count; r++) {
         ok = ds4_gpu_begin_commands() &&
              ds41_dspark_markov(g, dw, r, previous) &&
@@ -41859,14 +41893,24 @@ static bool ds41_dspark_head(ds41_gpu_graph *g, const ds4_model *m,
                  (uint64_t)r * DS4_N_VOCAB * sizeof(float), row,
                  (uint64_t)DS4_N_VOCAB * sizeof(float));
         if (!ok) break;
-        /* Row 0 predicts a token the target has already chosen when the
-         * block is drafted late: record the truth and key row 1's Markov
-         * correction on it instead of on the drafter's own guess. */
-        previous = (r == 0 && forced_first >= 0) ? forced_first
-                                                 : (int)ds41_dspark_argmax(row);
-        g->dspark_draft[r] = previous;
-        g->dspark_draft_len = r + 1u;
+        if (hid && cw && mw1) {
+            const uint32_t rank = (uint32_t)last->markov_w1->dim[0];
+            double acc = 0.0;
+            for (uint32_t i = 0; i < DS4_N_EMBD; i++) acc += (double)cw[i] * hid[(size_t)r * DS4_N_EMBD + i];
+            for (uint32_t i = 0; i < rank; i++) acc += (double)cw[DS4_N_EMBD + i] * mw1[(size_t)previous * rank + i];
+            const float c = (float)(1.0 / (1.0 + exp(-acc)));
+            /* Indexed like dspark_draft: the confidence of draft[slot]. */
+            g->dspark_confidence[late ? r + 1u : r] = c;
+            if (getenv("DS4_V41_DSPARK_LOG"))
+                fprintf(stderr, "ds4: dspark draft row=%u prev=%d confidence=%.3f\n", r, previous, c);
+        }
+        previous = (int)ds41_dspark_argmax(row);
+        const uint32_t slot = late ? r + 1u : r;
+        if (slot >= (uint32_t)(sizeof(g->dspark_draft) / sizeof(g->dspark_draft[0]))) break;
+        g->dspark_draft[slot] = previous;
+        g->dspark_draft_len = slot + 1u;
     }
+    free(hid);
     free(row);
     return ok;
 }
@@ -41917,18 +41961,23 @@ static void ds41_dspark_capture_begin(ds41_gpu_graph *g) {
  * batches are captured; an ordinary prefill chunk is far wider than the
  * buffer and does not need a proposal anyway. */
 static bool ds41_dspark_capture_batch(ds41_gpu_graph *g, uint32_t il,
-                                      const ds41_prefill_row *b, uint32_t count) {
+                                      const ds41_prefill_row *b, uint32_t first,
+                                      uint32_t count) {
     uint32_t slot = 0;
     if (!g->dspark_ready || count > g->dspark_capture_cap ||
         !ds41_dspark_target_slot(g, il, &slot)) return true;
     const uint64_t row = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t hc_row = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
     ds4_gpu_tensor *dst = ds4_gpu_tensor_view(g->dspark_target_hidden_rows,
         (uint64_t)slot * g->dspark_capture_cap * row, (uint64_t)count * row);
+    ds4_gpu_tensor *src = ds4_gpu_tensor_view(b->residual, (uint64_t)first * hc_row,
+        (uint64_t)count * hc_row);
     ds4_gpu_tensor *wts = ds4_gpu_tensor_view(g->dspark_hc_mean_rows, 0,
         (uint64_t)count * DS4_N_HC * sizeof(float));
-    const bool ok = dst && wts &&
-        ds4_gpu_hc_weighted_sum_tensor(dst, b->residual, wts, DS4_N_EMBD, DS4_N_HC);
+    const bool ok = dst && src && wts &&
+        ds4_gpu_hc_weighted_sum_tensor(dst, src, wts, DS4_N_EMBD, DS4_N_HC);
     ds4_gpu_tensor_free(wts);
+    ds4_gpu_tensor_free(src);
     ds4_gpu_tensor_free(dst);
     if (!ok) return false;
     g->dspark_batch_rows = count;
@@ -41995,7 +42044,10 @@ static bool ds41_dspark_configure(ds41_gpu_graph *g, const ds4_model *dm,
     g->dspark_markov_bias = ds4_gpu_tensor_alloc(
         (uint64_t)DS4_N_VOCAB * sizeof(float));
     if (!g->dspark_logits || !g->dspark_markov_emb || !g->dspark_markov_bias) return false;
-    g->dspark_capture_cap = dw->block_size + 1u;
+    /* A verify batch is at most the committed token plus the proposal; the
+     * prompt's tail seeds the drafter's whole key window. */
+    g->dspark_capture_cap = dw->block_size + 1u > DS4_DSPARK_WINDOW ?
+        dw->block_size + 1u : DS4_DSPARK_WINDOW;
     g->dspark_hc_mean_rows = ds4_gpu_tensor_alloc(
         (uint64_t)g->dspark_capture_cap * DS4_N_HC * sizeof(float));
     g->dspark_target_hidden_rows = ds4_gpu_tensor_alloc(
@@ -42003,7 +42055,8 @@ static bool ds41_dspark_configure(ds41_gpu_graph *g, const ds4_model *dm,
         DS4_N_EMBD * sizeof(float));
     if (!g->dspark_hc_mean_rows || !g->dspark_target_hidden_rows) return false;
     {
-        float rows[DS4_MAX_HC * (DS4_DSPARK_MAX_BLOCK_SIZE + 1)];
+        float rows[DS4_MAX_HC * (DS4_DSPARK_MAX_BLOCK_SIZE + 1 > DS4_DSPARK_WINDOW ?
+                                 DS4_DSPARK_MAX_BLOCK_SIZE + 1 : DS4_DSPARK_WINDOW)];
         for (uint32_t i = 0; i < g->dspark_capture_cap * DS4_N_HC; i++)
             rows[i] = 1.0f / (float)DS4_N_HC;
         if (!ds4_gpu_tensor_write(g->dspark_hc_mean_rows, 0, rows,
@@ -42202,10 +42255,14 @@ static bool ds41_verify_suffix_tops(ds41_gpu_graph *g, const ds4_model *m,
     if (n_tokens > g->prefill_cap || n_tokens > g->ctx - g->pos) return false;
     g->dspark_verify_batch = true;
     for (uint32_t i = 0; i < 3; i++) g->verify_carry_valid[i] = false;
+    static int rows_exact = -1;
+    if (rows_exact < 0) rows_exact = getenv("DS4_METAL_V41_ROWS_EXACT") != NULL;
+    g_ds41_batch_rows_shared = !rows_exact;
     ds4_gpu_stream_expert_batch_pipeline(1);
     const bool swept =
         ds41_graph_prefill(g, m, w, tokens, n_tokens, NULL, NULL, 0, NULL, NULL);
     ds4_gpu_stream_expert_batch_pipeline(0);
+    g_ds41_batch_rows_shared = false;
     g->dspark_verify_batch = false;
     if (!swept) return false;
     ds41_prefill_row *b = &g->batch;
@@ -42232,6 +42289,22 @@ static bool ds41_verify_suffix_tops(ds41_gpu_graph *g, const ds4_model *m,
         if (row_tops)
             for (uint32_t i = 0; i < n_tokens; i++)
                 row_tops[i] = (int)ds41_dspark_argmax(rows + (size_t)i * DS4_N_VOCAB);
+        /* Diagnostics: the target's confidence in each row's top token and
+         * the rank it gives the drafter's proposal for that position. */
+        if (row_tops && getenv("DS4_V41_DSPARK_LOG")) {
+            for (uint32_t i = 0; i + 1u < n_tokens; i++) {
+                const float *lr = rows + (size_t)i * DS4_N_VOCAB;
+                const float top = lr[row_tops[i]];
+                double z = 0.0; uint32_t rank = 0;
+                const int prop = tokens[i + 1u];
+                for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+                    z += exp((double)lr[v] - top);
+                    if (lr[v] > lr[prop]) rank++;
+                }
+                fprintf(stderr, "ds4: dspark verify row=%u p_top=%.3f agree=%d rank=%u\n",
+                        i, 1.0 / z, prop == row_tops[i], rank);
+            }
+        }
         if (last_logits)
             memcpy(last_logits, rows + (size_t)(n_tokens - 1u) * DS4_N_VOCAB,
                    (size_t)DS4_N_VOCAB * sizeof(float));
@@ -42299,9 +42372,10 @@ static bool ds41_dspark_propose_from_row(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
-/* Draft the pending block now that the target's next token is known:
- * row 0 is the committed token, row 1 the known continuation, the rest noise.
- * draft[0] is then the known token and draft[1..] the proposals after it. */
+/* Draft the pending block now that the target's next token is known: it
+ * anchors the block (row 0), the rest is noise, and the hidden state of the
+ * committed token before it is the context. draft[0] is the anchor and
+ * draft[1..block_size] the proposals after it. */
 static bool ds41_dspark_draft_pending(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_weights *w, int next_token) {
     if (!g->dspark_draft_pending) return g->dspark_draft_len != 0;
@@ -42546,9 +42620,16 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
     if (!ds41_engram_decode_bg_join(&engram_bg)) ok = false;
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (ok && g->dspark_ready && g->dspark_capture_valid) {
-        if (!ds4_gpu_begin_commands() ||
-            !ds41_dspark_stage0(g, g->dspark_model, g->dspark_w) ||
-            !ds4_gpu_end_commands()) {
+        /* Every processed position keys the drafter's window (the reference
+         * writes window_kv_cache for each one). Prompt tokens and fallback
+         * decodes never draft, so without this their slots kept stale keys
+         * and the drafter attended to garbage for its first 128 positions. */
+        bool keyed = ds4_gpu_begin_commands() &&
+                     ds41_dspark_stage0(g, g->dspark_model, g->dspark_w);
+        for (uint32_t st = 0; keyed && g->dspark_w && st < g->dspark_w->n_stages; st++)
+            keyed = ds41_dspark_window_key(g, g->dspark_model,
+                                           &g->dspark_w->stage[st].block, st, g->pos);
+        if (!keyed || !ds4_gpu_end_commands()) {
             fprintf(stderr, "ds4: V4.1 DSpark stage 0 failed at position %u\n", g->pos);
             ok = false;
         } else {
@@ -43161,7 +43242,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
-            const uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
+            uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
+            /* The drafter's key window is seeded from the target layers'
+             * last DS4_DSPARK_WINDOW rows, so keep that many at every layer. */
+            if (g->dspark_ready && needed < DS4_DSPARK_WINDOW) needed = DS4_DSPARK_WINDOW;
+            if (needed > total_count) needed = total_count;
             first = total_count - needed;
             if (ok) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                 first - 127u, 127u, false, batch_hc, batch_attention, cancel, cancel_ud);
@@ -43261,8 +43346,16 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             /* The drafter reads the attention input of its target layers; in a
              * batch that is every row's, before the layer consumes them. */
-            if (ok && batch_hc && g->dspark_ready)
-                ok = ds41_dspark_capture_batch(g, il, &active, count);
+            if (ok && batch_hc && g->dspark_ready) {
+                /* A verify batch is captured whole (the next proposal starts
+                 * from one of its rows); a prompt captures the tail of its
+                 * last chunk, which seeds the drafter's key window. */
+                const uint32_t tail = count < DS4_DSPARK_WINDOW ? count : DS4_DSPARK_WINDOW;
+                if (g->dspark_verify_batch)
+                    ok = ds41_dspark_capture_batch(g, il, &active, 0, count);
+                else if (!encoder_only && off + count == total_count)
+                    ok = ds41_dspark_capture_batch(g, il, &active, count - tail, tail);
+            }
             if (ok && batch_hc)
                 ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
             DS41_STAGE("hc/engram");
@@ -43398,13 +43491,50 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     return ok;
 }
 
+/* After a prompt, give the drafter what the reference prefill gives it: a
+ * window key for each of the last DS4_DSPARK_WINDOW positions (the reference
+ * seeds window_kv_cache from every prompt position's main hidden), and a
+ * proposal armed from the last row so the first cycle can verify instead of
+ * decoding one token to get started. Without this the window held zeros for
+ * the prompt's positions until 128 tokens had been generated. */
+static bool ds41_dspark_seed_window(ds41_gpu_graph *g, const ds4_model *m,
+                                    const ds4_weights *w, const int *tokens,
+                                    uint32_t count, uint32_t start) {
+    if (!g->dspark_ready || !g->dspark_w || !g->dspark_batch_rows ||
+        g->dspark_batch_mask != ds41_dspark_complete_mask(g)) return true;
+    const uint32_t rows = g->dspark_batch_rows;
+    if (rows > count) return true;
+    const uint32_t first = count - rows;
+    const ds4_model *dm = g->dspark_model;
+    const ds4_dspark_weights *dw = g->dspark_w;
+    const double t0 = now_sec();
+    if (!ds4_gpu_begin_commands()) return false;
+    bool ok = true;
+    for (uint32_t i = 0; ok && i + 1u < rows; i++) {
+        ok = ds41_dspark_select_batch_row(g, i) && ds41_dspark_stage0(g, dm, dw);
+        for (uint32_t stage = 0; ok && stage < dw->n_stages; stage++)
+            ok = ds41_dspark_window_key(g, dm, &dw->stage[stage].block, stage,
+                                        start + first + i);
+    }
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok) ok = ds41_dspark_propose_from_row(g, m, w, tokens[count - 1u], rows - 1u,
+                                              start + count - 1u);
+    if (getenv("DS4_V41_DSPARK_LOG"))
+        fprintf(stderr, "ds4: dspark window seeded from %u prompt rows in %.1f ms%s\n",
+                rows, (now_sec() - t0) * 1000.0, ok ? "" : " (failed)");
+    if (!ok) { g->dspark_draft_len = 0; g->dspark_draft_pending = false; }
+    return true;
+}
+
 static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t count,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud) {
     if (g->streaming && !ds41_keep_seed(m, w)) return false;
-    return ds41_graph_prefill_sweep(g, m, w, tokens, count, progress, progress_ud,
-                                   total, cancel, cancel_ud, false, false);
+    const uint32_t start = g->pos;
+    if (!ds41_graph_prefill_sweep(g, m, w, tokens, count, progress, progress_ud,
+                                  total, cancel, cancel_ud, false, false)) return false;
+    return g->dspark_verify_batch || ds41_dspark_seed_window(g, m, w, tokens, count, start);
 }
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
     if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
@@ -43443,6 +43573,8 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
     if (remaining < 2u || remaining >= 256u ||
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL") || !ds41_cuda_row_batch_supported(g, w))
         return 0;
+    /* The drafter's key window is seeded by the layer-major sweep. */
+    if (g->dspark_ready) return 0;
     if (g->tp_world == 2 && (!ds41_tp_batch_enabled(g) ||
         getenv("DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL"))) return 0;
     return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
@@ -85681,10 +85813,22 @@ static int ds4_session_ds41_dspark_cycle(
     int tops[DS4_DSPARK_MAX_BLOCK_SIZE + 1];
     rows[0] = first_token;
     uint32_t n = 1;
+    /* Verify only the prefix the drafter itself expects to survive: under
+     * streaming each extra row costs a fixed share of a full decode (more
+     * unique experts, more misses), so a row whose chance of being reached
+     * and accepted is below that share is not worth verifying. */
+    static float min_survival = -1.0f;
+    if (min_survival < 0.0f) {
+        const char *env = getenv("DS4_V41_DSPARK_MIN_SURVIVAL");
+        min_survival = env ? (float)atof(env) : 0.6f;
+    }
+    double survival = 1.0;
     if (g->dspark_draft_len && g->dspark_draft[0] == first_token) {
         for (uint32_t i = 1; i < g->dspark_draft_len && n < limit; i++) {
             const int t = g->dspark_draft[i];
             if (t < 0 || (uint32_t)t >= DS4_N_VOCAB) break;
+            survival *= g->dspark_confidence[i];
+            if (n >= 2u && survival < min_survival) break;
             rows[n++] = t;
         }
     }
@@ -85801,12 +85945,13 @@ static int ds4_session_ds41_dspark_cycle(
         g->dspark_draft_len = 0;
         g->dspark_capture_valid = false;
     }
+    t_prev_cycle_end = now_sec();
     if (log)
         fprintf(stderr, "ds4: dspark cycle n=%u agreed=%u committed=%u%s "
-                        "verify=%.1fms draft=%.1fms gap=%.1fms\n",
+                        "verify=%.1fms draft=%.1fms gap=%.1fms tail=%.1fms\n",
                 n, agreed, commit, exact ? " exact" : "",
-                (t_decide - t_verify) * 1000.0, draft_ms, t_gap * 1000.0);
-    t_prev_cycle_end = now_sec();
+                (t_decide - t_verify) * 1000.0, draft_ms, t_gap * 1000.0,
+                (t_prev_cycle_end - t_decide) * 1000.0);
     (void)dw;
     return emitted;
 }
