@@ -1093,6 +1093,11 @@ static uint8_t  g_stream_expert_cache_decode_shrunk;
 static uint8_t  g_stream_expert_cache_auto_sized;
 static uint64_t g_stream_model_total_bytes;
 static uint64_t g_stream_dense_bytes;
+static uint64_t g_stream_support_bytes;
+
+void ds4_gpu_stream_note_support_bytes(uint64_t bytes) {
+    g_stream_support_bytes = bytes;
+}
 static uint64_t g_stream_expert_cache_cb_seq;
 static uint64_t g_stream_expert_cache_done_seq;
 static uint64_t g_stream_expert_cache_batch_seq;
@@ -1699,6 +1704,24 @@ static MTLResourceOptions ds4_gpu_model_resource_options(void) {
     return options;
 }
 
+/* DS4_METAL_ALLOC_LOG=<MiB>: report every Metal buffer allocation at or above
+ * the threshold, with a running total, to find where memory goes. */
+static void ds4_gpu_alloc_log(const char *label, uint64_t bytes) {
+    static long threshold = -1;
+    static uint64_t total;
+    if (threshold < 0) {
+        const char *env = getenv("DS4_METAL_ALLOC_LOG");
+        threshold = env ? strtol(env, NULL, 10) : 0;
+        if (threshold < 0) threshold = 0;
+    }
+    if (threshold == 0) return;
+    total += bytes;
+    if (bytes >= (uint64_t)threshold << 20) {
+        fprintf(stderr, "ds4: Metal alloc %s %.1f MiB (logged total %.2f GiB)\n",
+                label ? label : "?", (double)bytes / 1048576.0, (double)total / 1073741824.0);
+    }
+}
+
 static int ds4_gpu_ensure_scratch_buffer(
         id<MTLBuffer> __strong *buffer,
         NSUInteger    *capacity,
@@ -1734,6 +1757,7 @@ static int ds4_gpu_ensure_scratch_buffer(
     }
     (*buffer).label = [NSString stringWithUTF8String:label];
     *capacity = bytes;
+    ds4_gpu_alloc_log(label, (uint64_t)bytes);
     return 1;
 }
 
@@ -9315,6 +9339,7 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
         tensor.offset = 0;
         tensor.bytes = bytes;
         tensor.owner = 1;
+        ds4_gpu_alloc_log("tensor", bytes);
         uint64_t live_snap = 0;
         uint64_t peak_snap = 0;
         pthread_mutex_lock(&g_tensor_mu);
@@ -14535,7 +14560,21 @@ static uint32_t ds4_gpu_stream_expert_decode_target_slots(uint64_t dense_bytes,
     const uint64_t cur_bytes = (uint64_t)cur * slot_bytes;
     if (cur_bytes < DS4_STREAM_EXPERT_DECODE_CLIFF_BYTES) return 0;
 
-    const uint64_t reserved = dense_bytes + context_bytes;
+    /* Everything else that has to stay resident beside the bank: the support
+     * (DSpark) model, and the OS plus whatever else the machine is running.
+     * The old formula reserved only the dense weights and the context, so at
+     * 1M context (25 GiB of context buffers) the same pct landed a 128 GiB
+     * machine in a thrash the watchdog ended with a panic. DS4_SSD_CACHE_HEADROOM_GIB
+     * overrides the 24 GiB default. */
+    uint64_t headroom = 24ull << 30;
+    const char *headroom_env = getenv("DS4_SSD_CACHE_HEADROOM_GIB");
+    if (headroom_env && headroom_env[0]) {
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(headroom_env, &end, 10);
+        if (errno == 0 && end != headroom_env && v >= 0 && v <= 1024) headroom = (uint64_t)v << 30;
+    }
+    const uint64_t reserved = dense_bytes + context_bytes + g_stream_support_bytes + headroom;
     if (ram <= reserved) return 0;
 
     /*
@@ -14545,9 +14584,11 @@ static uint32_t ds4_gpu_stream_expert_decode_target_slots(uint64_t dense_bytes,
      * no page cache to fall back on: shrinking that far trades resident-expert
      * hits for true SSD reads and costs ~20% decode on an M5 Max. Keep enough
      * bank to hold the decode working set while still freeing the wired pages
-     * that were starving prefill.
+     * that were starving prefill. 70% of what is left after the reserve above
+     * is the 56 GiB bank measured stable at 16k on a 128 GiB M5 Max, and
+     * ~43 GiB at 1M context.
      */
-    uint32_t pct = 50u;
+    uint32_t pct = 70u;
     const char *pct_env = getenv("DS4_SSD_CACHE_AUTO_PCT");
     if (pct_env && pct_env[0]) {
         char *end = NULL;
@@ -37653,7 +37694,13 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
 
         const bool force_scalar = g_quality_mode;
         const bool use_tiled_f32 = tiled_f32;
-        const bool use_tiled = !force_scalar && n_tokens >= 8u &&
+        /* The scalar kernel runs one 32-thread threadgroup per (row, token)
+         * and re-reads the token's whole q per row: at 125k tokens of V4.1
+         * context that is 6 ms per call, 49 ms per decode step, and it grows
+         * with the context. The tiled kernel pads a decode's few tokens to
+         * its 8-token tile and is ~100x cheaper on a long context, so it
+         * takes any wide enough row range, not only the prefill's batches. */
+        const bool use_tiled = !force_scalar && (n_tokens >= 8u || n_rows >= 1024u) &&
                                n_head == 32u && head_dim == 128u;
         id<MTLComputePipelineState> pipeline =
             use_tiled
