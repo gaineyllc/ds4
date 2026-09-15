@@ -14074,6 +14074,10 @@ static id<MTLBuffer> ds4_gpu_stream_expert_alloc_buffer(
 
 static void ds4_gpu_stream_expert_unlock_explicit_buffer(id<MTLBuffer> buffer) {
     if (!g_ssd_streaming_mode || !buffer) return;
+    /* A no-copy view was never locked; the munlock is a wasted syscall per
+     * tensor on every eviction (a fifth of a tail sweep's host time). */
+    if (ds4_gpu_stream_expert_nocopy_enabled() &&
+        [buffer.label isEqualToString:@"ds4_model_exact_owned_view"]) return;
     void *ptr = [buffer contents];
     const NSUInteger n = [buffer length];
     if (!ptr || n == 0 || munlock(ptr, (size_t)n) != 0) return;
