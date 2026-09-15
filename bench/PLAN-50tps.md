@@ -203,3 +203,72 @@ at both lengths (encoder-first sweeps of 8192 rows; layers 0-19 over the whole p
   out of the bank (block_mask alone is prefill_cap x ctx/8 *floats* = 4.3 GiB; as bits it would be 0.5 GiB), and
   the same per-layer sync and GPU inefficiency as at 16k. A tail sweep after a cache hit costs 15-30 s at any long
   context: whole-model read (~12 s at 9 GB/s) + residency commits for the seed (~2 s) + GPU idle during page-in.
+
+## Sep 15 — prefill rows handed back through decode (40c5172 + follow-up)
+- Of the 19.4 GiB of V4.1 context buffers at 1M, the batch rows (8192 x every per-row column, block_mask alone
+  4 GiB) and the carry rows (3 GiB) are written only by a prompt sweep; through decode they are idle, and the bank
+  cap left room for them. Measured first what the OS will take back: madvise(MADV_FREE_REUSABLE) on the memory
+  Metal's own allocator hands out does nothing (footprint unchanged); on an anonymous mmap wrapped with
+  newBufferWithBytesNoCopy it drops the footprint at once, contents preserved until the OS needs the pages;
+  setPurgeableState:Empty also works but only for a whole buffer. Shared Metal buffers are wired only while a
+  command buffer that uses them runs (wired rises by the buffer size during the blit and falls ~2 s after).
+- Batch and carry tensors now come from ds4_gpu_tensor_alloc_reusable (mmap + bytesNoCopy; other backends alias
+  ds4_gpu_tensor_alloc). After each prefill ds41_graph_release_prefill_rows advises rows 64.. of every batch column
+  and all carry rows reusable; the next sweep that reaches them advises REUSE first (the drafter's verify sweeps
+  only ever touch rows < 16). Reclaimed pages refault zero-filled; every such row is rewritten before it is read.
+- The no-copy bank cap is recomputed from the requested budget with the released bytes taken out of the context
+  reserve (ds4_gpu_stream_expert_cache_nocopy_recap): raised after prefill, restored -- and pruned -- before the next
+  prefill, but only by the rows that prefill will sweep (ds41_graph_released_beyond), so a 461-row tail after a
+  cache hit gives back 0.5 GiB, not 10. Numbers: 16k releases 5.3 GiB (cap 6050 -> 6452); 1M releases 10.4 GiB
+  (batch 8.6 + carry 1.8; cap 5126 -> 5910 entries, 47.5 -> 54.8 GiB).
+- Output check: the 16k reference (run_pin4_pct50) is reproduced byte-for-byte only with DS4_METAL_V41_INDEX_SCALAR=1,
+  because 409f569 moved the drafter's 3-15 row verify batches onto the tiled indexer kernel (different summation
+  order); the env now covers the Metal side too. With it set, the release build is byte-identical to the reference;
+  without it, HEAD before and after this change produce the same (different) text.
+- At 125k the bank was already big enough (0.00 misses/layer in the second half of 200 tokens; 3.0 ms per layer =
+  1.95 GPU + 0.5 prepare + 0.5 turnaround), so decode is unchanged there (17-18 t/s steady). The first 50 tokens of
+  every request run at 9.5 t/s regardless of bank warmth -- not misses; unexplained, worth a look (defer warm-up?).
+- 869k decode anatomy (batch prof, second half of 120 tokens, bank 5910 entries): 0.00 misses/layer, so the
+  bigger bank has removed misses at 1M entirely. Per layer (drain+prepare+turnaround): non-index layers 2.2-2.6 ms
+  (the 16k floor), index-source layers 5.1-7.8 ms, layer 0 17.9 ms (carries the head, sampling and the 7 ms draft
+  between cycles). Verify ~115 ms at n=2, ~175 ms at n=3; the 8 index layers' extra ~4 ms each is the indexer
+  kernel (~0.8 ms/token) plus the top-k sort.
+
+## Sep 15 — rewind instead of rebuild (e8085f3)
+- Any prompt that was not an extension of the live tokens rebuilt the whole prefix (25 min at 869k): the server's
+  rewind path was GLM-only because V4.1's compressors "cannot be rolled back by truncating row counts". They can,
+  to a pair boundary: the caches are addressed by valid length and the odd-row pair state is rewritten by the next
+  even token. What was really lost was the 128-row raw decode window. Every raw row now also goes to a per-layer
+  ring of the last 8192 positions (DS4_V41_RAW_LOG_ROWS, 640 MiB), ds41_graph_rewind rebuilds the windows from
+  it, and the server rewinds below a diverging prompt too (pair-aligned). tests/test_metal_rewind.c: a rewound and
+  replayed session matches a session that reached the same tokens through a fresh prefix and the same replay with
+  identical logits (a single sweep over the whole prompt computes the prefix rows in a different batch shape and
+  lands up to ~1 logit away; the greedy tokens agree). Regenerate / edit-last-message at 1M now costs the tail.
+- Caveat: rewinds deeper than 8192 - 128 tokens, or past a snapshot load, still rebuild.
+
+## Sep 15 — top-k by radix select
+- The indexer top-k (kernel_argsort_f32_i32_desc + merge) keeps every 1024-row block's top 512 and merges them in
+  log2(blocks) passes: at 435k rows that is 9 dependent passes over 217k survivors, ~2-3 ms per call; the 32-row
+  causal batches of prefill took 9.6 ms. kernel_topk_select_*: four 8-bit histogram levels find the k-th key
+  exactly, one compaction pass, one threadgroup orders the winners (score desc, index asc). Same sets on random
+  rows (tests/test_metal_topk_select.m); only when more than 2048 rows tie at the boundary is the choice among
+  them arrival-ordered. First timings with the GPU shared: 435k/3 tokens 3.0 -> 0.35 ms, 869k 2.7 -> 0.43 ms,
+  32-row causal batch 9.6 -> 0.97 ms. DS4_METAL_DISABLE_TOPK_SELECT=1 restores the sort.
+
+## Sep 15 — indexer decode kernel as simdgroup matrix products
+- kernel_dsv41_indexer_scores_decode now forms C(8 rows x 32 heads) = K(8 x 128) . Q^T(128 x 32) from 8x8
+  simdgroup_float8x8 tiles: 16 key tiles read once from the cache and 64 q tiles from threadgroup memory per 8
+  rows, then a per-row relu/weight reduction. The row-streaming kernel spent ~280 instructions per row and lane
+  (32 float4 dots, a 31-shuffle transpose-reduce and its selects); this one ~25. Standalone at 435k rows with the
+  GPU shared by a running prefill: 3.6-4.5 -> 0.59-0.82 ms per token; |diff| vs a double reference 8e-10.
+  DS4_METAL_V41_INDEX_DECODE_ROWS=1 keeps the old kernel.
+- Early bank seed (opt-in, DS4_METAL_STREAMING_PREFILL_EARLY_SEED=1): a fresh 869k prefill (empty bank) ran
+  20-25% slower than the same prefill over a bank a previous session had filled, so the encoder sweeps can seed
+  layers 0-19 while the bank is below a quarter of its cap. A/B on the 125k prompt: 296 s with, 339 s without,
+  but the first sweep alone swung 435-720 t/s between identical runs -- prefill I/O depends on what the page
+  cache still holds of the model from the previous run -- so the default stays off until measured on a quiet
+  machine. The topk select did show in the same runs: first sweeps of 713-727 t/s against 672-675 before.
+- Open: the server's cold/continued disk stores of a raw 1M prompt (570401 tokens, "key=token-text") are not found
+  again as a text prefix of the same prompt, so the 25-minute prefill repeats after every restart; only the store
+  of the exact p100k prompt hits. Not investigated. Watchdog note: watch3.sh's compressor limit was raised 25 -> 40
+  GiB after it killed a run at comp=26G with swap flat (wired 79G) -- the 1M graph's idle buffers get compressed.
