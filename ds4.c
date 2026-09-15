@@ -40369,6 +40369,13 @@ typedef struct {
     ds4_engram_table table[2];
     float rows[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
     ds4_gpu_tensor *window[40];
+    /* Every raw row also goes to a longer per-layer ring indexed by absolute
+     * position, so a session can be rewound (ds41_graph_rewind) with the
+     * decode window rebuilt from it: the window itself only keeps 128 rows.
+     * raw_log_from is the first position the ring has held since the last
+     * reset or snapshot load. */
+    ds4_gpu_tensor *raw_log[40];
+    uint32_t raw_log_rows, raw_log_from;
     ds4_gpu_tensor *compressed[4], *index_cache[4];
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
@@ -40430,7 +40437,7 @@ typedef struct {
     bool prefill_more_pending;
     /* Bytes of batch and carry rows advised back to the OS after the last
      * prefill (ds41_graph_release_prefill_rows); 0 while they are in use. */
-    uint64_t prefill_rows_released;
+    uint64_t prefill_batch_released, prefill_carry_released;
     int dspark_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 1];
     uint32_t dspark_hist_len, dspark_hist_pos0;
     ds4_engram_history dspark_hist_history0;
@@ -40485,7 +40492,10 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
         ds4_gpu_tensor_free(g->engram_q_norm[i]);
         ds4_gpu_tensor_free(g->engram_k_norm[i]);
     }
-    for (uint32_t i = 0; i < 40; i++) ds4_gpu_tensor_free(g->window[i]);
+    for (uint32_t i = 0; i < 40; i++) {
+        ds4_gpu_tensor_free(g->window[i]);
+        ds4_gpu_tensor_free(g->raw_log[i]);
+    }
     for (uint32_t i = 0; i < 4; i++) {
         ds4_gpu_tensor_free(g->compressed[i]);
         ds4_gpu_tensor_free(g->index_cache[i]);
@@ -40525,13 +40535,24 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     g->table[0].fd = g->table[1].fd = -1;
 }
 
+/* DS4_V41_RAW_LOG_ROWS=<rows> sizes the rewind ring (0 disables it); the
+ * default keeps the last 8192 positions, 640 MiB over 40 layers. */
+static uint32_t ds41_raw_log_rows(uint32_t ctx) {
+    const char *env = getenv("DS4_V41_RAW_LOG_ROWS");
+    long rows = env && env[0] ? strtol(env, NULL, 10) : 8192;
+    if (rows < 0) rows = 0;
+    if (rows != 0 && rows < 256) rows = 256;
+    if ((uint64_t)rows > ctx) rows = ctx;
+    return (uint32_t)rows;
+}
+
 static uint64_t ds41_graph_bytes(uint32_t ctx) {
     const ds41_gpu_graph shape = {.ctx = ctx,
         .prefill_cap = ds41_prefill_limit(ctx),
         .carry_cap = ds41_carry_cap(ctx),
         .prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS"),
         .compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY")}, *g = &shape;
-    uint64_t floats = (uint64_t)40 * 128 * 512;
+    uint64_t floats = (uint64_t)40 * (128 + ds41_raw_log_rows(ctx)) * 512;
     for (uint32_t i = 0; i < 4; i++)
         floats += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) * (512u + 128u) + 2u * 512u;
     floats += (uint64_t)2 * 2 * DS4_N_EMBD * DS4_N_HC;
@@ -40573,6 +40594,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
     g->valid = true;
+    g->raw_log_from = 0;
     ds4_engram_history_reset(&g->history);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
      * partial pair is overwritten by its even-position token before use. */
@@ -40629,6 +40651,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     for (uint32_t i = 0; i < 40; i++) {
         g->window[i] = ds4_gpu_tensor_alloc(128u * 512u * sizeof(float));
         if (!g->window[i]) goto fail;
+    }
+    g->raw_log_rows = ds41_raw_log_rows(ctx);
+    for (uint32_t i = 0; g->raw_log_rows && i < 40; i++) {
+        g->raw_log[i] = ds4_gpu_tensor_alloc((uint64_t)g->raw_log_rows * 512u * sizeof(float));
+        if (!g->raw_log[i]) goto fail;
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
@@ -41008,6 +41035,66 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
         ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
 }
 
+/* Copy `count` raw rows for positions first_pos.. from src rows src_row..
+ * into the rewind ring, in at most two pieces around its wrap. */
+static bool ds41_raw_log_write(ds41_gpu_graph *g, uint32_t il, const ds4_gpu_tensor *src,
+                               uint32_t src_row, uint32_t first_pos, uint32_t count) {
+    const uint32_t rows = g->raw_log_rows;
+    if (!rows || !count) return true;
+    const uint64_t rb = 512u * sizeof(float);
+    if (count > rows) {
+        src_row += count - rows;
+        first_pos += count - rows;
+        count = rows;
+    }
+    const uint32_t slot = first_pos % rows;
+    const uint32_t part = count < rows - slot ? count : rows - slot;
+    return ds4_gpu_tensor_copy(g->raw_log[il], (uint64_t)slot * rb, src,
+                               (uint64_t)src_row * rb, (uint64_t)part * rb) &&
+        (part == count || ds4_gpu_tensor_copy(g->raw_log[il], 0, src,
+                               (uint64_t)(src_row + part) * rb, (uint64_t)(count - part) * rb));
+}
+
+/* Drop the graph back to an even position. The compressed and index caches
+ * are addressed by valid length, so the rows past `pos` are simply never read
+ * again, and the odd-row pair state is rewritten by the next even token; the
+ * decode windows are rebuilt from the rewind ring, which must still hold the
+ * rows before `pos`. `tokens` is the session's full token history. */
+static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos) {
+    if (!g->valid || pos > g->pos || (pos & 1u)) return false;
+    if (pos < g->pos) {
+        const uint32_t need = pos < 128u ? pos : 128u;
+        const uint32_t from = pos - need;
+        if (need && (!g->raw_log_rows || from < g->raw_log_from ||
+                     g->pos - from >= g->raw_log_rows)) return false;
+        const uint64_t rb = 512u * sizeof(float);
+        bool ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t il = 0; ok && il < 40 && need; il++) {
+            for (uint32_t q = from; ok && q < pos;) {
+                const uint32_t ls = q % g->raw_log_rows, ws = q % 128u;
+                uint32_t n = pos - q;
+                if (n > g->raw_log_rows - ls) n = g->raw_log_rows - ls;
+                if (n > 128u - ws) n = 128u - ws;
+                ok = ds4_gpu_tensor_copy(g->window[il], (uint64_t)ws * rb,
+                                         g->raw_log[il], (uint64_t)ls * rb, (uint64_t)n * rb);
+                q += n;
+            }
+        }
+        if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+        if (!ok) return false;
+    }
+    g->pos = pos;
+    ds4_engram_history_reset(&g->history);
+    for (uint32_t i = 0; i < 3 && i < pos; i++)
+        g->history.tail[i] = (int32_t)g->token_map[tokens[pos - 1u - i]];
+    g->dspark_draft_len = 0;
+    g->dspark_pending_len = 0;
+    g->dspark_draft_pending = false;
+    g->dspark_capture_valid = false;
+    for (uint32_t i = 0; i < 3; i++) g->verify_carry_valid[i] = false;
+    return true;
+}
+
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -41021,6 +41108,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
         !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                              g->kv, 0, 512u * 4u) ||
+        !ds41_raw_log_write(g, il, g->kv, 0, pos, 1) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
@@ -41485,6 +41573,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t kept = n_raw < 128u ? n_raw : 128u;
     const uint32_t slot = (start + count - kept) % 128u;
     const uint32_t part = kept < 128u - slot ? kept : 128u - slot;
+    if (!ds41_raw_log_write(g, il, g->raw_prefill, previous, start, count)) return false;
     return ds4_gpu_tensor_copy(g->window[il], slot * row_bytes, g->raw_prefill,
             (n_raw - kept) * row_bytes, part * row_bytes) &&
         (kept == part || ds4_gpu_tensor_copy(g->window[il], 0, g->raw_prefill,
@@ -43175,7 +43264,8 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
                         ds4_gpu_dsv41_quantize(row.kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0);
                 if (ok) ok = ds4_gpu_tensor_copy(g->window[il],
                     (uint64_t)(row.pos % 128u) * DS4_N_HEAD_DIM * sizeof(float),
-                    row.kv, 0, DS4_N_HEAD_DIM * sizeof(float));
+                    row.kv, 0, DS4_N_HEAD_DIM * sizeof(float)) &&
+                    ds41_raw_log_write(g, il, row.kv, 0, row.pos, 1);
             }
         }
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -43265,29 +43355,47 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
  * such row is rewritten over before it is read. */
 #define DS41_RESIDENT_ROWS 64u
 static uint64_t ds41_graph_release_prefill_rows(ds41_gpu_graph *g) {
-    if (!g->batch.residual || g->prefill_rows_released ||
+    if (!g->batch.residual || g->prefill_batch_released || g->prefill_carry_released ||
         g->prefill_cap <= DS41_RESIDENT_ROWS || getenv("DS4_METAL_KEEP_PREFILL_ROWS"))
         return 0;
-    uint64_t released = 0;
+    uint64_t batch = 0, carry = 0;
 #define DS41_BATCH_RELEASE(name, count) \
-    released += ds4_gpu_tensor_release_pages(g->batch.name, \
+    batch += ds4_gpu_tensor_release_pages(g->batch.name, \
         (uint64_t)DS41_RESIDENT_ROWS * (count) * 4u, \
         (uint64_t)(g->prefill_cap - DS41_RESIDENT_ROWS) * (count) * 4u);
     DS41_PREFILL_STORAGE(DS41_BATCH_RELEASE)
 #undef DS41_BATCH_RELEASE
 #define DS41_CARRY_RELEASE(name, count, format) \
-    if (g->carry.name) released += ds4_gpu_tensor_release_pages(g->carry.name, 0, \
+    if (g->carry.name) carry += ds4_gpu_tensor_release_pages(g->carry.name, 0, \
         ds4_gpu_tensor_bytes(g->carry.name));
     DS41_CARRY_ROWS(DS41_CARRY_RELEASE)
 #undef DS41_CARRY_RELEASE
-    g->prefill_rows_released = released;
-    if (released && getenv("DS4_METAL_ALLOC_LOG"))
-        fprintf(stderr, "ds4: prefill rows released %.2f GiB\n", (double)released / 1073741824.0);
-    return released;
+    g->prefill_batch_released = batch;
+    g->prefill_carry_released = carry;
+    if ((batch || carry) && getenv("DS4_METAL_ALLOC_LOG"))
+        fprintf(stderr, "ds4: prefill rows released %.2f GiB (batch %.2f, carry %.2f)\n",
+                (double)(batch + carry) / 1073741824.0, (double)batch / 1073741824.0,
+                (double)carry / 1073741824.0);
+    return batch + carry;
+}
+
+/* Of the released bytes, those a prefill of `rows` more tokens leaves alone:
+ * only the rows it sweeps refault, so only they come out of the bank. */
+static uint64_t ds41_graph_released_beyond(const ds41_gpu_graph *g, uint32_t rows) {
+    uint64_t bytes = 0;
+    if (g->prefill_batch_released) {
+        const uint32_t span = g->prefill_cap - DS41_RESIDENT_ROWS;
+        const uint32_t used = rows > g->prefill_cap ? g->prefill_cap : rows;
+        const uint32_t touched = used > DS41_RESIDENT_ROWS ? used - DS41_RESIDENT_ROWS : 0;
+        bytes += g->prefill_batch_released / span * (span - touched);
+    }
+    if (g->prefill_carry_released && rows <= ds41_encoder_chunk_cap(g, rows))
+        bytes += g->prefill_carry_released;
+    return bytes;
 }
 
 static void ds41_graph_reuse_prefill_rows(ds41_gpu_graph *g) {
-    if (!g->prefill_rows_released) return;
+    if (!g->prefill_batch_released && !g->prefill_carry_released) return;
 #define DS41_BATCH_REUSE(name, count) \
     ds4_gpu_tensor_reuse_pages(g->batch.name, (uint64_t)DS41_RESIDENT_ROWS * (count) * 4u, \
         (uint64_t)(g->prefill_cap - DS41_RESIDENT_ROWS) * (count) * 4u);
@@ -43297,7 +43405,7 @@ static void ds41_graph_reuse_prefill_rows(ds41_gpu_graph *g) {
     if (g->carry.name) ds4_gpu_tensor_reuse_pages(g->carry.name, 0, ds4_gpu_tensor_bytes(g->carry.name));
     DS41_CARRY_ROWS(DS41_CARRY_REUSE)
 #undef DS41_CARRY_REUSE
-    g->prefill_rows_released = 0;
+    g->prefill_batch_released = g->prefill_carry_released = 0;
 }
 
 static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
@@ -64156,6 +64264,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             for (uint32_t i = 0; i < 3 && i < pos; i++)
                 g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
             g->pos = pos;
+            g->raw_log_from = pos;
             ds4_tokens_copy(&s->checkpoint, &tokens);
             s->checkpoint_valid = true;
         }
@@ -76861,11 +76970,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
     }
 #ifndef DS4_NO_GPU
-    if (s && s->engine && s->engine->ssd_streaming) {
+    /* V4.1 sessions cap the bank once the rows still to prefill are known. */
+    if (s && s->engine && s->engine->ssd_streaming && !ds4_session_is_ds41(s)) {
         ds4_gpu_stream_expert_cache_cap_before_prefill(
                 s->ds41_graph.allocation_bytes);
     }
-    if (s) ds41_graph_reuse_prefill_rows(&s->ds41_graph);
 #endif
     int rc = s && s->engine && s->engine->tp.active && prompt && prompt->len > 0 ?
         ds4_session_sync_lockstep(s, prompt, err, errlen) :
@@ -77181,6 +77290,13 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
         ds41_encoder_residency encoder = {0};
+        /* The bank gives back the batch rows this prefill sweeps, no more: a
+         * short tail after a cache hit leaves most of them, and the experts
+         * held in their place, alone. */
+        if (e->ssd_streaming && prompt->len > s->checkpoint.len)
+            ds4_gpu_stream_expert_cache_cap_before_prefill(g->allocation_bytes -
+                ds41_graph_released_beyond(g, (uint32_t)(prompt->len - s->checkpoint.len)));
+        ds41_graph_reuse_prefill_rows(g);
         ds41_encoder_acquire(g, &e->model, &e->weights,
             (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
         for (int i = s->checkpoint.len; i < prompt->len;) {
@@ -87207,6 +87323,11 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (s->checkpoint_valid && ds4_session_is_ds41(s) && s->ds41_graph_ready &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len && ds4_gpu_synchronize())
+        state_ok = ds41_graph_rewind(&s->ds41_graph, s->checkpoint.v, (uint32_t)pos);
+#endif
 #endif
     s->checkpoint.len = pos;
     /* DeepSeek compressors cannot be rolled back by truncating their row
