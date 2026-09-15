@@ -159,3 +159,14 @@ DSpark, -c 16384, 400 tokens, DS4_SSD_CACHE_AUTO_PCT=50 unless noted. All varian
 - Ceiling estimate at 16k, full quality, one node: GPU 55 -> ~35 ms with kernel work, misses ~25 ms at pct 58,
   turnaround 8, draft ~5 => ~75 ms per ~2.4 tokens => ~30 t/s. 50 t/s needs the experts resident (two nodes) or a
   different accept rate (the drafter is Q2-mismatched: 2.2-2.4 tokens/cycle).
+- Later the same night: seed hotness 1..8 instead of 1..32 (9b1ec1c; warm-up misses 1.94 -> 1.70/layer) and the
+  Markov walk chained on the GPU (1b28c2b; draft loop 1.9 -> 1.4 ms, the rest is the 132 MiB F32 W2 read per row --
+  F16 W2 would halve it but changes the drafts). Same prompt: 18.7 t/s overall at pct 50, byte-identical.
+- Also measured: plain (non-DSpark) decode on the 5.7k prompt 10.0 t/s; a short prompt with DSpark 19.5 t/s overall,
+  22.5 steady (no seed for token-major prompts, so the bank fills from empty during the first ~70 cycles).
+- Without the Markov head acceptance drops to 1.66 tokens/cycle (2.16 with): keep it.
+- Left on the table, each a few percent, all needing the byte-identical gate: (1) bf16 rounding folded into the
+  producers (19 dispatches/layer at ~4 us each measured for dependent tiny dispatches); (2) the router's 11 small
+  kernels as one; (3) the hc F16 matvecs (68 outputs, K=7168) dispatch 3 threadgroups with nxpsg=8 -- nxpsg=32 would be
+  ~10x faster but changes the summation order; (4) the 5 attention publish copies per layer merged; (5) a chunked
+  Markov walk that stops at the survival cutoff instead of drafting all 5 rows.
