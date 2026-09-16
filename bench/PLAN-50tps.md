@@ -611,3 +611,16 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   split today's bank-prefill path from the older bank-shrink/no-copy state (bench_branch30nb). Until
   the wired growth is found the branch does not pass the speed track; the server at 92GB, -c 294912,
   never showed it (different shape: 16k prefills per frontier under a 262k allocation).
+- bench_branch30nb (same, DS4_METAL_V41_BANK_PREFILL_MAX=0): identical failure at the 65536 frontier, wired
+  5 -> 56 GB inside the first 16k prefill and 72-81 GB by the third frontier. So the growth is the older
+  branch state (no-copy bank / bank-shrink / prefill pins under the layer map), not today's bank-prefill
+  path. First frontiers at 30GB are also no faster than main (prefill 543/445/378 vs 620/442/328;
+  decode 10.1/10.4/10.0 vs 11.8/10.6/9.8): the branch's gains are bank-size dependent (92 GB) and the
+  agent-turn path, which ds4-bench does not exercise.
+- Where to look next (not done): what stays wired across frontiers with the no-copy bank under the map
+  prefill -- candidates: the map's whole-layer wrap buffers (ds4_gpu_wrap_model_range over 3.6 GB per
+  layer: are they freed between layers/frontiers?), the residency set publish after prefill
+  (prefill pins, ds4_gpu_stream_expert_cache_prefill_begin with threshold 0 = always pinned), and the
+  7.12 GiB prefill expert reserve. Reproduce with bench256.sh at BUDGET=30GB CTXMAX=98304 and watch
+  `vm_stat` wired per layer with DS4_METAL_GRAPH_PREFILL_PROFILE=1; the fix is a prerequisite for any
+  upstream PR from this branch beyond the three already open.
