@@ -534,3 +534,10 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   of experts + ~30 GB: a 192 GB machine fits, two 128 GB machines splitting the experts fit.
 - Upstream moved 20 commits (Qwen batched MTP, 400 files); the branch rebased clean onto 8db1d1d and the
   numbers reproduce on the rebased build.
+- Follow-up (commit "a bank prefill sweeps the whole tail at once"): one sweep for the whole tail (<= 8192
+  rows) instead of map-sized sweeps; the second 2048-row sub-chunk then misses 5% instead of 37%. Map vs
+  bank, identical completions: 1080 rows 46.2 -> 17.0 s; 3770 rows 74.5 -> 31.7 s; 5534 rows 79.5 -> 39.9 s
+  (142 t/s). The store-hit tail after a server start (empty bank) still takes the map, correctly.
+- Next on this path: overlap the misses with the matmul (two passes per layer over the address table,
+  resident experts first while the misses install -- the cached mm kernels already skip a zero address),
+  worth ~30% of a turn; after that the turn is the SSD reading the 36% of experts the bank lacks.
