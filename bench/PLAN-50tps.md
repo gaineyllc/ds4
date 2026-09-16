@@ -478,3 +478,15 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   t/s with it on.
 - Server gotcha: prompt + max_tokens + prefill_cap (8192) must fit -c; a 2000-token request at 261307 with
   -c 270336 silently re-synced the session (a full 261k prefill) mid-generation.
+
+## Sep 16 — split-miss dispatch (DS4_METAL_V41_SPLIT_MISS=1), and what the machine's memory really holds
+- Built: prepare leaves the missing experts pending, the gate/up pass runs for the resident ones and is
+  committed, the misses are installed while it runs, a second gate/up pass covers only the pending slots
+  (resident slot ids set to -1), then the one down pass. Exact (4/4 identical), +2% at 16k (10.4/10.0 vs
+  10.2/9.9 t/s): the layer still waits on the miss I/O, and ~0.5 ms of GPU work is all that hides behind it.
+  Opt-in; not the answer.
+- With ds4 idle: all processes' resident sets sum to 14.6 GB (the earlier "~40 GB of other apps" was wrong:
+  that was ds4's own bank plus 16 GB of compressor holding the apps' pages my runs had squeezed out). A booted
+  iOS simulator, Hermes, ChatGPT/Codex, Cursor, VS Code and Chrome are the tenants. With them quit and
+  iogpu.wired_limit_mb raised, the bank should reach ~85-90 GB at 256k (experts total 97 GB): the coldest
+  ~10% absent, which is the regime where a 3-row batch's 14 unique experts are usually all resident.

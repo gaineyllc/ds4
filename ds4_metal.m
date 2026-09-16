@@ -18970,6 +18970,54 @@ static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
     g_stream_expert_cache_layer_count[layer] = 0;
 }
 
+/* Split-miss dispatch (DS4_METAL_V41_SPLIT_MISS=1). A stopping verify layer
+ * pays its misses on the host while the GPU idles: ~0.4 ms of read-ahead per
+ * install plus the views, 1.3-1.5 ms per layer at 16k with a 36 GiB bank.
+ * With this on, prepare_selected_batch leaves the missing experts out (their
+ * table slots stay zero), the gate/up pass is encoded for the resident ones
+ * and committed, the misses are installed while that runs, and a second
+ * gate/up pass over only the missing slots (ids of the resident slots set to
+ * -1, which the kernel skips) is followed by the one down pass over every
+ * slot -- the same per-slot arithmetic as the unsplit path, so the output is
+ * identical. */
+typedef struct {
+    uint32_t u;           /* index in unique_ids */
+    uint32_t expert;
+    uint64_t gate_abs, up_abs, down_abs;
+} ds4_gpu_stream_split_pending;
+static int g_stream_split_defer_installs;
+static ds4_gpu_stream_split_pending g_stream_split_pending[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint32_t g_stream_split_pending_count;
+static int32_t g_stream_split_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 32];
+static uint32_t g_stream_split_n_ids;
+
+/* Install the experts prepare left pending and return their entries. */
+static int ds4_gpu_stream_expert_cache_install_pending_batch(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        ds4_gpu_stream_expert_cache_entry **out, uint32_t *n_out) {
+    *n_out = 0;
+    for (uint32_t i = 0; i < g_stream_split_pending_count; i++) {
+        const ds4_gpu_stream_split_pending *pd = &g_stream_split_pending[i];
+        uint64_t gi = 0, ui = 0, di = 0;
+        id<MTLBuffer> gb = ds4_gpu_wrap_model_exact_range_owned(model_map, model_size, pd->gate_abs, gate_expert_bytes, &gi);
+        id<MTLBuffer> ub = ds4_gpu_wrap_model_exact_range_owned(model_map, model_size, pd->up_abs, gate_expert_bytes, &ui);
+        id<MTLBuffer> db = ds4_gpu_wrap_model_exact_range_owned(model_map, model_size, pd->down_abs, down_expert_bytes, &di);
+        if (!gb || !ub || !db) return 0;
+        ds4_gpu_stream_expert_readahead_range(pd->gate_abs, gate_expert_bytes);
+        ds4_gpu_stream_expert_readahead_range(pd->up_abs, gate_expert_bytes);
+        ds4_gpu_stream_expert_readahead_range(pd->down_abs, down_expert_bytes);
+        ds4_gpu_stream_expert_cache_entry *e =
+            ds4_gpu_stream_expert_cache_install_loaded(model_map, model_size, layer, pd->expert,
+                                                       pd->gate_abs, pd->up_abs, pd->down_abs,
+                                                       gate_expert_bytes, down_expert_bytes,
+                                                       gb, ub, db, (NSUInteger)gi, (NSUInteger)ui, (NSUInteger)di);
+        if (!e) return 0;
+        out[(*n_out)++] = e;
+    }
+    return 1;
+}
+
 static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const void    *model_map,
         uint64_t       model_size,
@@ -19032,6 +19080,13 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                  ids,
                                  n_ids * sizeof(ids[0]));
     const double t_read = profile ? ds4_gpu_now_ms() : 0.0;
+    g_stream_split_pending_count = 0;
+    g_stream_split_n_ids = 0;
+    if (ok && g_stream_split_defer_installs && n_ids <= sizeof(g_stream_split_ids) / sizeof(g_stream_split_ids[0])) {
+        memcpy(g_stream_split_ids, ids, (size_t)n_ids * sizeof(ids[0]));
+        g_stream_split_n_ids = (uint32_t)n_ids;
+    }
+    bool deferred_u[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
     double prof_wrap_ms = 0.0, prof_ra_ms = 0.0, prof_install_ms = 0.0;
 
     bool seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
@@ -19178,6 +19233,18 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             /* With the no-copy cache the expert is already in the model's own
              * pages: wrap them instead of allocating a slot and reading into
              * it, which would hand pread a read-only destination. */
+            if (ds4_gpu_stream_expert_nocopy_enabled() && g_stream_split_defer_installs &&
+                g_stream_split_n_ids != 0 &&
+                g_stream_split_pending_count < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+                ds4_gpu_stream_split_pending *pd = &g_stream_split_pending[g_stream_split_pending_count++];
+                pd->u = u;
+                pd->expert = expert;
+                pd->gate_abs = unique_gate_offsets[u];
+                pd->up_abs = unique_up_offsets[u];
+                pd->down_abs = unique_down_offsets[u];
+                deferred_u[u] = true;
+                continue;
+            }
             if (ds4_gpu_stream_expert_nocopy_enabled()) {
                 uint64_t gi = 0, ui = 0, di = 0;
                 const double tw0 = profile ? ds4_gpu_now_ms() : 0.0;
@@ -19368,6 +19435,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         for (uint32_t u = 0; u < unique_count; u++) {
             ds4_gpu_stream_expert_cache_entry *entry = unique_entries[u];
             const uint32_t expert = (uint32_t)unique_ids[u];
+            if (deferred_u[u]) continue;
             if (!entry) {
                 const uint64_t gate_rel = unique_gate_offsets[u] - gate_offset;
                 const uint64_t down_rel = unique_down_offsets[u] - down_offset;
@@ -19455,7 +19523,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     }
     free(ids);
 
-    if (!ok || (*n_resources == 0 && view_served == 0)) {
+    if (!ok || (*n_resources == 0 && view_served == 0 && g_stream_split_pending_count == 0)) {
         ds4_gpu_stream_expert_cache_clear_layer(layer);
         return 0;
     }
@@ -19466,7 +19534,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         ds4_gpu_stream_expert_cache_clear_layer(layer);
         return 0;
     }
-    *unique_out = *n_resources + view_served;
+    *unique_out = *n_resources + view_served + g_stream_split_pending_count;
     if (view_served != 0 &&
         ds4_gpu_stream_expert_timing_summary_enabled()) {
         fprintf(stderr,
@@ -46439,6 +46507,12 @@ int ds4_gpu_routed_moe_batch_tensor(
             }
             g_stream_prefill_batch_selected_addr_building++;
             g_batch_prof_t[1] = ds4_gpu_now_ms();
+            {
+                static int split_env = -1;
+                if (split_env < 0) split_env = getenv("DS4_METAL_V41_SPLIT_MISS") != NULL;
+                g_stream_split_defer_installs = split_env && use_iq2_batch_selected_addr &&
+                    ds4_gpu_stream_expert_nocopy_enabled() && had_batch;
+            }
             if (!ds4_gpu_stream_expert_cache_prepare_selected_batch(
                         model_map,
                         model_size,
@@ -46465,6 +46539,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                 return 0;
             }
             g_stream_prefill_batch_selected_addr_building--;
+            g_stream_split_defer_installs = 0;
             g_batch_prof_t[2] = ds4_gpu_now_ms();
             if (stream_unique == 0) {
                 ds4_gpu_stream_expert_cache_clear_layer(layer_index);
@@ -46730,6 +46805,52 @@ int ds4_gpu_routed_moe_batch_tensor(
                     false,
                     stream_overflow_gate,
                     stream_overflow_up);
+            /* Split-miss: the pass above skipped the experts prepare left
+             * pending (their slots are zero). Commit it so the GPU runs while
+             * the host installs them, then run the same pass over only the
+             * pending slots; the down pass below then sees every slot. */
+            if (ok && g_stream_split_pending_count != 0 && g_stream_split_n_ids != 0) {
+                const double ts0 = ds4_gpu_now_ms();
+                if (!ds4_gpu_flush_commands()) return 0;
+                cb = g_batch_cb;
+                ds4_gpu_stream_expert_cache_entry *pending_entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+                uint32_t n_pending = 0;
+                if (!ds4_gpu_stream_expert_cache_install_pending_batch(
+                        model_map, model_size, layer_index, gate_expert_bytes, down_expert_bytes,
+                        pending_entries, &n_pending)) {
+                    fprintf(stderr, "ds4: Metal split-miss install failed at layer %u\n", layer_index);
+                    return 0;
+                }
+                const double ts1 = ds4_gpu_now_ms();
+                /* ids with every resident slot masked out. */
+                id<MTLBuffer> pass2_ids = ds4_gpu_new_transient_buffer(
+                        (NSUInteger)g_stream_split_n_ids * sizeof(int32_t), "split_miss_ids");
+                if (!pass2_ids) return 0;
+                {
+                    int32_t *dst = (int32_t *)[pass2_ids contents];
+                    for (uint32_t i = 0; i < g_stream_split_n_ids; i++) {
+                        const int32_t id = g_stream_split_ids[i];
+                        int pend = 0;
+                        for (uint32_t k = 0; k < g_stream_split_pending_count; k++)
+                            if ((int32_t)g_stream_split_pending[k].expert == id) { pend = 1; break; }
+                        dst[i] = pend ? id : -1;
+                    }
+                }
+                ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
+                        cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline, &gate_args, &act_args,
+                        pending_entries, n_pending, stream_gate_addr_buf, stream_up_addr_buf,
+                        xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
+                        upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
+                        pass2_ids, 0, weightsbuf, ds4_gpu_tensor_offset(weights),
+                        gate_smem, 2, false, stream_overflow_gate, stream_overflow_up);
+                /* The down pass names every entry of the layer. */
+                for (uint32_t i = 0; i < n_pending && stream_resource_count < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; i++)
+                    stream_resources[stream_resource_count++] = pending_entries[i];
+                g_stream_split_pending_count = 0;
+                if (getenv("DS4_METAL_STREAMING_BATCH_PROFILE"))
+                    fprintf(stderr, "ds4: split-miss layer=%u pending=%u install=%.3f ms encode2=%.3f ms\n",
+                            layer_index, n_pending, ts1 - ts0, ds4_gpu_now_ms() - ts1);
+            }
             /* Diagnostic: DS4_METAL_PAIR_TWICE=1 encodes the gate/up pair
              * dispatch a second time (same inputs and outputs) so a timeline
              * shows the cost of the same experts when they were just read. */
