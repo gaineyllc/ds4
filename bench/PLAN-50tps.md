@@ -425,3 +425,22 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
    cache_f16) and q for the batch's tokens in threadgroup memory.
 5. The host side (~65 ms/cycle at 869k): mostly the read-ahead of real misses (bank at 50% of the experts)
    plus ~30 ms of encoding; (3) halves the encoding; the misses only shrink with RAM.
+
+## Sep 15 night — the expert kernel is 3-4x slower in the engine than standalone
+- ~/ds4-bench/mb/pairbench.m compiles ds4's own metal sources and runs kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32
+  on synthetic experts (2048 rows x 4096, iq2_xxs, 12 distinct experts per layer, 10 layers' worth so nothing is
+  cache-resident): 0.131 ms per layer for 2 tokens = 396 GB/s -- at the bandwidth floor. The same with no-copy
+  views over the real model file wired by a residency set: 0.131 ms. In the engine the same kernel, same shape
+  (2-4 tokens x 6), takes 0.41-0.55 ms; DS4_METAL_PAIR_TWICE=1 dispatches it twice on the same experts and the
+  second is as slow as the first (550/563 us), so it is not the memory source or page residency.
+- Idle gaps: with usleep between single-layer command buffers the harness's best time goes 0.19 (no gap) ->
+  0.24 (1.5 ms) -> 0.44 ms (3 ms) for 3 tokens: the governor drops the clock in the host's per-layer gap. A
+  spinning keep-alive thread (DS4_METAL_DECODE_KEEPALIVE=1, the TP one) makes decode worse (8.3 vs 10.2 t/s:
+  it competes). A short spin submitted only at each drain (DS4_METAL_DECODE_KEEPALIVE=2, 150k iters ~1 ms) is
+  +3-5% at 16k over 3 pairs of runs (10.7-11.0 vs 10.3-10.6 t/s, sweep 177-182 vs 184-195 ms), byte-identical.
+  Left opt-in. So clocks are part of it but not the 3-4x.
+- Still unexplained: the rest of the gap. Candidates: the read-ahead's SSD DMA into the page cache during the
+  sweep (1.3 GB per sweep at 16k with a 36 GiB bank, 2.8 installs/layer even at 51 GiB in a fresh process),
+  and the 7000-allocation residency set. The separating test is a long warm session (0 installs/layer) with
+  the timeline gate: if the pair kernel is then ~0.15 ms, the miss I/O is what slows every kernel, and the
+  1M budget math changes (expert reads at the floor would take 9 ms per cycle, not 33).

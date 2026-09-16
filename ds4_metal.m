@@ -1662,6 +1662,9 @@ static int ds4_gpu_wait_pending_command_buffers(const char *label) {
 static double g_batch_cb_created_ms;
 static double ds4_gpu_now_ms(void);
 static void ds4_gpu_queue_keepalive_start(void);
+static void ds4_gpu_decode_keepalive_start_if_env(void);
+static void ds4_gpu_decode_keepalive_gap(void);
+static id<MTLComputePipelineState> g_decode_keepalive_pipeline;
 static void ds4_gpu_queue_keepalive_stop_thread(void);
 static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) {
     if (!owned) return 1;
@@ -2477,6 +2480,7 @@ static int ds4_gpu_finish_model_views(
         }
     }
     ds4_gpu_queue_keepalive_start();
+    ds4_gpu_decode_keepalive_start_if_env();
     const double t_warm = ds4_gpu_now_ms();
     if (ds4_gpu_model_map_log_enabled()) {
         fprintf(stderr,
@@ -11593,6 +11597,55 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
  * mapped model views) are paid at load time rather than inside the first
  * prefill.  TP sharding skips the load-time model-view warm, which used to
  * leave a 600-800 ms stall at the head of the first prompt on each rank. */
+/* Experiment: DS4_METAL_DECODE_KEEPALIVE=1 runs the TP clock keep-alive
+ * (a one-threadgroup ALU spin on its own queue) in single-machine mode.
+ * A stopping verify sweep leaves the GPU idle 1-3 ms per layer while the
+ * host prepares the next one, and the governor lets the clock sag: the
+ * same expert kernel measured 0.13 ms back to back and 0.44 ms with 3 ms
+ * gaps in a standalone harness, 0.41-0.55 ms in the sweep. */
+/* Mode 2 (DS4_METAL_DECODE_KEEPALIVE=2): no thread; instead one short ALU
+ * spin (DS4_METAL_DECODE_KEEPALIVE_ITERS, default 150000 ~ 1 ms) is
+ * submitted on the keep-alive queue each time the engine drains its batch,
+ * i.e. exactly when the GPU would otherwise idle while the host prepares. */
+static uint32_t g_decode_keepalive_iters;
+static void ds4_gpu_decode_keepalive_gap(void) {
+    if (!g_decode_keepalive_pipeline || !g_tp_keepalive_queue || !g_tp_keepalive_buffer) return;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g_tp_keepalive_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_decode_keepalive_pipeline];
+        [enc setBuffer:g_tp_keepalive_buffer offset:0 atIndex:0];
+        [enc setBytes:&g_decode_keepalive_iters length:sizeof(g_decode_keepalive_iters) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+    }
+}
+
+static void ds4_gpu_decode_keepalive_start_if_env(void) {
+    const char *mode = getenv("DS4_METAL_DECODE_KEEPALIVE");
+    if (!mode || g_tp_keepalive_running || g_decode_keepalive_pipeline) return;
+    if (atoi(mode) == 2) {
+        g_decode_keepalive_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+        g_decode_keepalive_iters = (uint32_t)ds4_gpu_env_u64("DS4_METAL_DECODE_KEEPALIVE_ITERS", 150000u, 1000u, 10000000u);
+        g_tp_keepalive_queue = [g_device newCommandQueue];
+        g_tp_keepalive_buffer = [g_device newBufferWithLength:256u * sizeof(float) options:MTLResourceStorageModeShared];
+        if (g_decode_keepalive_pipeline && g_tp_keepalive_queue && g_tp_keepalive_buffer)
+            fprintf(stderr, "ds4: decode clock keep-alive (gap mode, %u iters) armed\n", g_decode_keepalive_iters);
+        return;
+    }
+    uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
+    g_tp_keepalive_queue = [g_device newCommandQueue];
+    g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+    if (g_tp_keepalive_queue && g_tp_keepalive_buffer &&
+        pthread_create(&g_tp_keepalive_thread, NULL,
+                       ds4_gpu_tp_keepalive_thread, NULL) == 0) {
+        g_tp_keepalive_running = 1;
+        fprintf(stderr, "ds4: decode clock keep-alive started (tgs=%u)\n", ka_tgs);
+    }
+}
+
 int ds4_gpu_warm_command_queue(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return 1;
@@ -11620,6 +11673,7 @@ int ds4_gpu_warm_command_queue(void) {
     if (getenv("DS4_METAL_CB_TIMES"))
         fprintf(stderr, "ds4: command queue warm in %.1f ms\n", ds4_gpu_now_ms() - t0);
     ds4_gpu_queue_keepalive_start();
+    ds4_gpu_decode_keepalive_start_if_env();
     return 1;
 }
 
@@ -11775,7 +11829,9 @@ int ds4_gpu_end_commands(void) {
     g_batch_has_work = NO;
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
-    return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    const int rc = ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    if (g_decode_keepalive_pipeline) ds4_gpu_decode_keepalive_gap();
+    return rc;
 }
 
 static int ds4_gpu_flash_attn_stage_profile_boundary(
@@ -46674,6 +46730,18 @@ int ds4_gpu_routed_moe_batch_tensor(
                     false,
                     stream_overflow_gate,
                     stream_overflow_up);
+            /* Diagnostic: DS4_METAL_PAIR_TWICE=1 encodes the gate/up pair
+             * dispatch a second time (same inputs and outputs) so a timeline
+             * shows the cost of the same experts when they were just read. */
+            if (ok && getenv("DS4_METAL_PAIR_TWICE")) {
+                ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
+                    cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline, &gate_args, &act_args,
+                    stream_resources, stream_resource_count, stream_gate_addr_buf, stream_up_addr_buf,
+                    xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
+                    upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
+                    selectedbuf, ds4_gpu_tensor_offset(selected), weightsbuf, ds4_gpu_tensor_offset(weights),
+                    gate_smem, 2, false, stream_overflow_gate, stream_overflow_up);
+            }
             if (!ok) {
                 fprintf(stderr,
                         "ds4: Metal streaming prefill batch selected addr layer=%u "
