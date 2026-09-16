@@ -420,6 +420,11 @@ void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes);
 void ds4_gpu_stream_expert_cache_cap_before_prefill(uint64_t context_bytes);
 /* Called with the number of new tokens a prefill is about to sweep. */
 void ds4_gpu_stream_expert_cache_prefill_begin(uint32_t new_tokens);
+/* A short prefill of up to `rows` rows per chunk takes its experts from the
+ * no-copy bank instead of mapping every layer (Metal SSD streaming with the
+ * bank up). Returns nonzero when the backend can; _end restores decode. */
+int ds4_gpu_stream_expert_bank_prefill_begin(uint32_t rows);
+void ds4_gpu_stream_expert_bank_prefill_end(void);
 void ds4_gpu_stream_note_support_bytes(uint64_t bytes);
 void ds4_gpu_stream_expert_prefetch_layer(uint32_t layer);
 int ds4_gpu_stream_expert_predicted_begin_load(uint32_t layer);

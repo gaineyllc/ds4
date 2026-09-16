@@ -40432,6 +40432,11 @@ typedef struct {
      * through the decode cache. Mapping whole expert tensors per layer the
      * way a prefill chunk does reads the model end to end for five tokens. */
     bool dspark_verify_batch;
+    /* A short continuation of a live session sweeps against the expert bank
+     * (address tables, misses installed per layer) instead of mapping every
+     * layer's experts: a 1211-token tail at 256k read 97 GB of experts for
+     * 21 s through the layer map. Set by the session sync per chunk. */
+    bool bank_prefill;
     /* More prompt follows this sweep: its keep-list seed would only be
      * evicted by the next sweep's, so the bank is seeded once, at the end. */
     bool prefill_more_pending;
@@ -43585,7 +43590,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         if (il == 2u) engram_prefetched = overlap_engram &&
             ds41_engram_prefetch_start(&engram_prefetch, g, 1, total_count);
         const double t0 = profile ? now_sec() : 0;
-        if (g->streaming && !g->dspark_verify_batch) {
+        if (g->streaming && !g->dspark_verify_batch && !g->bank_prefill) {
 #ifdef __APPLE__
             const uint32_t first_count = total_count < encoder_chunk ? total_count : encoder_chunk;
             if (!g->encoder_resident || il >= 20)
@@ -77428,6 +77433,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         ds41_graph_reuse_prefill_rows(g);
         ds41_encoder_acquire(g, &e->model, &e->weights,
             (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
+        const long tail_total = (long)(prompt->len - s->checkpoint.len);
+        const bool warm_tail = s->checkpoint.len > 0;
         for (int i = s->checkpoint.len; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
                 interrupted = true;
@@ -77438,9 +77445,30 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 ds41_encoder_release(g, &e->model, &encoder);
             const uint32_t short_count = decoder_pending ? 0u :
                 ds41_short_prefill_count(g, &e->weights, remaining);
-            const uint32_t count = short_count ? short_count : g->encoder_resident ?
+            uint32_t count = short_count ? short_count : g->encoder_resident ?
                 (remaining - 512u < g->prefill_cap ? remaining - 512u : g->prefill_cap) :
                 ds41_prefill_count(g, remaining);
+            /* Short continuations of a warm session sweep against the bank:
+             * a tail of at most DS4_METAL_V41_BANK_PREFILL_TOTAL tokens
+             * (default 4096) in chunks of DS4_METAL_V41_BANK_PREFILL_MAX
+             * (default 2048, the layer map's own chunk, so the rows are cut
+             * where the map would cut them and the result is the same); a
+             * cold or long prefill keeps the sequential layer map. */
+            static long bank_max = -1, bank_total = -1;
+            if (bank_max < 0) {
+                const char *env = getenv("DS4_METAL_V41_BANK_PREFILL_MAX");
+                bank_max = env ? atol(env) : 2048;
+                env = getenv("DS4_METAL_V41_BANK_PREFILL_TOTAL");
+                bank_total = env ? atol(env) : 4096;
+            }
+            /* The bank sweep replaces the warm-append rule in ds41_prefill_count
+             * (token-major below 1024 tokens: 17 t/s against 36-57 t/s). */
+            const bool bank_eligible = e->ssd_streaming && !short_count && remaining > 1u &&
+                !decoder_pending && warm_tail && bank_max > 0 && tail_total <= bank_total &&
+                !g->encoder_resident &&
+                ds4_gpu_stream_expert_bank_prefill_begin(
+                    remaining < (uint32_t)bank_max ? remaining : (uint32_t)bank_max);
+            if (bank_eligible) count = remaining < (uint32_t)bank_max ? remaining : (uint32_t)bank_max;
             const bool defer_decoder = !g->encoder_resident && count >= 16384u &&
                 remaining - count >= 8192u &&
                 !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX") &&
@@ -77449,6 +77477,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * remainder finishes the pending decoder here, then runs normally. */
             const bool layer_major = count > 1u;
             g->prefill_more_pending = remaining > count;
+            g->bank_prefill = bank_eligible && layer_major && !defer_decoder &&
+                count <= (uint32_t)bank_max;
+            if (g->bank_prefill && getenv("DS4_METAL_STREAMING_BATCH_PROFILE"))
+                fprintf(stderr, "ds4: V4.1 bank prefill pos=%d rows=%u tail=%ld\n", i, count, tail_total);
             const bool ok = short_count ?
                 ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
                 layer_major ?
@@ -77459,6 +77491,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                  ds41_graph_prefill(g, &e->model, &e->weights, prompt->v + i, count,
                     s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud)) :
                 ds41_graph_step(g, &e->model, &e->weights, prompt->v[i], NULL);
+            ds4_gpu_stream_expert_bank_prefill_end();
+            g->bank_prefill = false;
             if (!ok) {
                 ds41_encoder_release(g, &e->model, &encoder);
                 s->checkpoint_valid = false;
