@@ -324,14 +324,15 @@ template [[host_name("kernel_argsort_merge_f32_i32_desc_causal_prefix")]] kernel
 // them in log2(blocks) passes: for a 435k-row indexer score row that is a
 // near-complete sort, nine dependent passes, ~1 ms per token per index layer.
 // A selection does not need the order: four 8-bit histogram passes find the
-// k-th largest key exactly (ties by index), one compaction pass gathers the
-// rows above it and the ties, and a final threadgroup sorts the k winners so
-// the output is in descending score order like the sort's.
+// k-th largest key exactly, one pass counts the ties at it per chunk, one
+// compaction pass gathers the rows above it and the first ties by index, and
+// a final threadgroup sorts the k winners so the output is in descending
+// score order like the sort's.
 //
 // Per-token state (uint words): [0] prefix (key bits settled so far, left
 // aligned), [1] above (rows with key > prefix so far), [2] need (rows still
-// to take from the current prefix), [3] sel_count, [4] tie_count, [5] level,
-// [16..272) histogram of the current byte.
+// to take from the current prefix), [3] sel_count, [5] level, [16..272)
+// histogram of the current byte, then the per-chunk tie counts.
 #define DS4_TOPK_STATE_WORDS 272u
 #define DS4_TOPK_HIST_OFF 16u
 
@@ -342,7 +343,6 @@ struct ds4_metal_args_topk_select {
     uint causal_start;  // width per token = min(n, (causal_start + t + 1) / causal_ratio) when causal_ratio != 0
     uint causal_ratio;
     uint chunk;         // rows per threadgroup in the histogram and compaction passes
-    uint tie_cap;       // tie buffer rows per token
     uint level;         // histogram byte: 0 (top) .. 3
     uint64_t row_stride;   // score row stride in bytes
     uint out_stride;       // selected row stride in elements
@@ -447,17 +447,52 @@ kernel void kernel_topk_select_scan(
     st[DS4_TOPK_HIST_OFF + bin] = 0u;
 }
 
-// Rows above the threshold go straight to the output (unordered), ties into
-// the tie buffer, in arrival order.
+// Count the ties at the threshold per chunk, so the compaction can rank
+// them by index across the row without a tie buffer or a cap: the chunk
+// counts go where the (now cleared) histogram lived, one word per chunk.
+kernel void kernel_topk_select_tiecount(
+        constant ds4_metal_args_topk_select &args,
+        device const char *scores,
+        device uint *state,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3 ntg3 [[threads_per_threadgroup]]) {
+    threadgroup atomic_uint count;
+    const uint tid = tpitg.x, ntg = ntg3.x;
+    const uint t = tgpig.y;
+    const uint width = ds4_topk_width(args, t);
+    const uint begin = tgpig.x * args.chunk;
+    if (begin >= width) return;
+    const uint end = min(begin + args.chunk, width);
+    device uint *st = state + t * DS4_TOPK_STATE_WORDS;
+    if (tid == 0) atomic_store_explicit(&count, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint thr = st[0];
+    device const float *row = (device const float *)(scores + (uint64_t)t * args.row_stride);
+    uint mine = 0u;
+    for (uint i = begin + tid; i < end; i += ntg) mine += ds4_topk_key(row[i]) == thr ? 1u : 0u;
+    mine = simd_sum(mine);
+    if ((tid & 31u) == 0u && mine) atomic_fetch_add_explicit(&count, mine, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) st[DS4_TOPK_HIST_OFF + tgpig.x] = atomic_load_explicit(&count, memory_order_relaxed);
+}
+
+// Rows above the threshold go to the output's first `above` slots (any
+// order: the finish sorts), and the ties take the slots after them in index
+// order -- the first `need` ties of the row, exactly the ones an index-
+// stable sort would keep. A chunk ranks its ties with a running prefix over
+// strips of ntg rows, on top of the preceding chunks' counts.
 kernel void kernel_topk_select_compact(
         constant ds4_metal_args_topk_select &args,
         device const char *scores,
         device uint *state,
-        device uint *ties,
         device int *selected,
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort3 tpitg [[thread_position_in_threadgroup]],
-        ushort3 ntg3 [[threads_per_threadgroup]]) {
+        ushort3 ntg3 [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint sums[32];
     const uint tid = tpitg.x, ntg = ntg3.x;
     const uint t = tgpig.y;
     const uint width = ds4_topk_width(args, t);
@@ -466,29 +501,45 @@ kernel void kernel_topk_select_compact(
     const uint end = min(begin + args.chunk, width);
     device uint *st = state + t * DS4_TOPK_STATE_WORDS;
     const uint thr = st[0];
+    const uint above = st[1];
+    const uint need = st[2];
+    uint base = 0u;
+    for (uint c = 0; c < tgpig.x; c++) base += st[DS4_TOPK_HIST_OFF + c];
     device const float *row = (device const float *)(scores + (uint64_t)t * args.row_stride);
     device int *out = selected + t * args.out_stride;
-    device uint *tie = ties + t * args.tie_cap;
-    for (uint i = begin + tid; i < end; i += ntg) {
-        const uint key = ds4_topk_key(row[i]);
-        if (key > thr) {
+    const uint nsg = (ntg + 31u) / 32u;
+    uint running = base;
+    for (uint s = begin; s < end; s += ntg) {
+        const uint i = s + tid;
+        const bool in_row = i < end;
+        const uint key = in_row ? ds4_topk_key(row[i]) : 0u;
+        const uint tie = (in_row && key == thr) ? 1u : 0u;
+        if (in_row && key > thr) {
             const uint slot = atomic_fetch_add_explicit((device atomic_uint *)(st + 3), 1u, memory_order_relaxed);
-            if (slot < args.top_k) out[slot] = (int)i;
-        } else if (key == thr) {
-            const uint slot = atomic_fetch_add_explicit((device atomic_uint *)(st + 4), 1u, memory_order_relaxed);
-            if (slot < args.tie_cap) tie[slot] = i;
+            if (slot < above) out[slot] = (int)i;
         }
+        const uint excl = simd_prefix_exclusive_sum(tie);
+        const uint sg_total = simd_sum(tie);
+        if (lane == 0) sums[sg] = sg_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint before = 0u, total = 0u;
+        for (uint g = 0; g < nsg; g++) { if (g < sg) before += sums[g]; total += sums[g]; }
+        if (tie) {
+            const uint rank = running + before + excl;
+            if (rank < need) out[above + rank] = (int)i;
+        }
+        running += total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
-// One threadgroup per token: take the `need` lowest-index ties, then sort the
-// k winners by score descending (index ascending among equals) so the row
-// reads like the merge sort's output. top_k <= 2 * threads.
+// One threadgroup per token: sort the k winners by score descending (index
+// ascending among equals) so the row reads like the merge sort's output.
+// top_k <= 2 * threads.
 kernel void kernel_topk_select_finish(
         constant ds4_metal_args_topk_select &args,
         device const char *scores,
         device uint *state,
-        device uint *ties,
         device int *selected,
         threadgroup int *sh_idx [[threadgroup(0)]],
         uint tgpig [[threadgroup_position_in_grid]],
@@ -496,38 +547,12 @@ kernel void kernel_topk_select_finish(
         ushort ntg [[threads_per_threadgroup]]) {
     const uint t = tgpig;
     if (t >= args.n_tokens) return;
-    device uint *st = state + t * DS4_TOPK_STATE_WORDS;
     device const float *row = (device const float *)(scores + (uint64_t)t * args.row_stride);
     device int *out = selected + t * args.out_stride;
-    device uint *tie = ties + t * args.tie_cap;
     const uint width = ds4_topk_width(args, t);
     const uint k = min(args.top_k, width);
-    const uint above = min(st[3], k);
-    const uint need = k - above;
-    const uint n_tie = min(st[4], args.tie_cap);
-    // Ties: sort the buffer by index (bitonic, padded with UINT_MAX) and
-    // append the first `need`. n_tie <= tie_cap <= 2 * threads.
     threadgroup float *sh_val = (threadgroup float *)(sh_idx + 2u * ntg);
-    threadgroup uint *sh_tie = (threadgroup uint *)sh_idx;
-    uint cap = 1u;
-    while (cap < n_tie) cap <<= 1u;
-    for (uint i = tid; i < cap; i += ntg) sh_tie[i] = i < n_tie ? tie[i] : 0xFFFFFFFFu;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint size = 2u; size <= cap; size <<= 1u) {
-        for (uint stride = size >> 1u; stride > 0u; stride >>= 1u) {
-            for (uint i = tid; i < cap; i += ntg) {
-                const uint j = i ^ stride;
-                if (j > i) {
-                    const bool up = (i & size) == 0u;
-                    const uint a = sh_tie[i], b = sh_tie[j];
-                    if ((a > b) == up) { sh_tie[i] = b; sh_tie[j] = a; }
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-    for (uint i = tid; i < need; i += ntg) out[above + i] = (int)sh_tie[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint cap;
     // Order the winners: score descending, index ascending among equals.
     cap = 1u;
     while (cap < k) cap <<= 1u;
