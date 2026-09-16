@@ -458,3 +458,23 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   whoever issues it; only a bank with fewer misses removes it.
 - Warm 16k DSpark with a 47 GiB bank over 800-2500 tokens: 13.9-16.1 t/s (the 40-token runs' 10.5 is warm-up);
   installs never reach 0 at this bank size with 3-4-row batches (1.2-2.2 per layer).
+
+## Sep 16 — 256k baseline and what 50 t/s there requires
+- Server, 261307-token prompt (first 822k chars of p1m.txt), `-c 294912`, bank capped at 48 GiB (58 GiB got the
+  process killed at 3.4 GB of swap with the other apps resident), DSpark: first 500 tokens 14.7 t/s, clean
+  repeats 12.1 / 14.6, a 2000-token run 15.3 t/s steady (819 cycles, 2.44 tokens per cycle, verify 161 ms per
+  cycle). Deferred batches: 8 attempted over ~2600, all 8 missed. Misses are uniform across layers (1.1-2.0
+  installs per layer per batch even after 2500 warm tokens at 16k with 47 GiB), because a 3-row batch routes to
+  ~14 unique experts per layer and the bank holds ~130 of 256: P(no miss) ~ 0.9^14 = 23%, and a miss costs a
+  full rerun. Partial rerun from the missed layer would not help (the first miss is at layer 0-1).
+- The floor at 256k with no stops: dense ~19 ms + experts ~8 + indexer ~4 + attention ~5 + tiny ~5 = ~45 ms per
+  cycle for 2.44 tokens = ~53 t/s. The stops (host prepare 1.3 ms + GPU pipeline/clock warm-up after each of
+  40 gaps, kernels at half speed) are the entire distance from 15 to 50. They are forced by misses, and the
+  misses by memory: all 10240 Q2 experts are 97 GB. On this 128 GB machine with ~40 GB of other work resident
+  the bank tops out near 48-58 GiB. A dedicated 128 GB box gets ~90 GB (still short); 192 GB, or two machines
+  (ds4's TP/pipeline path, each holding half the experts), gets every expert resident, and then the deferred
+  batches -- already exact -- take the stops out.
+- Instrumentation cost: the encoder timeline itself slows decode ~30% (8.4-9.7 vs 12-15 t/s); never measure
+  t/s with it on.
+- Server gotcha: prompt + max_tokens + prefill_cap (8192) must fit -c; a 2000-token request at 261307 with
+  -c 270336 silently re-synced the session (a full 261k prefill) mid-generation.
