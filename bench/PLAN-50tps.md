@@ -638,3 +638,20 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   against no-copy's 9.8-11.2, wired 45-48 GB. No-copy earns its keep only when the bank is large enough
   that a copied bank would not fit (the 79-86 GiB regime); consider making that the default rule.
 - Full 256k sweeps on the fixed branch (30 GB then 92 GB) running: bench_branch30fix.csv, bench_branch92.csv.
+- Fixed branch, full 256k sweep at 30 GB (bench_branch30fix.csv), main30 alongside, prefill t/s / decode t/s
+  (ds4-bench: greedy, no DSpark, 128 tokens per frontier):
+    ctx      main        branch(no-copy)
+    16k    620 / 11.8    498 / 10.1
+    32k    465 / 11.5    485 / 10.8
+    64k    430 / 11.6    466 / 10.8
+    98k    440 / 11.1    446 / 10.8
+    131k   435 / 11.0    432 / 10.4
+    196k   430 / 10.6    405 / 10.5
+    262k   416 / 10.1    411 / 10.5
+  Prefill equal within noise from 32k on (branch ahead 32k-100k), 16k first frontier 20% slower on the
+  branch; decode 5-10% lower than main below 131k in no-copy mode. The 2-frontier copy-mode run
+  (NOCOPY unset) gave 13.5-14.2 t/s decode at 16k/32k against main's 11.8 -- a full copy-mode sweep is
+  queued (bench_branch30copy) to settle which mode the branch should default to at small budgets.
+  branch92 (no-copy, 92 GB): prefill 360-384 (a wired 79 GiB bank leaves the map sweep less file cache),
+  decode 10.2-11.9 without DSpark; the branch's 17-19 t/s at 256k needs --dspark, which ds4-bench has no
+  option for -- the decode gain is reported from the server runs above, not from this sweep.
