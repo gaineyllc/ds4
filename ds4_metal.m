@@ -16120,6 +16120,13 @@ static void ds4_gpu_stream_expert_defer_note_outcome(int missed) {
                 : (g_stream_expert_defer_backoff > DS4_METAL_DEFER_BACKOFF_MAX / 2u
                        ? DS4_METAL_DEFER_BACKOFF_MAX
                        : g_stream_expert_defer_backoff * 2u);
+        {
+            /* DS4_METAL_V41_DEFER_BACKOFF_MAX caps the backoff (experiment:
+             * misses in a cold bank otherwise park deferral for 256 tokens). */
+            static long cap = -1;
+            if (cap < 0) { const char *e = getenv("DS4_METAL_V41_DEFER_BACKOFF_MAX"); cap = e ? atol(e) : 0; }
+            if (cap > 0 && g_stream_expert_defer_backoff > (uint32_t)cap) g_stream_expert_defer_backoff = (uint32_t)cap;
+        }
         g_stream_expert_defer_cooldown = g_stream_expert_defer_backoff;
         return;
     }
