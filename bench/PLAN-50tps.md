@@ -624,3 +624,17 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   7.12 GiB prefill expert reserve. Reproduce with bench256.sh at BUDGET=30GB CTXMAX=98304 and watch
   `vm_stat` wired per layer with DS4_METAL_GRAPH_PREFILL_PROFILE=1; the fix is a prerequisite for any
   upstream PR from this branch beyond the three already open.
+- FOUND AND FIXED (commit "an evicted no-copy view leaves the residency set instead of being handed on
+  for reuse"): clear_entry_internal handed every eviction victim's buffers to the caller as reusable slab
+  slots; under no-copy the caller wraps a fresh view for the new expert and releases the old one while
+  the residency set still holds it (the set retains members) -- every evicted view stayed alive and
+  wired. Measured with the new report (DS4_METAL_STREAMING_BATCH_PROFILE=1 prints "bank at prefill"):
+  2468 entries but 15315 live views (47.5 GiB) after one 32k prefill, 22110 (68.6 GiB) a frontier later.
+  After the fix: 7488 views (23.2 GiB) = 3 per entry, wired 47-49 GB flat, the 32k..81k sweep passes the
+  65k frontier (prefill 607/461/455/468 t/s, decode 9.8/11.2/10.9/10.5). The bug dates from the no-copy
+  bank's introduction; it needs many evictions per prefill to show (ds4-bench's 16k-per-frontier
+  shape), which the 92 GB server runs did not produce.
+- Also measured on the way: at the 30 GB budget slab copies (NOCOPY unset) decode at 13.5-14.2 t/s
+  against no-copy's 9.8-11.2, wired 45-48 GB. No-copy earns its keep only when the bank is large enough
+  that a copied bank would not fit (the 79-86 GiB regime); consider making that the default rule.
+- Full 256k sweeps on the fixed branch (30 GB then 92 GB) running: bench_branch30fix.csv, bench_branch92.csv.
