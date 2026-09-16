@@ -592,3 +592,22 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   stays as a diagnostic (ds41_probe_* in ds4.c). Decision: a trained head is a separate project
   (port scripts/ from Edge0 to V4.1 Flash, 384 experts, sigmoid/group router; a data pass through
   the model on this machine); the cheap win to keep is pin_bonus once any predictor exists.
+
+## Sep 16 — antirez's tracks at 256k (bench256.sh: ds4-bench --ctx-start 16384 --ctx-max 262144 --step-incr 16384
+## --gen-tokens 128 --ssd-streaming, promessi_sposi.txt, NOCOPY=1 HEADROOM=2 PCT=100)
+- Correctness track on the branch (streaming build, DS4_TEST_SSD_STREAMING=1, 60 GB bank): --server OK,
+  --metal-kernels OK, --long-context OK (30474-token recall), --logprob-vectors ERR on one vector
+  (short_code_completion step 0 selected token) -- identical failure on upstream main 8db1d1d with the
+  same Q2 file, so it is the quant vs the official API vector, not the branch. make test-deepseek41-metal
+  PASS, make test-metal-ssd-experts PASS, make test-metal-moe-prefill PASS.
+- Speed track, upstream main 8db1d1d at --ssd-streaming-cache-experts 30GB (92GB does not fit main: it
+  copies experts into the bank; 0.58 t/s decode at 16k with 6 GB swap): prefill 620 t/s at 16k falling
+  to 393-416 at 229-262k; decode 11.8 at 16k, 10.1-10.6 from 98k on; wired flat at 49 GB.
+  (bench_main30.csv). Past 229k ds4-bench replays the whole prefix per frontier (snapshot > 1 GiB).
+- Speed track, branch at 30GB: FAILED at the 65536 frontier -- "Metal command batch failed: Insufficient
+  Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory)" in decode right after the prefill, wired
+  63 -> 80 GB over the first frontiers where main stays at 49. First three frontiers: prefill 528/442/328
+  t/s, decode 10.1/10.6/9.8 (bench_branch30.csv). Re-running with DS4_METAL_V41_BANK_PREFILL_MAX=0 to
+  split today's bank-prefill path from the older bank-shrink/no-copy state (bench_branch30nb). Until
+  the wired growth is found the branch does not pass the speed track; the server at 92GB, -c 294912,
+  never showed it (different shape: 16k prefills per frontier under a 262k allocation).
