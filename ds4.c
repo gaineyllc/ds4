@@ -77450,16 +77450,22 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 ds41_prefill_count(g, remaining);
             /* Short continuations of a warm session sweep against the bank:
              * a tail of at most DS4_METAL_V41_BANK_PREFILL_TOTAL tokens
-             * (default 4096) in chunks of DS4_METAL_V41_BANK_PREFILL_MAX
-             * (default 2048, the layer map's own chunk, so the rows are cut
-             * where the map would cut them and the result is the same); a
-             * cold or long prefill keeps the sequential layer map. */
+             * (default 8192) in one sweep of up to DS4_METAL_V41_BANK_PREFILL_MAX
+             * rows (default 8192, held to the prefill cap and the carry
+             * rows). One sweep pays each layer's misses once for the whole
+             * tail: the sweep's 2048-row sub-chunks find the first one's
+             * experts still in the bank (3770 rows: 31 s in one sweep, 46 s
+             * as two, the same bits either way since the sub-chunks cut
+             * where the map cuts). A cold or long prefill keeps the map. */
             static long bank_max = -1, bank_total = -1;
             if (bank_max < 0) {
                 const char *env = getenv("DS4_METAL_V41_BANK_PREFILL_MAX");
-                bank_max = env ? atol(env) : 2048;
+                bank_max = env ? atol(env) : 8192;
                 env = getenv("DS4_METAL_V41_BANK_PREFILL_TOTAL");
-                bank_total = env ? atol(env) : 4096;
+                bank_total = env ? atol(env) : 8192;
+                if (bank_max > (long)g->prefill_cap) bank_max = (long)g->prefill_cap;
+                if (bank_max > 2048 && bank_max > (long)(g->carry_cap ? g->carry_cap : 2048u))
+                    bank_max = (long)(g->carry_cap ? g->carry_cap : 2048u);
             }
             /* The bank sweep replaces the warm-append rule in ds41_prefill_count
              * (token-major below 1024 tokens: 17 t/s against 36-57 t/s). */
