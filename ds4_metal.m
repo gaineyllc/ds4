@@ -46733,7 +46733,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             /* Diagnostic: DS4_METAL_PAIR_TWICE=1 encodes the gate/up pair
              * dispatch a second time (same inputs and outputs) so a timeline
              * shows the cost of the same experts when they were just read. */
-            if (ok && getenv("DS4_METAL_PAIR_TWICE")) {
+            for (int rep = 1; ok && getenv("DS4_METAL_PAIR_TWICE") && rep < atoi(getenv("DS4_METAL_PAIR_TWICE")); rep++) {
                 ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
                     cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline, &gate_args, &act_args,
                     stream_resources, stream_resource_count, stream_gate_addr_buf, stream_up_addr_buf,

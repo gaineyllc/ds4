@@ -444,3 +444,17 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   and the 7000-allocation residency set. The separating test is a long warm session (0 installs/layer) with
   the timeline gate: if the pair kernel is then ~0.15 ms, the miss I/O is what slows every kernel, and the
   1M budget math changes (expert reads at the floor would take 9 ms per cycle, not 33).
+
+## Sep 16 early — what the in-engine slowdown is and is not
+- Ten back-to-back dispatches of the pair kernel on the same experts inside the sweep (DS4_METAL_PAIR_TWICE=10):
+  all ten equal, 315-390 us for ~19 (row, expert) pairs = 16-20 us per pair, against 11-12 us in the harness
+  (ne01 2304 corrected). So the steady in-engine cost is ~1.5x the harness, not 3.5x; the rest of the 510-550 us
+  a normal sweep pays is the first dispatch after the host gap (the second half of a warm run is 315 us). Clock
+  and pipeline warm-up per layer, i.e. the per-layer stop, is the main multiplier on the expert kernel time.
+- MAP_SHARED vs MAP_PRIVATE for the model file: no difference in the harness (0.131 ms either way). 8k extra
+  resident views: no difference.
+- Async read-ahead on a helper thread: prepare 1.3 -> 0.3 ms per layer but the drain grows 2.2 -> 3.2 ms; the
+  GPU waits for the same pages. Net zero (10.0/9.4 vs 10.2/10.0 t/s). Removed. Miss I/O is on the critical path
+  whoever issues it; only a bank with fewer misses removes it.
+- Warm 16k DSpark with a 47 GiB bank over 800-2500 tokens: 13.9-16.1 t/s (the 40-token runs' 10.5 is warm-up);
+  installs never reach 0 at this bank size with 3-4-row batches (1.2-2.2 per layer).
