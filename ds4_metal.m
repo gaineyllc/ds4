@@ -13656,6 +13656,30 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
 #endif
 }
 
+typedef struct { uint64_t offset, len; } ds4_gpu_stream_expert_ra_range;
+
+/* The same advisories from a helper thread. F_RDADVISE is not free on the
+ * calling thread (~0.25 ms each, 100-300 experts x 3 ranges per layer of a
+ * bank prefill: ~3 s of a 17 s turn spent issuing them while the GPU idled);
+ * the sweep only needs the pages to be on their way before the dispatch
+ * reaches them. */
+static void ds4_gpu_stream_expert_readahead_ranges_async(
+        const ds4_gpu_stream_expert_ra_range *ranges, uint32_t n) {
+    if (n == 0) return;
+    ds4_gpu_stream_expert_ra_range *copy = malloc((size_t)n * sizeof(*copy));
+    if (!copy) {
+        for (uint32_t i = 0; i < n; i++)
+            ds4_gpu_stream_expert_readahead_range(ranges[i].offset, ranges[i].len);
+        return;
+    }
+    memcpy(copy, ranges, (size_t)n * sizeof(*copy));
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (uint32_t i = 0; i < n; i++)
+            ds4_gpu_stream_expert_readahead_range(copy[i].offset, copy[i].len);
+        free(copy);
+    });
+}
+
 typedef struct {
     uint64_t offset;
     uint64_t len;
@@ -19231,6 +19255,11 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     ds4_gpu_stream_expert_pread_task *tasks = NULL;
     uint32_t n_loads = 0;
     uint32_t n_tasks = 0;
+    /* A bank prefill's misses: advised together from a helper thread. */
+    ds4_gpu_stream_expert_ra_range *ra_ranges = NULL;
+    uint32_t n_ra_ranges = 0;
+    if (g_stream_bank_prefill_rows != 0)
+        ra_ranges = malloc(3u * (size_t)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(*ra_ranges));
     double load_prepare_ms = 0.0;
     double load_install_ms = 0.0;
     double load_timing_t0 = ds4_gpu_stream_expert_timing_summary_enabled() ?
@@ -19329,9 +19358,15 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 /* The driver pages a no-copy expert in when the dispatch is
                  * submitted, one expert after another; ask the kernel for
                  * the pages now so the misses of a layer overlap instead. */
-                ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u], gate_expert_bytes);
-                ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u], gate_expert_bytes);
-                ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u], down_expert_bytes);
+                if (ra_ranges && n_ra_ranges + 3u <= 3u * DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+                    ra_ranges[n_ra_ranges++] = (ds4_gpu_stream_expert_ra_range){ unique_gate_offsets[u], gate_expert_bytes };
+                    ra_ranges[n_ra_ranges++] = (ds4_gpu_stream_expert_ra_range){ unique_up_offsets[u], gate_expert_bytes };
+                    ra_ranges[n_ra_ranges++] = (ds4_gpu_stream_expert_ra_range){ unique_down_offsets[u], down_expert_bytes };
+                } else {
+                    ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u], gate_expert_bytes);
+                    ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u], gate_expert_bytes);
+                    ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u], down_expert_bytes);
+                }
                 if (profile) { prof_wrap_ms += tw1 - tw0; prof_ra_ms += ds4_gpu_now_ms() - tw1; }
                 continue;
             }
@@ -19486,6 +19521,10 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         }
     }
     if (tasks) free(tasks);
+    if (ra_ranges) {
+        if (ok) ds4_gpu_stream_expert_readahead_ranges_async(ra_ranges, n_ra_ranges);
+        free(ra_ranges);
+    }
     const double t_loop = profile ? ds4_gpu_now_ms() : 0.0;
     if (ok) {
         for (uint32_t u = 0; u < unique_count; u++) {
