@@ -501,3 +501,36 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
 - So on this machine 256k decode is ~17-19 t/s steady (24 peak), 1M ~10, and the route to 50 at 256k is
   memory: 192 GB, or two machines splitting the experts (ds4's TP/pipeline path). Software-only remaining
   levers here are single digits each (keep-alive +3-5%, split-miss +2%).
+
+## Sep 16 — agent turns: short continuations sweep against the bank (commit "metal: short continuations
+## sweep against the expert bank")
+- The realistic workload (Hermes-style agent turns on a live 260k session) paid the whole layer map for
+  every turn: 1080 rows at 261k = 42-48 s (97 GB.. see below, read end to end), and below 1024 rows the
+  warm-append rule went token-major at 17 t/s. The store-hit tail (1211 rows) ran the map at ~23-28 s.
+- Built: `g->bank_prefill` -- a tail of <= 4096 tokens on a warm session sweeps in map-sized chunks (2048)
+  with the selected-address batch path instead of `metal_graph_stream_map_layer`. First cut used the
+  per-row address pair kernel: 540 rows = 337 ms/layer, compute-bound (it dequantizes every expert once
+  per row), 2x540 rows 36 s vs 42 s -- no. Second cut runs the map path's own grouped matmul (map0 +
+  `kernel_mul_mm_id_iq2_xxs_cached_f32_mpp` gate/up + new `kernel_mul_mm_id_q2_K_cached_f16_mpp` down,
+  EXPERT_ADDRESSES instantiations) through the bank's address table: 1080 rows in one chunk 18.9 s and
+  byte-identical to the map (the 2x540 split was not identical: chunking changes the bits, so the bank
+  path cuts exactly where the map cuts).
+- Then the bank churn: a 2048-row chunk touches ~300 of 384 experts in every layer (12k entries, more
+  than the 8509 the bank holds), and prepare's frequency hotness (rows per expert) made every prefill
+  expert hotter than decode's set, so the sweep evicted the whole bank and the next chunk missed 72-76%
+  again; decode after the turn fell to 2.4 t/s. Fix: entries a bank prefill installs are `bank_transient`
+  (first victims regardless of hotness, cleared when decode hits them), and a bank prefill neither ages
+  nor heats the hotness table; the keep-list seed still runs at the end. Miss rate 36% on every chunk,
+  decode after the turn 7 -> 15 t/s (map: 5.4 -> 15).
+- Numbers (M5 Max, 256k live session, temperature 0, identical md5 of the completion text in both modes):
+    1080-token turn   map 42-48 s      bank 15.1-15.8 s (72-76 t/s)
+    3770-token turn   map 74.9 s       bank 46.5 s (82 t/s; 2048 chunk at 100 t/s, 1722 at 68)
+  Where the 15 s goes for 1080 rows: ~4k expert loads x 9.5 MiB = 37 GB of random reads (36% miss) at
+  2.5-4 GB/s effective, overlapping only partly with ~4.4 s of MoE matmul + ~2.5 s of attention. The next
+  lever is the miss rate, i.e. bank residency again.
+- Correction to the memory notes above: this model has 384 routed experts per layer (gguf
+  `deepseek41.n_routed_experts`), not 256 -- 15360 x 9.49 MiB = 142 GiB of experts, so the 8509-entry
+  bank is 55% residency, not 83%; the "97 GB" figure was for 10240 experts. 100% residency needs ~142 GB
+  of experts + ~30 GB: a 192 GB machine fits, two 128 GB machines splitting the experts fit.
+- Upstream moved 20 commits (Qwen batched MTP, 400 files); the branch rebased clean onto 8db1d1d and the
+  numbers reproduce on the rebased build.
