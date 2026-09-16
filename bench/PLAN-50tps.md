@@ -490,3 +490,14 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   iOS simulator, Hermes, ChatGPT/Codex, Cursor, VS Code and Chrome are the tenants. With them quit and
   iogpu.wired_limit_mb raised, the bank should reach ~85-90 GB at 256k (experts total 97 GB): the coldest
   ~10% absent, which is the regime where a 3-row batch's 14 unique experts are usually all resident.
+
+## Sep 16 — the memory experiment at 256k (apps quit, wired limit 115 GB)
+- Bank 48 GiB -> 15.3 t/s; 65 GiB (cap from headroom 6) -> 17.1; 79 GiB (`--ssd-streaming-cache-experts 92GB`,
+  capped to 86 by the working-set budget; 8509 entries = 83% of the experts, wired 91-92 GB) -> 17.2-18.8 avg,
+  chunks to 24 t/s. Deferred batches with the backoff capped at 8 (DS4_METAL_V41_DEFER_BACKOFF_MAX): 209
+  attempts warm, 209 misses -- even 2-row batches, even at 83% residency. The absent 17% are not "cold": the
+  router reaches them in every batch. Deferral needs ~100% residency (97 GB of experts + ~30 GB of everything
+  else), which this 128 GB machine cannot hold; the driver's working-set budget also stops the bank at 86 GiB.
+- So on this machine 256k decode is ~17-19 t/s steady (24 peak), 1M ~10, and the route to 50 at 256k is
+  memory: 192 GB, or two machines splitting the experts (ds4's TP/pipeline path). Software-only remaining
+  levers here are single digits each (keep-alive +3-5%, split-miss +2%).
