@@ -553,3 +553,33 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   a tie-count pass per chunk ranks ties by index with no cap), PR amended and its body rewritten to
   say plainly where the select and the sort differ (only at exact ties at the k-th boundary). Lesson:
   run test-deepseek41-metal, not just ds4_test --metal-kernels, before opening a PR.
+
+## Sep 16 — Edge0 prerouter (Edge0-35B-A3B-preview, github.com/Edge0-AI/edge0, paper/main.pdf): what transfers
+- Their mechanism: a per-layer head (fc1 -> erf-gelu -> fc2, plus a linear path warm-started from the
+  NEXT layer's router weight) takes layer N's post-attention-norm hidden state at token t plus one-hots
+  of the experts layer N routed to at t and t-1, and predicts layer N+1's routing at token t+1 (double
+  shift: one layer, one token). One flush per step predicts every staged layer; the next step's SSD
+  reads overlap the current forward. They tried same-token per-layer prediction (Pre-gated MoE style)
+  and every variant lost to a plain LRU: the per-layer sync drains the GPU pipeline (30-100 ms/step),
+  which is the same "stops" cost we measured. 33 fp16 heads, 0.2 GB. +59..84% decode in their regime.
+- NOT transferable: "prediction is the routing". At decode they route by the head's logits, not the
+  model's router, so the staged set is the routed set by definition ("zero drop"). Requires training
+  (distilled heads + a recovery LoRA trained on the student path) and costs quality: 3.9 points mean
+  on the 35B tier, 6.1 on AIME. That is a different model; ds4's bar is exactness vs the reference.
+- NOT transferable: "35B in 3 GB". Qwen3.6 4-bit experts are ~7 MB per layer per token at K=4 (310 MB
+  per layer); V4.1 Flash Q2 is 6 x 9.5 MiB x 40 = 2.3 GB per token, 30x more. Their engine reads nearly
+  every routed expert from SSD every step (15-18 tok/s on M4 Pro; 19.9 with the prerouter OFF). On this
+  model that is ~2 tok/s from the SSD alone, which is why the 79 GiB resident bank carries us.
+- Transferable, exactness kept: the prediction as a PREFETCH HINT, the true router still decides.
+  ds4 already has the naive form (ds4_gpu_stream_expert_predicted_begin_load: reload a layer's
+  previous-token experts before it runs); Edge0 quantifies why it is weak: adjacent tokens agree on
+  only ~a quarter of a layer's experts. A one-token-ahead head would raise the hit rate of the
+  deferred verify batches (100% miss today at 55% residency) without changing any output.
+  Step 1 (no training): their warm-start init is "apply layer N+1's router to layer N's hidden state".
+  Instrument decode to compute that proxy per layer and log its top-6 recall against the real routing
+  one token later; if recall is 60-80%, prefetch its top-8..12 per layer. Step 2 (training): port their
+  scripts/ distillation to V4.1 Flash (384 experts, sigmoid/group routing like their 8B tier).
+- Also worth taking regardless: pin_bonus -- experts a predictor names get a bonus in hot-set
+  selection (our victim ranking), so what is about to be used is kept resident.
+- Their other findings match ours: the floor is host-side per-step work (44 ms/step of graph building
+  for them), and prerouter gains shrink on hot caches and fast storage.
