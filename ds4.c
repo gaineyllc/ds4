@@ -41161,6 +41161,134 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            ds41_bf16(g->block, DS4_N_EMBD);
 }
 
+
+/* Prerouter probe (DS4_V41_PREROUTE_PROBE=1, decode only, diagnostic): how
+ * well does "apply layer N+1's router to layer N's post-FFN-norm hidden state
+ * at token t" predict layer N+1's real routing at token t+1? That is the
+ * warm-start Edge0's trained prerouter heads begin from (the MLP learns the
+ * correction), so its recall bounds what a zero-training prefetch hint is
+ * worth: a hit is an expert the true router picks one token later that the
+ * prefetch would already have installed. Reported per 64 tokens: top-6 and
+ * top-12 recall of the proxy against the next token's top-6, and the
+ * same-layer previous-token baseline ds4 prefetches today. Output unchanged:
+ * the real router still routes. */
+#define DS41_PROBE_MAX_LAYER 64u
+#define DS41_PROBE_K12 12u
+typedef struct {
+    int enabled;
+    const ds4_weights *w;
+    ds4_gpu_tensor *logits, *weights6, *probs, *weights12;
+    ds4_gpu_tensor *pred6[DS41_PROBE_MAX_LAYER], *pred12[DS41_PROBE_MAX_LAYER],
+                   *actual[DS41_PROBE_MAX_LAYER];
+    int32_t prev6[DS41_PROBE_MAX_LAYER][DS4_MAX_EXPERT_USED];
+    int32_t prev12[DS41_PROBE_MAX_LAYER][DS41_PROBE_K12];
+    int32_t prev_actual[DS41_PROBE_MAX_LAYER][DS4_MAX_EXPERT_USED];
+    int prev_valid;
+    uint64_t tokens, total, hit6, hit12, hit_prev;
+    uint64_t layer_hit6[DS41_PROBE_MAX_LAYER], layer_total[DS41_PROBE_MAX_LAYER];
+} ds41_preroute_probe;
+static ds41_preroute_probe g_probe;
+
+static bool ds41_probe_init(void) {
+    if (g_probe.enabled) return true;
+    if (!getenv("DS4_V41_PREROUTE_PROBE") || DS4_N_LAYER > DS41_PROBE_MAX_LAYER ||
+        DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) return false;
+    g_probe.logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    g_probe.probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    g_probe.weights6 = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+    g_probe.weights12 = ds4_gpu_tensor_alloc((uint64_t)DS41_PROBE_K12 * sizeof(float));
+    bool ok = g_probe.logits && g_probe.probs && g_probe.weights6 && g_probe.weights12;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        g_probe.pred6[il] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        g_probe.pred12[il] = ds4_gpu_tensor_alloc((uint64_t)DS41_PROBE_K12 * sizeof(int32_t));
+        g_probe.actual[il] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        ok = g_probe.pred6[il] && g_probe.pred12[il] && g_probe.actual[il];
+    }
+    if (!ok) { fprintf(stderr, "ds4: prerouter probe: allocation failed\n"); return false; }
+    g_probe.enabled = 1;
+    fprintf(stderr, "ds4: prerouter probe on (next-layer router on this layer's hidden state)\n");
+    return true;
+}
+
+/* Encoded after layer il's real router ran: keep its selection, and predict
+ * layer il+1's selection for the next token from g->norm. */
+static bool ds41_probe_layer(ds41_gpu_graph *g, const ds4_model *m, uint32_t il, uint32_t token) {
+    if (!g_probe.enabled || !g_probe.w) return true;
+    if (!ds4_gpu_tensor_copy(g_probe.actual[il], 0, g->selected, 0,
+                             (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t))) return false;
+    if (il + 1u >= DS4_N_LAYER) return true;
+    const ds4_layer_weights *n = &g_probe.w->layer[il + 1u];
+    const ds4_tensor *bias = ds41_image_at(g, g->pos) ? n->ffn_exp_probs_vl : n->ffn_exp_probs_b;
+    if (!n->ffn_gate_inp || !bias) return true;
+    return ds41_matmul(g_probe.logits, m, n->ffn_gate_inp, g->norm, false) &&
+        ds4_gpu_router_select_tensor(g_probe.pred6[il + 1u], g_probe.weights6, g_probe.probs,
+            m->map, m->size, bias->abs_offset, 0, 0, token,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+            g_probe.logits) &&
+        ds4_gpu_router_select_tensor(g_probe.pred12[il + 1u], g_probe.weights12, g_probe.probs,
+            m->map, m->size, bias->abs_offset, 0, 0, token,
+            DS4_N_EXPERT, DS41_PROBE_K12, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+            g_probe.logits);
+}
+
+static int ds41_probe_contains(const int32_t *set, uint32_t n, int32_t id) {
+    for (uint32_t i = 0; i < n; i++) if (set[i] == id) return 1;
+    return 0;
+}
+
+/* After the token's commands completed: score last token's predictions
+ * against this token's routing, then keep this token's for the next. */
+static void ds41_probe_token_done(void) {
+    if (!g_probe.enabled) return;
+    int32_t actual[DS41_PROBE_MAX_LAYER][DS4_MAX_EXPERT_USED];
+    int32_t pred6[DS41_PROBE_MAX_LAYER][DS4_MAX_EXPERT_USED];
+    int32_t pred12[DS41_PROBE_MAX_LAYER][DS41_PROBE_K12];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_gpu_tensor_read(g_probe.actual[il], 0, actual[il],
+                                 (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t))) return;
+        if (il == 0) continue;
+        if (!ds4_gpu_tensor_read(g_probe.pred6[il], 0, pred6[il],
+                                 (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t)) ||
+            !ds4_gpu_tensor_read(g_probe.pred12[il], 0, pred12[il],
+                                 (uint64_t)DS41_PROBE_K12 * sizeof(int32_t))) return;
+    }
+    if (g_probe.prev_valid) {
+        for (uint32_t il = 1; il < DS4_N_LAYER; il++) {
+            for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
+                const int32_t id = actual[il][j];
+                g_probe.total++;
+                g_probe.layer_total[il]++;
+                if (ds41_probe_contains(g_probe.prev6[il], DS4_N_EXPERT_USED, id)) {
+                    g_probe.hit6++;
+                    g_probe.layer_hit6[il]++;
+                }
+                if (ds41_probe_contains(g_probe.prev12[il], DS41_PROBE_K12, id)) g_probe.hit12++;
+                if (ds41_probe_contains(g_probe.prev_actual[il], DS4_N_EXPERT_USED, id)) g_probe.hit_prev++;
+            }
+        }
+        g_probe.tokens++;
+        if ((g_probe.tokens % 64u) == 0u && g_probe.total) {
+            fprintf(stderr, "ds4: prerouter probe tokens=%llu recall: next-layer-router top6=%.1f%% "
+                            "top12=%.1f%% | same-layer prev-token top6=%.1f%%\n",
+                    (unsigned long long)g_probe.tokens,
+                    100.0 * (double)g_probe.hit6 / (double)g_probe.total,
+                    100.0 * (double)g_probe.hit12 / (double)g_probe.total,
+                    100.0 * (double)g_probe.hit_prev / (double)g_probe.total);
+            if ((g_probe.tokens % 256u) == 0u) {
+                fprintf(stderr, "ds4: prerouter probe per-layer top6 recall:");
+                for (uint32_t il = 1; il < DS4_N_LAYER; il++)
+                    fprintf(stderr, " %u:%.0f", il, g_probe.layer_total[il] ?
+                        100.0 * (double)g_probe.layer_hit6[il] / (double)g_probe.layer_total[il] : 0.0);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+    memcpy(g_probe.prev6, pred6, sizeof(pred6));
+    memcpy(g_probe.prev12, pred12, sizeof(pred12));
+    memcpy(g_probe.prev_actual, actual, sizeof(actual));
+    g_probe.prev_valid = 1;
+}
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
 #ifndef DS4_NO_GPU
@@ -41182,6 +41310,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+    if (g_probe.enabled && !ds41_probe_layer(g, m, il, token)) return false;
 #ifndef DS4_NO_GPU
     /*
      * Start the routed expert loads now, before the shared-expert matmuls are
@@ -42758,6 +42887,7 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
         if (g_engram_decode_profile) atexit(ds41_engram_decode_report);
     }
     ds4_gpu_stream_expert_defer_begin_token(defer_disabled);
+    if (getenv("DS4_V41_PREROUTE_PROBE") && ds41_probe_init()) g_probe.w = w;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds41_engram_decode_bg engram_bg = {0};
     ds4_engram_history next_history = g->history;
@@ -42920,6 +43050,7 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
      * its ids and destination are this call's own storage. */
     if (!ds41_engram_decode_bg_join(&engram_bg)) ok = false;
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (ok && g_probe.enabled) ds41_probe_token_done();
     if (ok && g->dspark_ready && g->dspark_capture_valid) {
         /* Every processed position keys the drafter's window (the reference
          * writes window_kv_cache for each one). Prompt tokens and fallback

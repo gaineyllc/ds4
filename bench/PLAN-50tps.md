@@ -583,3 +583,12 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   selection (our victim ranking), so what is about to be used is kept resident.
 - Their other findings match ours: the floor is host-side per-step work (44 ms/step of graph building
   for them), and prerouter gains shrink on hot caches and fast storage.
+- Probe result (DS4_V41_PREROUTE_PROBE=1, 10k prompt, 320 greedy tokens, no DSpark): the zero-training
+  proxy "layer N+1's router applied to layer N's post-FFN-norm hidden state at token t" recalls
+  22.6% of layer N+1's real top-6 at token t+1 (31.9% with its top-12); the same-layer previous-token
+  set ds4 already prefetches recalls 25.9%. Per layer 7-36%, worst at 1-3, 15-16, 19, 39. So Edge0's
+  warm-start init is no predictor on its own: their gain is the trained MLP correction (and the
+  prev-token one-hots), which needs the distillation run. Nothing to ship from the probe; the code
+  stays as a diagnostic (ds41_probe_* in ds4.c). Decision: a trained head is a separate project
+  (port scripts/ from Edge0 to V4.1 Flash, 384 experts, sigmoid/group router; a data pass through
+  the model on this machine); the cheap win to keep is pin_bonus once any predictor exists.
