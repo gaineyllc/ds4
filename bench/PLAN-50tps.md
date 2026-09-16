@@ -541,3 +541,15 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
 - Next on this path: overlap the misses with the matmul (two passes per layer over the address table,
   resident experts first while the misses install -- the cached mm kernels already skip a zero address),
   worth ~30% of a turn; after that the turn is the SSD reading the 36% of experts the bank lacks.
+- Split-miss for the bank sweep (resident experts' matmul first, misses installed meanwhile, second
+  pass over the misses; exact): no change, dropped (stash). The read-ahead prepare issues already
+  overlaps a layer's miss I/O with its dispatch; the MoE stage of a 1080-row turn is the SSD (37 GB
+  of misses at ~4 GB/s), not the matmul. What did pay: issuing the F_RDADVISE calls from a helper
+  thread (they cost ~0.25 ms each on the sweep's thread while the GPU idled): 1080 rows 22.1 -> 18.8 s,
+  3770 rows 37.1 -> 31.9 s, same bits.
+- PR #1060 (radix-select top-k) failed `make test-deepseek41-metal` at the 4096 frontier: the causal
+  batch and the single-token call chose different algorithms for the same row, and ties past the
+  2048-tie cap were arrival-ordered (nondeterministic). Fixed (a batch straddling 4096 is cut in two;
+  a tie-count pass per chunk ranks ties by index with no cap), PR amended and its body rewritten to
+  say plainly where the select and the sort differ (only at exact ties at the k-th boundary). Lesson:
+  run test-deepseek41-metal, not just ds4_test --metal-kernels, before opening a PR.
