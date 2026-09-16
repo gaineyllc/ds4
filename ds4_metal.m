@@ -16238,6 +16238,13 @@ static void ds4_gpu_stream_expert_defer_note_outcome(int missed) {
                 : (g_stream_expert_defer_backoff > DS4_METAL_DEFER_BACKOFF_MAX / 2u
                        ? DS4_METAL_DEFER_BACKOFF_MAX
                        : g_stream_expert_defer_backoff * 2u);
+        {
+            /* DS4_METAL_V41_DEFER_BACKOFF_MAX caps the backoff (experiment:
+             * misses in a cold bank otherwise park deferral for 256 tokens). */
+            static long cap = -1;
+            if (cap < 0) { const char *e = getenv("DS4_METAL_V41_DEFER_BACKOFF_MAX"); cap = e ? atol(e) : 0; }
+            if (cap > 0 && g_stream_expert_defer_backoff > (uint32_t)cap) g_stream_expert_defer_backoff = (uint32_t)cap;
+        }
         g_stream_expert_defer_cooldown = g_stream_expert_defer_backoff;
         return;
     }
@@ -46451,10 +46458,12 @@ int ds4_gpu_routed_moe_batch_tensor(
             if (ds4_gpu_stream_batch_pipelined() && layer_index == 0)
                 g_stream_expert_defer_token_mode = batch_deferred ? 1 : 2;
             if (getenv("DS4_METAL_V41_DEFER_DEBUG") && layer_index == 0)
-                fprintf(stderr, "ds4: batch gate L0: deferred=%d pipelined=%d enabled=%d disabled_for_token=%d cooldown=%u tokens=%u mode_after=%d layers=%llu\n",
+                fprintf(stderr, "ds4: batch gate L0: deferred=%d pipelined=%d enabled=%d disabled_for_token=%d cooldown=%u tokens=%u mode_after=%d layers=%llu entries=%u cap=%u budget=%u\n",
                         (int)batch_deferred, ds4_gpu_stream_batch_pipelined(), ds4_gpu_stream_expert_defer_enabled(),
                         g_stream_expert_defer_disabled_for_token, g_stream_expert_defer_cooldown, n_tokens,
-                        g_stream_expert_defer_token_mode, (unsigned long long)g_stream_expert_defer_layers);
+                        g_stream_expert_defer_token_mode, (unsigned long long)g_stream_expert_defer_layers,
+                        g_stream_expert_cache_entry_count, g_stream_expert_cache_mlock_budget_cap,
+                        ds4_gpu_stream_expert_cache_configured_budget());
             if (getenv("DS4_METAL_V41_DEFER_DEBUG") && !batch_deferred && ds4_gpu_stream_batch_pipelined()) {
                 static int said = 0;
                 if ((said++ % 400) == 0) {
