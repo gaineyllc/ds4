@@ -13243,6 +13243,11 @@ typedef enum {
     DS4_GPU_EXACT_VIEW_OWNED,
 } ds4_gpu_exact_view_lifetime;
 
+/* Owned (no-copy expert) views alive: counted at creation, decremented by
+ * the deallocator Metal calls when the last reference goes. */
+static _Atomic int64_t g_owned_view_live;
+static _Atomic uint64_t g_owned_view_live_bytes;
+
 static id<MTLBuffer> ds4_gpu_wrap_model_exact_range_impl(
         const void *model_map,
         uint64_t    model_size,
@@ -13294,10 +13299,19 @@ static id<MTLBuffer> ds4_gpu_wrap_model_exact_range_impl(
     }
     if (!buffer) {
         const uintptr_t base = (uintptr_t)model_map;
+        const int owned_view = !cache_view && !transient_view;
+        if (owned_view) {
+            g_owned_view_live++;
+            g_owned_view_live_bytes += view_bytes;
+        }
         buffer = [g_device newBufferWithBytesNoCopy:(void *)(base + page_offset)
                                              length:(NSUInteger)view_bytes
                                             options:ds4_gpu_model_resource_options()
-                                        deallocator:nil];
+                                        deallocator:owned_view ? ^(void *ptr, NSUInteger length) {
+                                            (void)ptr;
+                                            g_owned_view_live--;
+                                            g_owned_view_live_bytes -= (uint64_t)length;
+                                        } : nil];
         if (!buffer) {
             fprintf(stderr,
                     "ds4: Metal could not wrap exact mmaped model range at %.2f GiB, size %.2f MiB\n",
@@ -14857,8 +14871,10 @@ void ds4_gpu_stream_expert_cache_cap_before_prefill(uint64_t context_bytes) {
  * bank wired against 128 with it unpinned (the layer reads lose file cache
  * to it). DS4_METAL_STREAM_EXPERT_PIN_PREFILL_TOKENS=N unpins sweeps shorter
  * than N tokens for workloads where prefill dominates. */
+static void ds4_gpu_stream_expert_bank_report(uint32_t new_tokens);
 void ds4_gpu_stream_expert_cache_prefill_begin(uint32_t new_tokens) {
     if (!ds4_gpu_stream_expert_nocopy_enabled()) return;
+    if (getenv("DS4_METAL_STREAMING_BATCH_PROFILE")) ds4_gpu_stream_expert_bank_report(new_tokens);
     static long threshold = -1;
     if (threshold < 0) {
         const char *env = getenv("DS4_METAL_STREAM_EXPERT_PIN_PREFILL_TOKENS");
@@ -15756,6 +15772,22 @@ static void ds4_gpu_stream_expert_cache_residency_drop(id<MTLBuffer> buffer) {
  * handed to the queue once, so every command buffer inherits it and a deferred
  * dispatch needs no per-encoder bookkeeping at all. */
 static int g_stream_expert_cache_residency_on_queue;
+
+static void ds4_gpu_stream_expert_bank_report(uint32_t new_tokens) {
+    unsigned long members = 0, retired = 0, pending = 0;
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        members = (unsigned long)[g_stream_expert_cache_residency_members count];
+        retired = (unsigned long)[g_stream_expert_cache_residency_retired count];
+        pending = (unsigned long)[g_stream_expert_cache_residency_pending count];
+    }
+#endif
+    fprintf(stderr, "ds4: bank at prefill: tokens=%u entries=%u owned_views=%lld (%.2f GiB) "
+                    "residency members=%lu pending=%lu retired=%lu on_queue=%d\n",
+            new_tokens, g_stream_expert_cache_entry_count,
+            (long long)g_owned_view_live, ds4_gpu_gib(g_owned_view_live_bytes),
+            members, pending, retired, g_stream_expert_cache_residency_on_queue);
+}
 
 /* Publishing costs time proportional to the size of the set, so it happens at
  * most once per token rather than once per layer -- committing on every layer
@@ -16662,7 +16694,13 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
                                                e->down_abs_offset,
                                                e->down_expert_bytes);
     ds4_gpu_stream_expert_cache_zero_addr_slot(layer, expert);
-    if (reuse) {
+    /* Only slab slots can be handed on for reuse. A no-copy view is bound to
+     * one expert's pages: handing it to `reuse` made the caller wrap a fresh
+     * view and let this one go while the residency set still held it, so the
+     * set kept every evicted view alive and wired -- 15k views (47 GiB) for a
+     * 2.5k-entry bank after one 32k prefill, and a GPU out-of-memory at the
+     * 65k frontier of a 256k ds4-bench sweep. */
+    if (reuse && e->slab_backed) {
         reuse->gate_buffer = e->gate_buffer;
         reuse->up_buffer = e->up_buffer;
         reuse->down_buffer = e->down_buffer;
