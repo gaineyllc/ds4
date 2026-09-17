@@ -655,3 +655,28 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   branch92 (no-copy, 92 GB): prefill 360-384 (a wired 79 GiB bank leaves the map sweep less file cache),
   decode 10.2-11.9 without DSpark; the branch's 17-19 t/s at 256k needs --dspark, which ds4-bench has no
   option for -- the decode gain is reported from the server runs above, not from this sweep.
+- FINAL 256k sweep table (prefill t/s / decode t/s; ds4-bench greedy, no DSpark, 128 tokens per frontier;
+  bench_main30 / bench_branch30fix / bench_branch30copy / bench_branch92):
+    ctx    main 30GB     branch 30GB no-copy   branch 30GB copy   branch 92GB no-copy
+    16k    620 / 11.8    498 / 10.1            432 / 12.0         371 / 11.4
+    32k    465 / 11.5    485 / 10.8            441 / 13.1         384 / 11.2
+    64k    430 / 11.6    466 / 10.8            423 / 14.1         375 / 11.8
+    96k    440 / 11.1    446 / 10.8            396 / 13.3         369 / 11.7
+    128k   435 / 11.0    432 / 10.4            387 / 13.3         369 / 11.1
+    176k   420 / 10.7    419 / 10.4            391 / 13.5         358 / 11.1
+    208k   406 / 10.4    410 / 10.0            401 / 12.7         331 / 11.1
+    256k   416 / 10.1    411 / 10.5            374 / 13.7         328 / 10.7
+  Verdict for antirez's speed track: no single configuration dominates main on both axes.
+    * copy mode (NOCOPY unset) at 30 GB: decode +20-30% over main at every frontier (13-14 vs 10-12),
+      prefill 5-10% under main from 32k on (30% at the 16k first frontier).
+    * no-copy at 30 GB: prefill equal to main from 32k on, decode 5% under main below 131k.
+    * no-copy at 92 GB: prefill 15-20% under main, decode equal; the branch's 17-19 t/s at 256k comes
+      with --dspark, which ds4-bench cannot run.
+  So the branch as a whole is not PR-ready: the prefill cost in copy mode and the decode cost in no-copy
+  mode both need to be attributed to a commit and removed before a sweep can be put in a PR body
+  (the CONTRIBUTING rule: no speed regression except for a correctness fix). The right default at small
+  budgets is copy mode; no-copy only when a copied bank would not fit. The open PRs (#1059-#1061) are
+  independent of this and stand on their own measurements.
+  Next: bisect the copy-mode prefill cost (candidates: prefill pins / expert reserve of 7.12 GiB taken
+  from the file cache, the bank seed at the end of every sweep, the reuse-rows change) with the
+  32k..81k short sweep (~6 min per run), one env knob at a time before touching commits.
