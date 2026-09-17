@@ -42774,6 +42774,9 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_weights *w, int token, float *logits,
                                  int defer_disabled) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (g->streaming) ds4_gpu_stream_expert_hint_rows(&token, 1, DS4_N_VOCAB);
+#endif
     if (g_engram_decode_profile < 0) {
         g_engram_decode_profile = getenv("DS4_ENGRAM_DECODE_PROFILE") != NULL;
         g_engram_decode_serial = getenv("DS4_ENGRAM_DECODE_SERIAL") != NULL;
