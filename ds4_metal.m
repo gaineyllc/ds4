@@ -43110,8 +43110,23 @@ void ds4_gpu_stream_expert_hint_stats(uint64_t *calls, uint64_t *issued,
  * and read ahead what the table predicts for them. Layer geometry comes from
  * the prefetch scaffold's per-layer record, so a layer contributes only once
  * one earlier token has routed through it. */
+static void ds4_gpu_stream_expert_hint_report_atexit(void) {
+    uint64_t dt = 0, dr = 0;
+    ds4_gpu_stream_expert_defer_stats(&dt, &dr);
+    fprintf(stderr,
+            "ds4: draft-token expert hints: batches=%llu readahead=%llu experts (%.2f GiB) recall=%.1f%% (%llu/%llu); deferred tokens=%llu redos=%llu backed_off=%llu\n",
+            (unsigned long long)g_hint_calls, (unsigned long long)g_hint_issued,
+            (double)g_hint_issued_bytes / (1024.0 * 1024.0 * 1024.0),
+            g_hint_pred_total ? 100.0 * (double)g_hint_pred_hit / (double)g_hint_pred_total : 0.0,
+            (unsigned long long)g_hint_pred_hit, (unsigned long long)g_hint_pred_total,
+            (unsigned long long)dt, (unsigned long long)dr,
+            (unsigned long long)ds4_gpu_stream_expert_defer_backed_off());
+}
+
 void ds4_gpu_stream_expert_hint_rows(const int *tokens, uint32_t n, uint32_t n_vocab) {
     g_hint_n_rows = 0;
+    static int report_armed = 0;
+    if (!report_armed && g_ssd_streaming_mode) { report_armed = 1; atexit(ds4_gpu_stream_expert_hint_report_atexit); }
     if (!tokens || n == 0 || n_vocab == 0 || n_vocab > (1u << 20)) return;
     if (!ds4_gpu_stream_expert_hint_enabled()) return;
     if (g_hint_vocab == 0) g_hint_vocab = n_vocab;

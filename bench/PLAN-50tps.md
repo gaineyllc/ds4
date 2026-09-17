@@ -757,3 +757,38 @@ If recall < ~30% overall, raise TOPN to 4-6 and MIN to 1 before judging.
 Not done from the earlier list: redo-from-missed-layer (needs a per-MoE-layer
 residual checkpoint in the deferred sweep; ~half the redo cost) and storing
 per-token routing beside the disk KV for exact replay prefetch.
+
+### Measured (16k config: 10k prompt, 400 tok, 36 GB bank, DSpark, ab16k.sh)
+
+| run | prefill | decode |
+|---|---|---|
+| hints off (`DS4_METAL_V41_HINT=0`) | 186.2 t/s | 15.36 t/s |
+| hints on (default) | 169.4 t/s | 14.58 t/s |
+| hints on + `DEFER_NO_BACKOFF` | 166.3 t/s | 10.65 t/s |
+
+Verdict: hints as written are a ~5% loss on decode and ~9% on prefill;
+no-backoff is a ~30% loss. The recall line did not print (the
+DS4_METAL_MEMORY_REPORT path is not on the V4.1 CLI route), so it is not
+yet known whether the table predicts badly or the readahead competes with
+the stops for the SSD. An at-exit report was added (prints whenever
+streaming ran) but the rerun did not complete: see below.
+
+Why the first two attempts produced no numbers, so it is not repeated:
+`DS4_METAL_STREAMING_BATCH_PROFILE=1` on the CLI is not the cause either;
+the cause was ~/ds4-bench/watch2.sh killing ds4 within seconds because the
+machine was sitting on 9.8 GB of stale swap and the script's kill line is
+swap > 8000 MB. Threshold raised to 24000 MB for these runs.
+
+Machine state at the end of the session (nothing running): 13 GB wired,
+2 GB compressor, 9.7 GB swap used. That is leaked from the SIGKILLed
+streaming runs (residency-set / wired no-copy pages not returned) and it
+made the last rerun hang in `ds4_gpu_wait_command_buffer` during the
+prefill sweep (8 min, 0% CPU, state UN). Reboot before measuring anything
+else; numbers taken in this state are suspect, including the three above
+to a lesser degree (they completed, but under memory pressure).
+
+Next, in order: (1) reboot; (2) rerun hint_on/hint_off with the at-exit
+recall line; (3) if recall < 30%, TOPN=6 MIN=1 once, and if still low,
+turn hints off by default (`mode = env ? atoi(env) : 0`) and keep the
+table only as the data source for a trained prerouter later; (4) leave
+DEFER_NO_BACKOFF as an opt-in knob, it is measured negative.
