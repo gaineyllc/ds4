@@ -680,3 +680,11 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   Next: bisect the copy-mode prefill cost (candidates: prefill pins / expert reserve of 7.12 GiB taken
   from the file cache, the bank seed at the end of every sweep, the reuse-rows change) with the
   32k..81k short sweep (~6 min per run), one env knob at a time before touching commits.
+
+## Sep 16 — is the DSpark drafter mismatched to the Q2 target? (Neil's hypothesis; quick test)
+- 150 tokens at 16k, temperature 0, DS4_V41_DSPARK_LOG=1, four targets differing only in attention/dense/head
+  quant (routed experts Q2 in all): accept per drafted token 71/73/74/72% (Q2 / attnQ4K / denseQ4K /
+  denseQ4K-head), committed per cycle 2.11/2.07/2.03/2.19, gen 14.1/14.8/14.9/14.2 t/s. Acceptance does
+  not move with attention/dense/head precision. Still open for the routed experts themselves (no higher
+  expert-quant file exists here, and it would not fit the bank). Also: the drafter proposes only ~3
+  tokens per cycle (3 stages), so draft depth caps committed/cycle as much as acceptance does.
