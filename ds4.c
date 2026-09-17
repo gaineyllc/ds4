@@ -42644,7 +42644,10 @@ static bool ds41_verify_suffix_tops_once(ds41_gpu_graph *g, const ds4_model *m,
     if (!g || !g->valid || !tokens || !n_tokens || !g->dspark_logits) return false;
     if (n_tokens > g->prefill_cap || n_tokens > g->ctx - g->pos) return false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (g->streaming) ds4_gpu_stream_expert_defer_begin_token(defer_disabled);
+    if (g->streaming) {
+        ds4_gpu_stream_expert_hint_rows(tokens, n_tokens, DS4_N_VOCAB);
+        ds4_gpu_stream_expert_defer_begin_token(defer_disabled);
+    }
 #endif
     g->dspark_verify_batch = true;
     for (uint32_t i = 0; i < 3; i++) g->verify_carry_valid[i] = false;
@@ -42918,6 +42921,9 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_weights *w, int token, float *logits,
                                  int defer_disabled) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (g->streaming) ds4_gpu_stream_expert_hint_rows(&token, 1, DS4_N_VOCAB);
+#endif
     if (g_engram_decode_profile < 0) {
         g_engram_decode_profile = getenv("DS4_ENGRAM_DECODE_PROFILE") != NULL;
         g_engram_decode_serial = getenv("DS4_ENGRAM_DECODE_SERIAL") != NULL;

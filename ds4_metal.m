@@ -4560,6 +4560,18 @@ void ds4_gpu_print_memory_report(const char *label) {
                         (unsigned long long)defer_redos,
                         (unsigned long long)ds4_gpu_stream_expert_defer_backed_off(),
                         (unsigned long long)ds4_gpu_stream_expert_defer_cold_skipped());
+                {
+                    uint64_t hc = 0, hi = 0, hb = 0, hp = 0, hh = 0;
+                    ds4_gpu_stream_expert_hint_stats(&hc, &hi, &hb, &hp, &hh);
+                    if (hc != 0) {
+                        fprintf(stderr,
+                                "ds4:   draft-token expert hints: batches=%llu readahead=%llu experts (%.2f GiB) recall=%.1f%% (%llu/%llu)\n",
+                                (unsigned long long)hc, (unsigned long long)hi,
+                                (double)hb / (1024.0 * 1024.0 * 1024.0),
+                                hp ? 100.0 * (double)hh / (double)hp : 0.0,
+                                (unsigned long long)hh, (unsigned long long)hp);
+                    }
+                }
             }
             {
                 double commit_ms = 0.0; uint64_t commits = 0, members = 0;
@@ -13671,6 +13683,9 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
 }
 
 typedef struct { uint64_t offset, len; } ds4_gpu_stream_expert_ra_range;
+static uint32_t g_hint_n_rows;
+static void ds4_gpu_stream_expert_hint_note(uint32_t layer, uint32_t row,
+                                            const int32_t *ids, uint32_t n);
 
 /* The same advisories from a helper thread. F_RDADVISE is not free on the
  * calling thread (~0.25 ms each, 100-300 experts x 3 ranges per layer of a
@@ -16321,6 +16336,16 @@ int ds4_gpu_stream_expert_defer_expected(void) {
 }
 
 static void ds4_gpu_stream_expert_defer_note_outcome(int missed) {
+    /* DS4_METAL_V41_DEFER_NO_BACKOFF: stay deferred after a miss and redo,
+     * instead of parking the token in stop-per-layer mode for a cooldown. The
+     * backoff assumes a bank that mostly fits; at ~55% residency the
+     * stop-per-layer path is the slow path, not the safe one. */
+    static int no_backoff = -1;
+    if (no_backoff < 0) no_backoff = getenv("DS4_METAL_V41_DEFER_NO_BACKOFF") != NULL;
+    if (missed && no_backoff) {
+        g_stream_expert_defer_streak = 0;
+        return;
+    }
     if (missed) {
         g_stream_expert_defer_streak = 0;
         g_stream_expert_defer_backoff =
@@ -16466,6 +16491,7 @@ static void ds4_gpu_stream_expert_defer_replay_routing(void) {
         }
         if (!usable) continue;
 
+        ds4_gpu_stream_expert_hint_note(layer, row, ids, n_expert);
         ds4_gpu_stream_expert_cache_note_selected_hotness(layer, ids, n_expert);
         ds4_gpu_expert_prefetch_record(layer,
                                        n->model_map,
@@ -19193,6 +19219,10 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                  ids,
                                  n_ids * sizeof(ids[0]));
     const double t_read = profile ? ds4_gpu_now_ms() : 0.0;
+    if (ok && g_stream_bank_prefill_rows == 0 && n_tokens == g_hint_n_rows) {
+        for (uint32_t t = 0; t < n_tokens; t++)
+            ds4_gpu_stream_expert_hint_note(layer, t, ids + (size_t)t * n_selected, n_selected);
+    }
     g_stream_split_pending_count = 0;
     g_stream_split_n_ids = 0;
     if (ok && g_stream_split_defer_installs && n_ids <= sizeof(g_stream_split_ids) / sizeof(g_stream_split_ids[0])) {
@@ -42928,6 +42958,224 @@ static void ds4_gpu_expert_prefetch_record(uint32_t       layer,
     pthread_mutex_unlock(&g_prefetch_mu);
 }
 
+/* ---------------------------------------------------------------------------
+ * Draft-token expert hints.
+ *
+ * The verify batch's row tokens are known before the batch runs: the drafter
+ * produced them. Routing is not known -- it is a function of hidden states the
+ * batch has not computed yet -- but it is strongly conditioned on the token id,
+ * especially in the early layers. So keep, per (layer, token id), the experts
+ * that token routed to before (a small frequent-items cell fed by the same
+ * routing readback that feeds hotness), and when a batch's rows are announced,
+ * readahead the experts the table predicts for every row and layer that are
+ * not already in the bank. The advisories run from a helper thread and touch
+ * nothing Metal owns, so a wrong guess costs SSD bandwidth the decode leaves
+ * idle and can never change an output. A right guess turns the stop's SSD read
+ * into a page-cache hit; the drain around the stop is unchanged.
+ *
+ * Only issued in no-copy mode by default (the bank IS the page cache there).
+ * Copy mode double-populates memory and was measured negative for the older
+ * previous-token warmer; DS4_METAL_V41_HINT=2 forces it on there anyway.
+ *
+ *   DS4_METAL_V41_HINT=0      off
+ *   DS4_METAL_V41_HINT_TOPN   experts per (layer, token) to readahead (3)
+ *   DS4_METAL_V41_HINT_MIN    minimum count before a cell entry is trusted (2)
+ *   DS4_METAL_V41_HINT_MAX    experts per announcement, lowest layers first (128)
+ *
+ * Reported with the deferred-residency stats line: predicted = actual
+ * selections the table's top-N contained (recall), issued = experts read ahead.
+ * ------------------------------------------------------------------------- */
+
+enum { DS4_HINT_K = 8, DS4_HINT_MAX_ROWS = 64 };
+
+typedef struct {
+    uint16_t id[DS4_HINT_K];
+    uint8_t  cnt[DS4_HINT_K];
+} ds4_hint_cell;
+
+static ds4_hint_cell *g_hint_tab[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint32_t g_hint_vocab;
+static int32_t  g_hint_row_tok[DS4_HINT_MAX_ROWS];
+static int      g_hint_topn = 3, g_hint_max = 128, g_hint_min_cnt = 2;
+static uint64_t g_hint_calls, g_hint_issued, g_hint_issued_bytes;
+static uint64_t g_hint_pred_total, g_hint_pred_hit;
+
+static int ds4_gpu_stream_expert_hint_enabled(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *env = getenv("DS4_METAL_V41_HINT");
+        mode = env ? atoi(env) : 1;
+        if (mode < 0) mode = 0;
+        const char *e;
+        if ((e = getenv("DS4_METAL_V41_HINT_TOPN")) != NULL) g_hint_topn = atoi(e);
+        if ((e = getenv("DS4_METAL_V41_HINT_MAX")) != NULL) g_hint_max = atoi(e);
+        if ((e = getenv("DS4_METAL_V41_HINT_MIN")) != NULL) g_hint_min_cnt = atoi(e);
+        if (g_hint_topn < 1) g_hint_topn = 1;
+        if (g_hint_topn > DS4_HINT_K) g_hint_topn = DS4_HINT_K;
+        if (g_hint_max < 1) g_hint_max = 1;
+        if (g_hint_min_cnt < 1) g_hint_min_cnt = 1;
+    }
+    if (!mode || !g_ssd_streaming_mode) return 0;
+    if (mode == 1 && !ds4_gpu_stream_expert_nocopy_enabled()) return 0;
+    return 1;
+}
+
+static ds4_hint_cell *ds4_hint_cell_at(uint32_t layer, int32_t tok) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        tok < 0 || g_hint_vocab == 0 || (uint32_t)tok >= g_hint_vocab) {
+        return NULL;
+    }
+    if (!g_hint_tab[layer]) {
+        g_hint_tab[layer] = calloc(g_hint_vocab, sizeof(ds4_hint_cell));
+        if (!g_hint_tab[layer]) return NULL;
+    }
+    return &g_hint_tab[layer][tok];
+}
+
+/* The cell's experts by count, best first, counts below the trust floor left out. */
+static uint32_t ds4_hint_cell_top(const ds4_hint_cell *c, uint32_t topn, uint16_t *out) {
+    uint32_t n = 0, used = 0;
+    for (uint32_t k = 0; k < topn; k++) {
+        int best = -1;
+        for (uint32_t i = 0; i < DS4_HINT_K; i++) {
+            if (used & (1u << i)) continue;
+            if ((int)c->cnt[i] < g_hint_min_cnt) continue;
+            if (best < 0 || c->cnt[i] > c->cnt[best]) best = (int)i;
+        }
+        if (best < 0) break;
+        used |= 1u << best;
+        out[n++] = c->id[best];
+    }
+    return n;
+}
+
+/* Frequent-items update: a present expert gains a count (halving all when one
+ * saturates), an absent one takes the weakest slot once that slot has decayed
+ * to nothing, so a token's stable experts survive its occasional ones. */
+static void ds4_hint_cell_note(ds4_hint_cell *c, uint32_t expert) {
+    if (expert > 0xFFFFu) return;
+    for (uint32_t i = 0; i < DS4_HINT_K; i++) {
+        if (c->cnt[i] != 0 && c->id[i] == (uint16_t)expert) {
+            if (c->cnt[i] == 255u) {
+                for (uint32_t j = 0; j < DS4_HINT_K; j++) c->cnt[j] >>= 1;
+            }
+            c->cnt[i]++;
+            return;
+        }
+    }
+    uint32_t m = 0;
+    for (uint32_t i = 1; i < DS4_HINT_K; i++) {
+        if (c->cnt[i] < c->cnt[m]) m = i;
+    }
+    if (c->cnt[m] != 0) c->cnt[m]--;
+    if (c->cnt[m] == 0) {
+        c->id[m] = (uint16_t)expert;
+        c->cnt[m] = 1;
+    }
+}
+
+/* Row `row` of the announced batch routed layer `layer` to `ids`: score the
+ * table's prediction for it, then teach it. Same readback that feeds hotness. */
+static void ds4_gpu_stream_expert_hint_note(uint32_t layer, uint32_t row,
+                                            const int32_t *ids, uint32_t n) {
+    if (!ids || n == 0 || row >= g_hint_n_rows) return;
+    if (!ds4_gpu_stream_expert_hint_enabled()) return;
+    ds4_hint_cell *c = ds4_hint_cell_at(layer, g_hint_row_tok[row]);
+    if (!c) return;
+    uint16_t top[DS4_HINT_K];
+    const uint32_t nt = ds4_hint_cell_top(c, (uint32_t)g_hint_topn, top);
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] < 0) continue;
+        g_hint_pred_total++;
+        for (uint32_t j = 0; j < nt; j++) {
+            if (top[j] == (uint16_t)ids[i]) { g_hint_pred_hit++; break; }
+        }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] >= 0) ds4_hint_cell_note(c, (uint32_t)ids[i]);
+    }
+}
+
+void ds4_gpu_stream_expert_hint_stats(uint64_t *calls, uint64_t *issued,
+                                      uint64_t *issued_bytes,
+                                      uint64_t *pred_total, uint64_t *pred_hit) {
+    if (calls) *calls = g_hint_calls;
+    if (issued) *issued = g_hint_issued;
+    if (issued_bytes) *issued_bytes = g_hint_issued_bytes;
+    if (pred_total) *pred_total = g_hint_pred_total;
+    if (pred_hit) *pred_hit = g_hint_pred_hit;
+}
+
+/* Announce the rows of the token or verify batch about to run, in row order,
+ * and read ahead what the table predicts for them. Layer geometry comes from
+ * the prefetch scaffold's per-layer record, so a layer contributes only once
+ * one earlier token has routed through it. */
+void ds4_gpu_stream_expert_hint_rows(const int *tokens, uint32_t n, uint32_t n_vocab) {
+    g_hint_n_rows = 0;
+    if (!tokens || n == 0 || n_vocab == 0 || n_vocab > (1u << 20)) return;
+    if (!ds4_gpu_stream_expert_hint_enabled()) return;
+    if (g_hint_vocab == 0) g_hint_vocab = n_vocab;
+    else if (g_hint_vocab != n_vocab) return;
+    if (n > DS4_HINT_MAX_ROWS) n = DS4_HINT_MAX_ROWS;
+    for (uint32_t r = 0; r < n; r++) g_hint_row_tok[r] = tokens[r];
+    g_hint_n_rows = n;
+    g_hint_calls++;
+
+    const uint32_t max_exp = (uint32_t)g_hint_max;
+    ds4_gpu_stream_expert_ra_range *ranges =
+        malloc((size_t)max_exp * 3u * sizeof(*ranges));
+    if (!ranges) return;
+    uint32_t n_ranges = 0, n_exp = 0;
+    uint64_t bytes = 0;
+    uint16_t top[DS4_HINT_K];
+    uint64_t seen[(DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT + 63u) / 64u];
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER && n_exp < max_exp; layer++) {
+        if (!g_hint_tab[layer]) continue;
+        pthread_mutex_lock(&g_prefetch_mu);
+        const ds4_expert_prefetch_layer pl = g_prefetch_layers[layer];
+        pthread_mutex_unlock(&g_prefetch_mu);
+        if (!pl.valid || !pl.model_map || pl.model_size == 0 ||
+            pl.gate_bytes == 0 || pl.down_bytes == 0 ||
+            pl.n_total_expert == 0 ||
+            pl.n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+            continue;
+        }
+        memset(seen, 0, sizeof(seen));
+        for (uint32_t r = 0; r < n && n_exp < max_exp; r++) {
+            const int32_t tok = g_hint_row_tok[r];
+            if (tok < 0 || (uint32_t)tok >= g_hint_vocab) continue;
+            const uint32_t nt = ds4_hint_cell_top(&g_hint_tab[layer][tok],
+                                                  (uint32_t)g_hint_topn, top);
+            for (uint32_t j = 0; j < nt && n_exp < max_exp; j++) {
+                const uint32_t e = top[j];
+                if (e >= pl.n_total_expert) continue;
+                if (seen[e >> 6] & (1ull << (e & 63u))) continue;
+                seen[e >> 6] |= 1ull << (e & 63u);
+                if (g_stream_expert_cache[layer][e].valid) continue;
+                const uint64_t gate = pl.base_gate + (uint64_t)e * pl.gate_bytes;
+                const uint64_t up   = pl.base_up   + (uint64_t)e * pl.gate_bytes;
+                const uint64_t down = pl.base_down + (uint64_t)e * pl.down_bytes;
+                if (gate >= pl.model_size || pl.gate_bytes > pl.model_size - gate ||
+                    up   >= pl.model_size || pl.gate_bytes > pl.model_size - up ||
+                    down >= pl.model_size || pl.down_bytes > pl.model_size - down) {
+                    continue;
+                }
+                ranges[n_ranges].offset = gate; ranges[n_ranges].len = pl.gate_bytes; n_ranges++;
+                ranges[n_ranges].offset = up;   ranges[n_ranges].len = pl.gate_bytes; n_ranges++;
+                ranges[n_ranges].offset = down; ranges[n_ranges].len = pl.down_bytes; n_ranges++;
+                bytes += 2u * pl.gate_bytes + pl.down_bytes;
+                n_exp++;
+            }
+        }
+    }
+    if (n_ranges != 0) {
+        ds4_gpu_stream_expert_readahead_ranges_async(ranges, n_ranges);
+        g_hint_issued += n_exp;
+        g_hint_issued_bytes += bytes;
+    }
+    free(ranges);
+}
+
 /*
  * Issue a REAL slab load for `layer` using the selection it made on the
  * previous token. No readback: the ids are already on the host, so this costs
@@ -44620,6 +44868,7 @@ int ds4_gpu_routed_moe_one_tensor(
                         return 0;
                     }
                 }
+                ds4_gpu_stream_expert_hint_note(layer_index, 0, selected_ids, n_expert);
                 /* Remember this layer's actual routing so the next token can
                  * warm the same experts off the critical path. */
                 ds4_gpu_expert_prefetch_record(layer_index,

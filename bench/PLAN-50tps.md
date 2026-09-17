@@ -699,3 +699,61 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   Five variants now (attn, dense, head, target-layer experts) all land at 71-74%: the drafter's ceiling on
   this content, not the target quant. Untested: experts in layers 0-36 (cheap now: build per layer set).
   The tool is also the way to do the per-layer Q2-vs-native quality trace against the API vectors.
+
+## 2026-09-16 — Draft-token expert hints + no-backoff (written, NOT measured)
+
+Neil's direction: the verify rows' tokens are known before the batch runs
+(the drafter produced them), so use them as the prefetch key. Budget was
+~18% of the week, so this was written and compiled but not run. Treat every
+number below as a prediction to check, not a result.
+
+What was added (commit follows this note):
+
+- `ds4_metal.m`: per-(layer, token id) frequent-items table (8 slots of
+  uint16 id + uint8 count; ~124 MB for 40 layers x 129k vocab, allocated
+  per layer on first use). Fed by the same routing readback that feeds
+  hotness: `defer_replay_routing` (deferred rows), `prepare_selected_batch`
+  (non-deferred batch rows, only when the row count equals the announced
+  row count so prefill chunks are not mis-mapped), and `routed_moe_one`
+  (single token, row 0).
+- `ds4_gpu_stream_expert_hint_rows(tokens, n, n_vocab)`: announces the rows
+  of the token or verify batch about to run; for every row and every layer
+  whose geometry is known (the prefetch scaffold's `g_prefetch_layers`
+  record), takes the table's top-N experts, skips ones already in the bank,
+  and issues F_RDADVISE for gate/up/down from the helper thread
+  (`readahead_ranges_async`, the bank-prefill path). Lowest layers first,
+  capped at HINT_MAX experts per announcement.
+- Hooks in `ds4.c`: `ds41_verify_suffix_tops_once` (verify batch, before
+  `defer_begin_token`) and `ds41_graph_step_once` (single token).
+- `DS4_METAL_V41_DEFER_NO_BACKOFF`: after a deferred miss, stay deferred
+  and redo instead of parking in stop-per-layer mode for a cooldown.
+- Stats line next to "deferred expert residency":
+  `draft-token expert hints: batches= readahead= experts (GiB) recall=%`.
+  Recall = fraction of actual selections that were in the table's top-N
+  for that (layer, token) at announcement time.
+
+Env: `DS4_METAL_V41_HINT=0` off, `=1` (default) no-copy mode only,
+`=2` also in copy mode. `DS4_METAL_V41_HINT_TOPN` (3), `_MIN` (2), `_MAX` (128).
+
+What it can and cannot do: it is the prefetch-hint form only (Edge0's
+transferable half). It does not install anything or evict anything, so it
+cannot change an output and cannot thrash the bank; a wrong guess costs idle
+SSD bandwidth. A right guess turns the stop's SSD read into a page-cache
+hit; the GPU drain and clock ramp around the stop are unchanged. So the
+ceiling is the read share of a stop, not the stop. Expected gain is single
+digits to low teens percent of decode if recall is decent in the early
+layers, ~0 if the table's recall is as poor as the untrained prerouter's.
+First-token window is short: layer 0's reads will not land in time; the
+gain is in layers that run after the reads complete (~2.5 ms/layer batch
+vs ~2 ms per expert read).
+
+How to measure (not done):
+  DS4_METAL_STREAMING_BATCH_PROFILE=1 ~/ds4-bench/bp_run.sh hintA          # default
+  DS4_METAL_V41_HINT=0 ... bp_run.sh hintB                                  # off
+  DS4_METAL_V41_DEFER_NO_BACKOFF=1 ... bp_run.sh hintC                      # + no backoff
+Compare decode t/s and the two stats lines (redos, backed_off, recall).
+If recall < ~30% overall, raise TOPN to 4-6 and MIN to 1 before judging.
+
+Not done from the earlier list: redo-from-missed-layer (needs a per-MoE-layer
+residual checkpoint in the deferred sweep; ~half the redo cost) and storing
+per-token routing beside the disk KV for exact replay prefetch.

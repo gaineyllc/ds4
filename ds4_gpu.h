@@ -427,6 +427,12 @@ int ds4_gpu_stream_expert_bank_prefill_begin(uint32_t rows);
 void ds4_gpu_stream_expert_bank_prefill_end(void);
 void ds4_gpu_stream_note_support_bytes(uint64_t bytes);
 void ds4_gpu_stream_expert_prefetch_layer(uint32_t layer);
+/* Announce the row tokens of the token or verify batch about to run so the
+ * draft-token hint table can read ahead the experts it predicts for them. */
+void ds4_gpu_stream_expert_hint_rows(const int *tokens, uint32_t n, uint32_t n_vocab);
+void ds4_gpu_stream_expert_hint_stats(uint64_t *calls, uint64_t *issued,
+                                      uint64_t *issued_bytes,
+                                      uint64_t *pred_total, uint64_t *pred_hit);
 int ds4_gpu_stream_expert_predicted_begin_load(uint32_t layer);
 void ds4_gpu_stream_expert_cache_replenish_free_slots(void);
 void ds4_gpu_stream_expert_reserve_stats(uint64_t *runs, uint64_t *evicted, uint32_t *free_now);
