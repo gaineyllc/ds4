@@ -2393,6 +2393,9 @@ typedef struct ds4_model {
     const uint8_t *map;
     uint64_t size;       /* Addressable weights, excluding disk-only n-grams. */
     uint64_t file_size;
+    /* Unmapped span inside [0, size): the V4.1 Engram tables of a mixed file
+     * whose replacement experts trail them. Zero-length otherwise. */
+    uint64_t hole_start, hole_end;
 
     uint32_t version;
     uint64_t n_kv;
@@ -2651,7 +2654,11 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
      * mapping into the page cache before token generation reaches it.
      */
 #if defined(POSIX_MADV_WILLNEED)
-    const int rc = posix_madvise((void *)m->map, (size_t)m->size, POSIX_MADV_WILLNEED);
+    const uint64_t first = m->hole_end > m->hole_start ? m->hole_start : m->size;
+    int rc = posix_madvise((void *)m->map, (size_t)first, POSIX_MADV_WILLNEED);
+    if (rc == 0 && first < m->size)
+        rc = posix_madvise((void *)(m->map + m->hole_end), (size_t)(m->size - m->hole_end),
+                           POSIX_MADV_WILLNEED);
     if (rc != 0) {
         ds4_log(stderr,
                 DS4_LOG_WARNING,
@@ -2786,13 +2793,41 @@ static void model_unmap_engram(ds4_model *m) {
     }
     if (!tables[0] || !tables[1]) ds4_die("V4.1 GGUF is missing Engram tables");
     const uint64_t start = tables[0]->abs_offset;
+    const uint64_t engram_end = tables[1]->abs_offset + tables[1]->bytes;
     const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0 || start % (uint64_t)page || resident_end > start ||
+    if (page <= 0 || start % (uint64_t)page ||
         tables[1]->abs_offset < start + tables[0]->bytes)
         ds4_die("V4.1 Engram tables must follow the page-aligned main weights");
-    if (munmap((void *)(m->map + start), (size_t)(m->size - start)) != 0)
-        ds4_die_errno("cannot unmap disk-only region", "Engram");
-    m->size = start;
+    /* Resident tensors may also trail the tables: a mixed file built by
+     * gguf-tools/deepseek41_native_expert_layers.py appends its replacement
+     * experts after them (an APFS clone of the base plus the new payloads,
+     * so the 189 GiB of tables are never rewritten). Every resident tensor
+     * must lie wholly before or wholly after the tables. */
+    bool trailing = false;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t == tables[0] || t == tables[1]) continue;
+        if (t->abs_offset + t->bytes <= start) continue;
+        if (t->abs_offset >= engram_end) { trailing = true; continue; }
+        ds4_die("V4.1 resident tensor overlaps the Engram tables");
+    }
+    (void)resident_end;
+    if (!trailing) {
+        if (munmap((void *)(m->map + start), (size_t)(m->size - start)) != 0)
+            ds4_die_errno("cannot unmap disk-only region", "Engram");
+        m->size = start;
+    } else {
+        /* Unmap the tables alone; a partial trailing page stays mapped. */
+        const uint64_t hole_end = engram_end - engram_end % (uint64_t)page;
+        if (hole_end > start &&
+            munmap((void *)(m->map + start), (size_t)(hole_end - start)) != 0)
+            ds4_die_errno("cannot unmap disk-only region", "Engram");
+        m->hole_start = start;
+        m->hole_end = hole_end;
+        fprintf(stderr, "ds4: V4.1 resident tensors trail the Engram tables (mixed file); "
+                        "tables unmapped, %.2f GiB mapped after them\n",
+                (double)(m->size - engram_end) / 1073741824.0);
+    }
 }
 
 /* Like V4.1 Engram, the n-gram table must trail the resident weights. This
@@ -7001,7 +7036,9 @@ static void config_validate_deepseek41_model(const ds4_model *m) {
     for (uint32_t i = 0; i < 2; i++) {
         ds4_tensor *t = required_tensorf(m, "blk.%u.engram_embd.weight", engram[i]);
         tensor_expect_layout(t, DS4_TENSOR_I8, 2, 264, rows[i], 0);
-        if (t->abs_offset < m->size) ds4_die("Engram table is still mapped");
+        if (t->abs_offset < m->size &&
+            !(t->abs_offset >= m->hole_start && t->abs_offset < m->hole_end))
+            ds4_die("Engram table is still mapped");
     }
 }
 

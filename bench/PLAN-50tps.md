@@ -688,3 +688,14 @@ Not pushed: waiting for Neil to say the fork under gaineyllc is fine.
   not move with attention/dense/head precision. Still open for the routed experts themselves (no higher
   expert-quant file exists here, and it would not fit the bank). Also: the drafter proposes only ~3
   tokens per cycle (3 stages), so draft depth caps committed/cycle as much as acceptance does.
+- Native experts test (Neil's direction: the DSpark-native recipe applied to the main model).
+  DeepSeek's release is FP8 dense + FP4 routed experts (config.json quantization_config expert_dtype
+  fp4); no BF16 experts exist. New gguf-tools/deepseek41_native_expert_layers.py repacks chosen layers'
+  released FP4 experts bit-exact as MXFP4 (deepseek41_dspark.mxfp4_from_native) into an APFS clone of
+  the Q2 file, appending after the Engram tables (20 GiB for 3 layers, 40 s; only the 3 HF shards for
+  those layers are needed, 7.4 GB each). Loader change in ds4.c: resident tensors may trail the Engram
+  tables (the tables alone are unmapped; m->hole_start/end). Layers 37-39 (DSpark's targets) at native:
+  committed/cycle 2.01 vs 2.11, accept 72% vs 71%, 13.5 vs 14.1 t/s -- acceptance unchanged again.
+  Five variants now (attn, dense, head, target-layer experts) all land at 71-74%: the drafter's ceiling on
+  this content, not the target quant. Untested: experts in layers 0-36 (cheap now: build per layer set).
+  The tool is also the way to do the per-layer Q2-vs-native quality trace against the API vectors.
