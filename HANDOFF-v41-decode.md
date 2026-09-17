@@ -1,650 +1,189 @@
-# ds4 / DeepSeek V4.1 Flash — decode performance handoff
+# DeepSeek V4.1 Flash on ds4 / M5 Max 128 GB — Engineering Handoff
 
-**Author:** Claude Opus 5 session, 2026-09-14
-**For:** Fable 5.1 (or whoever picks this up next)
-**Repo:** `/Users/gaineyllc/ds4`, branch `ssd-decode-bank-shrink`, HEAD `b77b624`
-**Upstream base:** `a04f46f` (antirez/ds4 `main` at branch point) — **`origin/main` has since moved to `9139e2a`; see §−1 before doing anything**
-**Machine:** Neil's MacBook Pro, Apple M5 Max, 128 GiB unified memory, macOS
+**For:** Astra (implementation)
+**From:** Neil Gainey's ds4 session, September 2026
+**Branch:** `gaineyllc/ds4` → `ssd-decode-bank-shrink` (latest `1f99c22`); upstream PRs #1059, #1060, #1061 open against `antirez/ds4`
+**Goal:** DeepSeek V4.1 Flash, Q2 experts, 256k context, on one MacBook Pro M5 Max 128 GB, decode at 50 tok/s. Current: 14–17 tok/s with DSpark at 16k, 10–12 without.
+
+This document is everything learned, measured, built, and rejected, in one place, followed by the design Neil is directing (ragged/sawtooth batching, JIT experts, draft-keyed prefetch) and an honest assessment of the pasted "Zero-Copy Engram Table Offload" spec against what ds4 already is. Read sections 2, 5 and 8 first if short on time.
 
 ---
 
-## −1. Before you read anything else: re-sync the repo
+## 1. Ground truth about the model and the machine
 
-**This document describes a branch that was already behind upstream when it was written.** Every measurement, line number, and file reference below is against `ssd-decode-bank-shrink` at `b77b624`. Do not trust a line number in this document until you have diffed.
+These numbers were checked against the GGUF headers, the HF release, and ds4's loader. Several documents floating around (including the pasted spec) have them wrong.
 
-State at the moment of writing, `2026-09-14 18:08Z` [measured, live `git fetch`]:
-
-| | |
-|---|---|
-| branch | `ssd-decode-bank-shrink` @ `b77b624`, tree clean |
-| branch point | `a04f46f` ("DeepSeek v4.1 Flash support for CUDA") |
-| `origin/main` | `9139e2a` ("Document and download self-contained Qwen BF16 n-gram releases") |
-| divergence | **33 ahead, 16 behind** |
-| local `main` ref | `bd66c40` — **stale, two commits older than the branch point.** Do not rebase onto local `main`; fetch and use `origin/main`. |
-
-**Do this first:**
-
-```sh
-cd /Users/gaineyllc/ds4
-git fetch origin
-git log --oneline a04f46f..origin/main          # what landed upstream
-git diff --stat a04f46f..origin/main -- ds4.c ds4_metal.m metal/moe.metal ds4_gpu.h
-git rebase origin/main                           # branch is clean; backup-pre-rebase exists
-```
-
-### Why this is not a formality
-
-Upstream touched **six of the eight files this branch touches** [measured]:
-
-| file | upstream lines changed since branch point | this branch touches it |
+| Item | Value | Note |
 |---|---|---|
-| `ds4.c` | +5035 | yes |
-| `ds4_metal.m` | +2085 | yes |
-| `metal/moe.metal` | +230 | yes |
-| `ds4_gpu.h` | +235 | yes |
-| `ds4_cuda.cu` | +301 | yes |
-| `.gitignore` | +9 | yes |
-| `ds4_engram.c`, `gguf-tools/deepseek41_dspark.py` | untouched upstream | yes |
+| Layers | 40 | all routed after the dense stem |
+| Routed experts per layer | **384** (top-6 used) | not 256 |
+| Routed expert size at Q2 (gate+up+down) | 9.49 MiB | IQ2_XXS gate/up, Q2_K down |
+| Routed experts total at Q2 | **142 GiB** | this is the thing that does not fit |
+| Engram n-gram tables | 189 GiB, FP8, two tables of ~94 GiB | at the end of the GGUF; **already disk-only in ds4** (pread, 24 scattered rows per table per token) |
+| DeepSeek release format | FP8 dense + **FP4 experts** (`expert_dtype: fp4`) | there are no BF16 experts to "go get" |
+| antirez's `ds41f-q4` | Q4_K gate/up + MXFP4 down | MXFP4 = bit-exact repack of the released FP4 |
+| Expert bank at 92 GB budget | 8509 entries = **55 % residency** | the number that governs everything below |
+| DSpark drafter | 3-stage MTP, block 5, `DeepSeek-V4.1-Flash-DSpark-native.gguf` | fully resident, never streams |
+| Machine | M5 Max, 128 GB unified, NVMe | ~5–6 GB/s sustained expert reads observed; SSD 80–95 % idle during decode |
 
-Most of that volume is a new model family (Qwen3.8 Flash Next, `ccea768` / `f06d3eb`) that has no obvious bearing on the V4.1 decode path. **Three upstream commits are in V4.1 territory and you should read them before trusting §3 or §9:**
-
-- `c2c3ce3` — "Overlap CUDA SSD expert reads with V4.1 prefill"
-- `e9e1baa` — "Process medium CUDA SSD appends in one layer sweep"
-- `6e4c285` — "Record CUDA SSD prefill gains and regression checks"
-
-These are CUDA-side and prefill-side; this branch is Metal-side and decode-side. Whether they overlap conceptually with the deferred-residency design in §4, or invalidate anything in §3, I have not determined — they landed after my last fetch and I have not read them. `8464282` ("Keep short Qwen prefill tails on FP32-query attention") also touches attention paths and is worth a look.
-
-Upstream also added `tests/test_q8_prefill_variants.c` and grew `tests/test_deepseek41_prefill.c` and `tests/ds4_test.c` substantially. Run the full suite after rebasing; the byte-identical-output check in §4 is the one that matters most for the deferred-residency work.
-
-**Conflicts — resolved answer, not an expectation** [measured, `git merge-tree --write-tree HEAD origin/main`, Apple Git 2.50.1 on the Mac]:
-
-Four of the six overlapping files auto-merge clean: `ds4_cuda.cu`, `ds4_gpu.h`, `ds4_metal.m`, `metal/moe.metal`. **Every Metal and kernel change on this branch merges without conflict.** Two files conflict, both trivially:
-
-**1. `ds4.c` — one hunk, ~line 83915.** Upstream and this branch each inserted a speculative-decode dispatch at the same point in the same function. They are mutually exclusive model kinds, so the resolution is to keep both:
-
-```c
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s) && s->engine->support_kind == DS4_SUPPORT_DSPARK &&
-        s->engine->dspark && !s->engine->quality && !s->engine->dspark_strict &&
-        accepted && accepted_cap > 0) {
-        return ds4_session_ds41_dspark_cycle(s, first_token, max_tokens, eos_token,
-                                             accepted, accepted_cap, err, errlen);
-    }
-#endif
-    if (ds4_session_is_qwen4(s)) {
-        (void)max_tokens;
-        (void)eos_token;
-        if (!accepted || accepted_cap <= 0) return 0;
-#ifdef DS4_HAS_QWEN4_METAL
-        if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && s->qwen4_graph_ready) {
-            return ds4_session_qwen4_spec_cycle(s, first_token, 0.0f, 0, 0.0f, 0.0f, NULL, false,
-                                                accepted, accepted_cap, err, errlen);
-        }
-#endif
-        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-        accepted[0] = first_token;
-        return 1;
-    }
-```
-
-I have not verified that this ordering is correct beyond the fact that the two guards cannot both be true (`ds4_session_is_ds41` vs `ds4_session_is_qwen4`). [unverified] whether any later code in that function assumes one ran.
-
-**2. `.gitignore` — one hunk.** Keep all three lines: `hf-dspark/` (mine), `/tests/test_qwen4_conv_parallel` and `/tests/test_q8_prefill_variants` (upstream).
-
-`backup-pre-rebase` exists as a branch if you need to get back.
-
-**After rebasing, re-measure before trusting any number in §0.** The throughput figures are the single most rebase-fragile thing in this document.
+The single sentence to keep in mind: **the GPU can only run a layer once all six experts every row routes to are in memory, and only 55 % of them are.** Every result in this document is downstream of that.
 
 ---
 
-## How to read this document
+## 2. What ds4 already does (state of the branch)
 
-Every performance number below carries its **provenance**: how many runs, warm or cold, and whether anything else was competing for the machine. That matters more than usual here — see §6, this machine actively fights benchmarking.
+ds4 is not a naive streamer. Before designing anything, know that these exist and work:
 
-**Nothing in this document predicts the outcome of work that has not been done.** Where a direction exists, §9 states the measured facts that motivate it and the code that would have to change. It does not estimate what throughput would result. Those determinations are yours.
+**No-copy expert bank.** Experts are `bytesNoCopy` Metal buffers over the model's own mmap pages, held in one `MTLResidencySet`. An expert enters the bank by creating a view and adding it to the set (no memcpy); the residency commit wires the file pages. Copy mode (pread into GPU slabs) still exists and is faster per token at small budgets (+20–30 % decode at 30 GB) but halves the bank you can afford. `DS4_METAL_STREAM_EXPERT_NOCOPY=1` selects no-copy.
 
-Claims are labelled:
-- **[measured]** — observed, with run count.
-- **[derived]** — arithmetic from measured or file-layout facts.
-- **[unverified]** — a hypothesis I did not test. Treat as a lead, not a finding.
+**Address-table MoE kernels.** The routed kernels (`kernel_mul_mv_*` for decode rows, `kernel_mul_mm_id_*_cached_*` with `EXPERT_ADDRESSES=true` for ≥64-row batches) reach experts through a per-layer GPU address table, so the dispatch does not need to name six buffers per row and the host does not need to read the router back before encoding.
+
+**Deferred expert sync (the "loop-around" already exists).** A verify batch runs all 40 layers without the host reading the router. The cached-address kernels check residency on the GPU and set a miss flag. If anything missed, the host installs the missing experts and **redoes the whole batch from layer 0**, then backs off into stop-per-layer mode for a cooldown (`DS4_METAL_DEFER_BACKOFF_MIN/MAX`, capped by `DS4_METAL_V41_DEFER_BACKOFF_MAX`). Entry points: `ds4_gpu_stream_expert_defer_begin_token`, `ds4_gpu_stream_expert_defer_token_missed`, `ds4_gpu_stream_expert_defer_replay_routing`.
+
+**DSpark speculative decode.** Drafter proposes ~3 tokens; the verify batch runs the drafted rows plus the anchor through the main model in one pass; longest agreeing prefix commits; rollback ring restores KV/position/Engram state. Output is bit-identical to greedy. Measured: acceptance 71–74 %, **2.01–2.19 committed tokens per cycle**, verify batch 150–193 ms at 16k.
+
+**Bank prefill (built this session).** Agent-turn prefill (short tail after a warm prefix) takes experts from the bank via a grouped matmul over the address table instead of mapping every layer. Agent-turn prefill went 46→17 s (1080 rows), 74→32 s (3770 rows), 80→40 s (5534 rows), output byte-identical. Mechanics: `bank_transient` eviction priority so prefill does not churn the decode bank, whole-tail sweep to 8192 rows, async `F_RDADVISE` from a helper thread (`ds4_gpu_stream_expert_readahead_ranges_async`).
+
+**Hotness / eviction.** Frequency-with-decay counters per (layer, expert) decide which 55 % stays resident. It is not a predictor; it is the LRU/LFU policy. With it suspended during bank prefill the bank churned to 72–76 % miss and decode fell to 2.4 t/s; with it on, ~50 % hit is what you get. No clean hotness-vs-random A/B exists.
+
+**Disk KV store, live-prefix rewind, ds4-bench replay.** Prefix replay past ~229k (snapshot >1 GiB) recomputes the prompt; it is prefill, not prediction.
+
+**Fixes landed this session.** Residency-set leak (evicted no-copy views handed to `reuse` while still set members: 15315 views / 47.5 GiB for 2468 entries → 7488 views, wired flat at 47–49 GB; this was the 65k OOM). Radix top-k determinism (PR #1060: select per visible width 4096, split straddling batches, tie-count pass, ties by index). Loader support for mixed GGUFs whose tensors trail the Engram tables (`hole_start/hole_end`).
+
+**Tools.** `gguf-tools/deepseek41_native_expert_layers.py`: APFS-clone a Q2 GGUF and replace chosen layers' experts with the released FP4 repacked bit-exact as MXFP4 (appended payloads, patched records). Built `DeepSeek-V4.1-Flash-Q2-L37-39native.gguf`.
 
 ---
 
-## 0. State
+## 3. Everything measured (so nothing gets re-measured by accident)
 
-Neil's goal: DeepSeek V4.1 Flash Q2 as a final reviewer of large codebases, **1M token context (non-negotiable)**, **≥50 tokens/second generation**, fast prefill, concurrent request serving.
-
-**Current generation throughput** — all on branch HEAD `b77b624`, `DS4_METAL_STREAM_EXPERT_NOCOPY=1`, nothing else running:
-
-| condition | t/s | provenance |
+| Experiment | Result | Verdict |
 |---|---|---|
-| ctx 32k allocated, ~10-token prompt, warm | **20.9 / 22.4 / 22.5** | [measured] 3 runs, run 1 of a set discarded as cold |
-| ctx 1M allocated, ~10-token prompt, warm | **19.5 / 20.2** | [measured] 2 runs |
-| ctx 1M allocated, ~10-token prompt, cold | 8.7 | [measured] 1 run, first after model load |
-| ctx 131k allocated, **65k-token prompt** | **9.5 – 10.2** | [measured] single runs per arm, server verified down |
-| stopping path (deferral off), ctx 32k, warm | 18.3 / 18.4 / 18.5 | [measured] 3 alternating pairs vs the above |
+| Bank prefill, agent turns | 46→17 s / 74→32 s / 80→40 s, identical output | **keep** |
+| Split-miss (run resident rows, redo missed) | 0 gain | stashed, not committed |
+| Edge0 prerouter, zero-training proxy (layer L+1 router weights on layer L state) | 22.6 % recall of misses | not worth prefetching on; needs a trained head |
+| DSpark acceptance vs quant (attn Q4_K, dense Q4_K, head, native experts L37–39) | flat 71–74 %, 2.0–2.2 committed/cycle | **drafter is not misaligned to the quant**; experts are not the problem either |
+| Speed track, no-copy 30 GB vs upstream main | ≈ main prefill, −5 % decode | |
+| Speed track, copy mode 30 GB | +20–30 % decode, −5–10 % prefill | copy mode should be the small-budget default (bisect of prefill cost still open) |
+| Speed track, no-copy 92 GB | −15–20 % prefill, decode ≈ main (no DSpark in ds4-bench) | |
+| Previous-token predicted preload (`DS4_METAL_V41_PREDICTED_LOAD`, pre-existing) | −7 % at 8k | opt-in only |
+| madvise WILLNEED warmer (pre-existing) | 6.36 vs 10.00 t/s in copy mode | off by default; wrong mechanism when the bank holds copies |
+| **Draft-token expert hints** (this session, see §6.4) | 15.36 → 14.58 t/s (−5 %); prefill 186 → 169 t/s | recall not yet measured; default should flip to off until it is |
+| **`DEFER_NO_BACKOFF`** | 15.36 → 10.65 t/s (−30 %) | dead; leave as opt-in knob |
+| 256k regression tracks | correctness tracks pass with `DS4_TEST_SSD_STREAMING=1`; `logprob-vectors short_code_completion` step-0 mismatch is identical on upstream main (quant vs API) | |
 
-For reference, the prior session's starting point on this workload was 16.0–18.5 t/s.
-
-**A number I do not have:** nothing here was measured with a genuinely full 1M-token context. Every "1M" row above is an *allocated* window with a ten-token prompt. The largest real occupancy tested is 65k. See §9 Lead 3.
-
-### The central measured fact
-
-Decode reads **9.79 GB of weights per generated token** [derived, §3 — from GGUF file layout, not from assumed type sizes].
-
-At the measured 22 t/s that is **215 GB/s**. Against a **~546 GB/s** figure for M5 Max peak memory bandwidth, that is 39.5% of peak, and 50 t/s would require 490 GB/s — 89.7% of peak.
-
-⚠️ **The 546 GB/s figure is from my training data and was never measured on this machine.** Every conclusion about headroom rests on it. Establish the *achievable* streaming bandwidth first — a Metal kernel doing a large strided read with no compute — before using §3 for anything. If the achievable figure differs materially from what I assumed, the whole picture changes.
-
-Four optimization attempts (§5) failed, and all four are consistent with bandwidth being the binding constraint. That is a pattern, not a proof.
+Config for the 16k numbers: 10k prompt, 400 generated tokens, `-c 16384`, `--ssd-streaming-cache-experts 36GB`, no-copy, DSpark, `~/ds4-bench/ab16k.sh`.
 
 ---
 
-## 1. Hardware, model, file inventory
+## 4. Where the time goes (the decode limiter)
 
-**Machine:** Apple M5 Max, 128 GiB unified memory. Metal 4 runtime, MTL4 queue, tensor API, "M5 neural accelerators likely" per ds4's own startup probe.
+At 16k with DSpark a cycle is ~100 ms wall: verify 150–193 ms per batch over ~2.1 committed tokens, plus draft ~7 ms and gap ~8 ms. The floor for one verify batch with everything resident is ~45 ms (streaming the resident weights out of unified memory for 4–6 rows; row count barely matters because expert bytes dominate). The other ~55 ms per cycle is **expert-miss stops**: GPU drain, host reads the miss set, SSD read (~2 ms per expert at 9.5 MiB), residency commit, clock ramp, re-encode, and on the deferred path a full redo from layer 0 followed by a stop-per-layer cooldown.
 
-**Model files**, `/Users/gaineyllc/ds4/gguf/`:
+Two things follow. First, no batching trick changes the 45 ms; only memory bandwidth does. Second, everything that attacks the 55 ms is one of exactly three levers: **fit more of the bank** (memory), **know the routing earlier** (prediction), or **make each stop cheaper** (engineering). No-copy only touches the cost of getting a missing expert in; it does not change the batch or the stall.
 
-| file | size | notes |
-|---|---|---|
-| `DeepSeek-V4.1-Flash-Q2.gguf` | 365,713,686,528 B (340 GiB) | target. IQ2_XXS gate/up, Q2_K down, Q8_0 attention/shared/head |
-| `DeepSeek-V4.1-Flash-DSpark-native.gguf` | 8,421,605,376 B (7.84 GiB) | DSpark drafter, near-native precision (§7) |
-| `DeepSeek-V4.1-Flash-DSpark-support.gguf` | 4,568,907,776 B (4.25 GiB) | DSpark at Q2 — **does not run** (§7.3) |
-| `DeepSeek-V4.1-Flash-Vision.gguf` | 970,555,552 B | vision tower — see below |
-
-**On the vision tower:** it was exercised in exactly one way — a startup run with `--vision` to determine whether it enters the expert-cache budget. **It does not** [measured, 1 run]: the cache target came out at exactly 65.63 GiB and static weights locked at 9.37 GiB, byte-identical to a run without `--vision`. Vision *inference* (image input) was never exercised, and no vision code path was touched on this branch. The budget result is in §2; it is the same gap that affects the support model.
-
-**HF source shards** (`/Users/gaineyllc/ds4/hf-dspark/`, gitignored): shards 44, 45, 46 of 48, plus `config.json` and `model.safetensors.index.json`. These are the three containing `mtp.*`. **Shards 47–48 were never downloaded** — they hold the Engram tables, so re-deriving Engram from source requires fetching them.
-
-**Architecture facts** (`hf-dspark/config.json`, `text_config`):
-
-```
-hidden_size 5120, moe_intermediate_size 2304, num_hidden_layers 40
-num_attention_heads 64, num_key_value_heads 1, head_dim 512
-q_lora_rank 1280, o_lora_rank 1024, o_groups 8
-n_routed_experts 384, n_shared_experts 1, num_experts_per_tok 6
-sliding_window 128, max_position_embeddings 1048576
-rope yarn factor 16, original_max_position_embeddings 65536
-engram_layer_ids [1, 14], engram_max_ngram_size 4
-engram_num_embeddings [384006168, 384016682], engram_vocab_size 16000000
-engram_n_heads 8, engram_head_dim 256, engram_compressed_vocab_size 99092
-dspark_block_size 5, dspark_markov_rank 256, dspark_target_layer_ids [37,38,39]
-dspark_n_routed_experts 128, dspark_num_experts_per_tok 3
-dspark_noise_token_id 128799
-quantization_config: fp8, weight_block_size [32,32], scale_fmt ue8m0, expert_dtype fp4
-```
-
-**Where the 340 GiB goes** [derived from GGUF tensor table]:
-
-| component | size | share |
-|---|---|---|
-| Engram n-gram tables (layers 1 and 14) | **188.8 GiB** | 56% |
-| routed experts (40 × 384 × 9.4 MB) | 142.3 GiB | 42% |
-| static / attention weights | 9.37 GiB | 3% |
-
-Each Engram table is `[264, 384006168]` — 384 million rows of 264 bytes = 94.4 GiB, twice. GGUF tensor type 24, encoding `deepseek41.engram.encoding = e4m3_e8m0_32_row264`. ds4 logs `Engram disk-only` at startup and reads them with `pread` via `ds4_engram_table_open` / `ds4_engram_read` — not through the expert cache, not through any GPU mapping.
-
-I reasoned about the expert cache as a fraction of "the 340 GiB model" for most of the session. That was wrong: the expert working set is 142 GiB, so the 65.63 GiB decode bank at 1M covers **46% of the experts**, not 19%.
+Why prefetching is hard here specifically: layer L's routing is a matmul on a hidden state that layer L−1 has not produced yet, and within a batch row t's attention at layer L needs row t−1's layer-L KV, so a miss at (row r, layer L) blocks every row ≥ r. Nothing recorded from the past gives you next-token routing directly. The drafter changes this: it gives you the **token ids** of the next verify batch before it runs, which is a real prefetch window (§6.4).
 
 ---
 
-## 2. The expert cache
+## 5. Neil's proposals, assessed
 
-`--ssd-streaming` keeps a bank of routed experts resident and streams the rest.
+### 5.1 Staggered / overlapping verify cycles that "loop around" on a miss
 
-- Auto-sized at `ds4.c` ~64470 (`ds4_ssd_auto_cache_plan`), fed `recommended` (Metal `recommendedMaxWorkingSetSize`), `cache_percent` 86 for non-GLM, `model_limit` from `ds4_streaming_manual_cache_safe_bytes`, and `non_routed_bytes` from `weights_streaming_non_routed_bytes(&e->weights, …)`.
-- Budget observed [measured]: **76.62 GiB** at ctx 32768, **75.62 GiB** at ctx 131072, **65.63 GiB** at ctx 1048576.
-- Per-expert 9.49 MiB (gate + up + down).
-- `--ssd-streaming-cache-experts 95GB` is clamped to 75.00 GiB by `ds4_streaming_manual_cache_safe_bytes` [measured].
+The loop-around exists (deferred path, §2). What does not exist and cannot exist without speculation is overlapping two verify cycles: cycle n+1's draft is a function of cycle n's committed token and hidden state. Until n commits there is nothing to run. Tree speculation (Medusa / EAGLE-2 / SpecInfer: several draft branches per position, verified together under a tree mask, longest agreeing branch wins) is the legitimate form of "run more candidates concurrently", but a 16-node tree touches up to 96 experts per layer instead of 24 and at 55 % residency that means more misses per cycle. It pays when the bank fits; it hurts here until residency is fixed.
 
-**Neither auxiliary model enters the budget** [measured, 4 runs]. The cache target is byte-identical with and without `--vision`, and with and without `--mtp-model`. `weights_streaming_non_routed_bytes` reads only the target model's static spans. On this machine it caused no observed memory pressure: at 1M with DSpark loaded, mid-decode sampling showed `free=55.9 wired=4.6 compressed=4.5 GiB` and **zero swapouts**; without DSpark, `free=50.3 wired=4.6 compressed=4.5`, also zero.
+What is still on the table inside the existing loop-around, unbuilt:
 
-**Two cache modes:**
+1. **Redo from the missed layer, not layer 0.** Checkpoint the residual after each MoE layer during the deferred pass; on miss, install and resume at the lowest missed layer. Roughly halves redo cost. Needs a per-layer residual checkpoint in `ds41_graph_prefill_sweep` for verify batches and a resume entry point.
+2. **Issue the miss reads before the drain finishes.** The miss buffer is host-visible; a helper thread can poll it and issue `F_RDADVISE` the moment a layer writes it, the way bank-prefill readahead already runs.
+3. Do **not** remove the backoff (measured −30 %).
 
-- **Copy mode** (default) — experts `pread` into wired slab buffers.
-- **No-copy mode** (`DS4_METAL_STREAM_EXPERT_NOCOPY=1`, added on this branch) — experts stay in the model file's own mmap'd pages, wrapped with `newBufferWithBytesNoCopy`. `bind_total` 2242 → 96 ms, `cache_mixed` 2632 → 0, hit_rate 0.765 → 0.820 [measured].
+Expected total from 1+2: single digits to low teens percent. Not 2×.
 
-**The two modes invert with context length** [measured, single runs per arm, server verified down]: at 65k occupied context, copy mode 10.21 t/s vs no-copy 4.94. At short context the prior session measured no-copy +24% at 8k. There is no adaptive switch — it is a manual env var with no in-code guidance.
+### 5.2 "Run the rows as concurrent threads, most accurate wins"
 
----
+Rows already run concurrently on the one GPU in one command buffer. Correctness is not a vote: the main model's output at row t−1 *is* the grade for row t. The concurrent-candidates version of this is tree speculation above.
 
-## 3. Weight traffic per token
+### 5.3 JIT experts / evict the coolest to make room
 
-Method: read the GGUF tensor table; compute bytes-per-weight from **consecutive tensor data offsets in the file** rather than assumed type sizes; scale `*_exps` by 6/384 since top-6 of 384 are read per token.
+That is what a miss install does now (victim = lowest hotness, `bank_transient` first). The bank is always full; every install is an eviction. What "JIT" adds only if the routing is known early enough to install *before* the layer needs it, which returns to prediction.
 
-I derived this three times. The first two were wrong — once by counting only routed experts at a wrong per-expert size (this produced a "9% of bandwidth" claim I stated to Neil and later retracted), once with guessed type codes. **Re-derive it rather than inheriting it.**
+### 5.4 KV + replay + experts as a lookup graph → draft-token hints (built, measured once)
 
-Bytes/weight from layout: `F32 4.0, F16 2.0, Q8_0 1.0625, Q2_K 0.3281, IQ2_XXS 0.2578`.
+The useful version of the graph idea: per-(layer, token id) table of the experts that token routed to before, fed by the same routing readback that feeds hotness; when a verify batch is announced, read ahead the predicted experts for every row and layer that are not in the bank. Built as `ds4_gpu_stream_expert_hint_rows()` and friends in `ds4_metal.m` (search "Draft-token expert hints"), hooked in `ds41_verify_suffix_tops_once` and `ds41_graph_step_once`. Prefetch-hint only (no installs, no evictions, cannot change output). Env: `DS4_METAL_V41_HINT=0|1|2`, `_TOPN` (3), `_MIN` (2), `_MAX` (128). Memory ~124 MB for 40 layers × 129k vocab.
 
-| tensor (all 40 layers) | GB/token | share |
-|---|---|---|
-| `attn_q_b.weight` | 1.78 | 18.2% |
-| `attn_output_b.weight` | 1.78 | 18.2% |
-| `attn_output_a.weight` | 1.43 | 14.6% |
-| `ffn_down_exps.weight` | 0.93 | 9.5% |
-| `ffn_gate_exps.weight` | 0.73 | 7.5% |
-| `ffn_up_exps.weight` | 0.73 | 7.5% |
-| `ffn_gate_shexp.weight` | 0.50 | 5.1% |
-| `ffn_up_shexp.weight` | 0.50 | 5.1% |
-| `ffn_down_shexp.weight` | 0.50 | 5.1% |
-| **TOTAL** | **9.79** | |
+Measured once: −5 % decode, −9 % prefill. The recall line (the number that decides whether the table is any good) did not print on the CLI path; an at-exit report was added (`ds4_gpu_stream_expert_hint_report_atexit`) but the rerun hung under a bad machine state (§7). **Do this first after a reboot:** run `ab16k.sh` on/off, read the recall. If recall < 30 %, try `TOPN=6 MIN=1` once; if still low, flip the default to off and keep the table only as training data for a real prerouter. If recall is high and it is still a loss, the readahead is competing with the stops for the SSD and needs to be throttled to layers ≥ N ahead of the sweep.
 
-Required bandwidth [derived], against the **unverified** 546 GB/s peak:
+For prefill/replayed tokens the routing *is* deterministic: storing expert ids per token per layer beside the disk KV gives exact prefetch on replay. Smaller win because prefill is already layer-major with batched misses; not built.
 
-| rate | GB/s | % of peak |
-|---|---|---|
-| 11 t/s | 108 | 19.7% |
-| 22 t/s (current) | 215 | 39.5% |
-| 50 t/s (goal) | 490 | 89.7% |
+### 5.5 The ragged / "sawtooth" batcher (Neil's original direction)
 
-Arithmetic ceiling at 100% of that peak: **55.8 t/s**.
+Within one verify batch, rows are already grouped by expert: the address-table kernels run one dispatch per layer over all rows, and the ≥64-row cached `mm_id` path (bank prefill) is a true grouped GEMM per expert. So single-session decode already has the batching the pasted spec asks for, at 4–6 rows, which is far too few rows for GEMM to beat matvec. That is the sawtooth: prefill runs the fat GEMM path, decode runs the thin matvec path, and the cost per token is set by expert bytes either way.
 
-**Attention is 51% of weight traffic** (`q_b` + `output_a` + `output_b` = 4.99 GB/token), all Q8_0. Routed experts are 24.5%. `head_dim` 512 × 64 heads makes `attn_q_b` alone `[1280, 32768]` = 42M params = 44.6 MB per layer at Q8_0.
+Where ragged batching **does** buy something is across sessions. If N sessions decode concurrently, their rows at layer L can be binned by expert and each expert's weights read once for all of them. Two things to be clear about before building it:
+
+- It raises **throughput**, not per-session latency. Each session still waits for the full 40-layer pass; the pass gets a little longer, not shorter.
+- It **raises the expert working set per pass**. Six sessions' verify rows can touch up to 6×24 = 144 distinct experts per layer instead of 24; at 55 % residency that is more misses per pass, and misses are what already cost half the cycle. Cross-session batching helps most when the bank fits and hurts when it does not, exactly like tree speculation.
+
+So on this machine the ordering is: fix residency or stop cost first; then ragged batching is a throughput multiplier for the server, which is a different goal from 50 tok/s on one stream. Both are worth having; only one moves the number Neil is chasing.
 
 ---
 
-## 4. What shipped
+## 6. The pasted spec ("Zero-Copy Engram Table Offload & MoE Execution Engine") against ds4 reality
 
-19 commits on `ssd-decode-bank-shrink`. DSpark conversion/binder (`f33db6a` … `7734064`) predates this session; decode performance (`65b7de8` … `b77b624`) is this session and the prior one. Diffstat vs `d32661a`: `ds4.c` +1316, `ds4_metal.m` +889, `gguf-tools/deepseek41_dspark.py` +431 (new), `ds4_gpu.h` +22, `ds4_cuda.cu` +15, `metal/moe.metal` +14.
+Take the spec as a good description of the shape of the problem and a poor description of where the bytes actually are. Point by point:
 
-Build is clean — **zero compiler warnings** (antirez's new `QA_BEFORE_RELEASES.md` treats warnings as build failures).
+**Engram is not the memory problem.** The spec treats the 183 GiB Engram table as the thing that has to be offloaded. In ds4 it already is: the tables are unmapped and read with `pread` at the head of every token, 24 scattered rows per table, ~32–64 KB per token, off the critical path. The thing that does not fit is the **142 GiB of routed experts at Q2**, of which a 92 GB bank holds 55 %. The spec's MoE line ("~60–75 GB, pinned resident") is what a Q2/Q4 *dense-plus-routed* footprint looks like only if you ignore that 384×40 experts cannot all be resident. Rewrite section 1 of that spec around experts, not Engram.
 
-### 4.1 `65b7de8` — async per-layer commit
+**Zero-copy mmap + `newBufferWithBytesNoCopy` for Engram.** Feasible, and it is exactly the mechanism ds4 already uses for *experts*. For Engram it is optional: 48 rows per token via pread is not a stall we have ever measured. If Astra wants the fused gather-gate kernel for cleanliness, fine, but do not expect a decode win from it. Note the constraint the spec omits: a file-backed no-copy buffer is only safe to read from the GPU once its pages are resident (residency commit wires them); "madvise WILLNEED then dispatch" is not a barrier. ds4 handles this with the residency set plus pending/retired member tracking; the leak fixed this session lives exactly there.
 
-`ds4_gpu_end_commands_async()` commits and appends to `g_pending_cbs`, capped at `DS4_GPU_MAX_ASYNC_BATCHES` (8). Blocking commits retained only at layer 13 (Engram input hazard) and layer 39 (publishing the token). **+26% at 8k** [measured, prior session].
+**Two-phase CPU prefetch with `MADV_WILLNEED`.** For Engram: the hashes are deterministic at tokenization, so yes, this is trivial and free. For experts: the prior `MADV_WILLNEED` warmer in ds4 measured 6.36 vs 10.00 t/s in copy mode (double-populates memory). In no-copy mode `F_RDADVISE` from a helper thread is the right primitive and is what bank prefill and the draft-token hints use. The spec's claim "eliminating pipeline stalls" is only true when the addresses are known ahead of time, which for experts they are not (§4).
 
-`ds4.c` ~41095:
-```c
-const bool overlap = queue_layers && g->tp_world != 2 &&
-    !getenv("DS4_METAL_DISABLE_V41_DECODE_OVERLAP");
-const bool drain = !queue_layers || overlap || il == 13 || il + 1u == DS4_N_LAYER;
-const bool blocking = !overlap || il == 13 || il + 1u == DS4_N_LAYER;
-```
+**Ragged batching / grouped GEMM.** Already present for ≥64 rows (`kernel_mul_mm_id_*_cached_*`, `DS4_METAL_V41_BANK_MM_MIN`). For decode rows it is matvec by design. The cross-session form is §5.5, with the residency caveat.
 
-### 4.2 `57adcc4` / `0aa8f4a` — no-copy expert cache
+**"Full tensors, never partially sliced."** Correct and already the case: an expert is gate+up+down for one (layer, expert), 9.49 MiB, installed or evicted as a unit.
 
-**+24% at 8k, +20% at 1M, byte-identical output** [measured, prior session]. `0aa8f4a` disabled it when a support model was loaded; `e4b81b1` later fixed the underlying cause and re-enabled.
+**Roadmap Phase 1 (re-serialize Engram into a 64-byte-aligned FP8 file).** Unnecessary; the GGUF tables are already contiguous and page-aligned enough for the pread path, and the loader now tolerates tensors trailing them. Skip unless the fused kernel is built.
 
-### 4.3 `c464574` — deferred expert residency
+**Roadmap Phase 3 (`MTLSharedEvent` ring between CPU worker and GPU queue).** This is the right structure for the "issue miss reads before the drain finishes" item in §5.1, and for a multi-session server. It is not needed for Engram.
 
-**Observation** [measured]: the routed MoE stopped 40× per token to read the router's choice off the GPU, check those six experts were cached, and hand their addresses to the matmul. That stop was almost entirely *waiting*: `sync_avg` 1.471 ms vs `bind_avg` 0.016 ms. And across a full decode run **every layer found all six experts already resident** — `cache_all_resident=4320, cache_all_missing=0, cache_mixed=0`.
-
-**Change:** the address-table kernels (`kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32`, `kernel_mul_mv_addr_q2_K_sum6_f32`) read the router's own output buffer and index a per-layer address table that install/evict already keep current. They return without contributing when an address is zero — a miss costs a missing contribution, not a fault. Residency is checked on the GPU, the token runs straight through, the result is read once at the end. If any layer came up short the token is rolled back and re-decoded with stops in place.
-
-Three supporting changes were required:
-
-1. **Residency.** Raw GPU addresses are invisible to Metal, so each dispatch used to name the six buffers with `useResource:` — only possible if the host knows which six. The bank now lives in one `MTLResidencySet` handed to the queue (`ds4_metal.m` ~15157). Membership changes only on install/evict.
-2. **Eviction interlock.** A deferred token cannot pin entries inflight because it never named them, so nothing is evicted while one is in flight (`ds4_gpu_stream_expert_defer_in_flight()`).
-3. **The rollback snapshot** stopped borrowing DSpark's carry buffers, which only exist when a DSpark module is loaded. **This is why an earlier version silently disabled itself on every token.** It now has its own `defer_carry_kv` / `defer_carry_score`.
-
-**Result** [measured]: 8120 of 8120 layers deferred, zero redos, output byte-identical over 150 tokens on one prompt. **21.09 / 21.14 t/s vs 18.44 / 18.48** on the stopping path — two alternating pairs, warm, plus an earlier set of three alternating pairs at 20.93/20.87/20.74 vs 18.34/18.30/18.30. This is the best-evidenced result on the branch.
-
-**Invariant to preserve:** a token commits to one mode at its first routed layer (`g_stream_expert_defer_token_mode`) so a stopping layer — which must be free to evict — can never sit inside a deferred layer's window.
-
-### 4.4 `e4b81b1` — no-copy cache serves DSpark
-
-Two of four expert loaders never learned about no-copy: `ds4_gpu_stream_expert_cache_load_selected_missing_with_source` (~17604) and `ds4_gpu_stream_expert_cache_prepare_selected_batch` (~18556) still allocated a slab slot and `pread` into it. Under no-copy those "slots" are views of a **read-only mapping**, so the read failed with **EFAULT**, returning zero bytes. That was the entire content of `V4.1 DSpark verify failed` — DSpark's verify batch is the one decode path through those loaders. Both now wrap.
-
-Also fixed here: both cache prune loops spun forever when `clear_entry` declined an eviction (they loop until the entry count drops); and the residency set treated additions and removals alike, so pruning marked it dirty, a dirty set turned deferral off, and the stopping path pruned again — a livelock between two features. Only additions need a commit before use; removals need the buffer to outlive the set's reference, so retired buffers are held until the next commit.
-
-### 4.5 `7a4fcb5` — rollback snapshot rides the token's command buffer
-
-The snapshot was its own commit-and-wait at the head of every token — a full GPU drain. Command buffers on one queue run in order, so the copies only need to be *encoded* ahead of the token's work. `ds41_verify_snapshot_encode` (`ds4.c` ~40922). No throughput change measurable in isolation once the other changes were in.
-
-### 4.6 `34e758f` — kernels self-report misses; exponential backoff
-
-**Wrong place to ask:** a 1×1×1 validator dispatch per layer sits in the compute encoder as a barrier between the MoE and everything after it. Removing it moved 65k decode from 6.94 → 9.94 t/s [measured, 1 run each]. The address kernels already discover a miss, so each now raises one relaxed atomic on that path (`metal/moe.metal`, `atomic_fetch_or_explicit(miss, 1u, memory_order_relaxed)` at the two `addr == 0` early-outs) and the dispatch is gone.
-
-**Wrong question:** the old validator was *also reporting no misses when there were misses*. With honest reporting, 65k context misses on **every token — 39 redos in 39 tokens** [measured]. Once the KV cache is large enough the expert bank no longer holds a token's working set, so the deferral bet cannot be won and every deferred token is decoded twice.
-
-So the bet is abandoned when it starts losing: exponential backoff 8 → 4096 tokens with an occasional probe, reset after 256 clean tokens (`DS4_METAL_DEFER_BACKOFF_MIN/MAX/FORGIVE`, `ds4_metal.m` ~15646).
-
-At 65k [measured, 1 run per arm]: **9.49 t/s with backoff, 3 tokens deferred of 40**, against 10.23 for the pure stopping path and 6.94 for unbacked-off deferral. At short context: 8120/8120 layers deferred, **redos=0, backed_off=0**.
-
-### 4.7 `276a3fe` — support model weights held resident
-
-`vmmap -resident` mid-decode showed the DSpark mapping at **3.0 MiB resident of 7.84 GiB**, while the target held its 9.4 GiB of `mlock`'d statics. Only `e->model.map` was ever locked; the drafter is read through no-copy views of its own mapping, so every draft step faulted its weights off SSD. Now `mlock`'d like the target's statics (`DS4_DISABLE_SUPPORT_MODEL_MLOCK` opts out): **7.84 GiB locked, 0.00 pageable**.
-
-Throughput after: **6.13 t/s** [measured, 1 run] against 5.75 / 5.84 / 5.90 before [3 runs]. **Thin evidence — one post-change run.** The residency fact is solid; the throughput delta is not well established.
-
-### 4.8 `54b9383` / `b77b624` — Engram decode cost, measured and partly hidden
-
-`DS4_DECODE_PROFILE_DETAIL` only instruments the *prefill* sweep; decode-side Engram reads were uncovered. Added `DS4_ENGRAM_DECODE_PROFILE`. Measured **5.493 ms/token** across 212 reads at ctx 131072 — 24 scattered 264-byte rows per table out of a 94 GiB file, synchronous at the head of every token.
-
-Layer 1 needs `rows[0]` almost immediately; **layer 14 does not need `rows[1]` until thirteen layers have gone by**. The second read now runs on its own thread and joins just before layer 14 binds it, with a second join after the layer loop so the thread cannot outlive the frame whose ids and destination it uses (`ds41_engram_decode_bg`, `ds4.c` ~41068).
-
-[measured, 2 alternating pairs, ctx 131072, short prompt]:
-
-```
-serial   3.947 / 3.857 ms/token engram     12.58 / 12.61 t/s
-overlap  2.059 / 2.090 ms/token engram     12.93 / 12.91 t/s
-```
-
-Residual at the join ~0.08 ms — the layers cover it. Byte-identical over 150 tokens.
-
-⚠️ **Provenance caveat:** absolute throughput in that pair (12.6–12.9) is well below comparable short-prompt runs measured later with the server verified down (20–22 t/s). Those runs predate my discovery of the `ds4-server` contention problem (§6.1) and were very likely contended. The **delta** comes from alternating back-to-back runs and the engram-ms figures are direct, so the improvement is credible; the **absolute numbers in that block are not** comparable to the §0 table.
-
-The remaining ~2 ms is the layer-1 table, whose ids depend on the token just sampled.
+Net: about a third of the spec is already built in ds4 under different names, a third is aimed at the wrong tensor, and a third (cross-session ragged batching, CPU/GPU event ring, per-layer resume) is the actual work.
 
 ---
 
-## 5. What was tried and failed
+## 7. Operational facts that cost a night
 
-All measured. Do not repeat without new information.
+- **Build only from a macOS shell.** Running `make` in the Linux VM that mounts the repo pollutes the tree with ELF `.o` files.
+- **`DS4_METAL_STREAMING_BATCH_PROFILE=1` is for the server.** It was believed to kill the CLI; it was not the cause, but do not use it on `ds4` CLI runs. Stats lines for hints print at exit; `DS4_METAL_MEMORY_REPORT=1` is not on the V4.1 CLI path.
+- **`~/ds4-bench/watch2.sh` kills ds4 on swap > 8000 MB** (raised to 24000 for the last runs). After several SIGKILLed streaming runs the machine sat at **13 GB wired, 2 GB compressed, 9.7 GB swap with nothing running**: leaked wired no-copy pages / residency sets. That state made runs die silently at startup and finally hung one in `ds4_gpu_wait_command_buffer` (state UN, 0 % CPU). **Reboot before measuring anything.** Prefer letting runs finish over `pkill -9`.
+- **Auto budget picks 55 GiB (6003 entries) when memory looks free**; pin `--ssd-streaming-cache-experts 36GB` for A/B runs so the bank is constant.
+- Bridge sleeps ≥ ~55 s time out; poll ≤ 45 s.
+- Do not delete Neil's Q2 side-variant GGUFs without his say-so (four × 366 GB nominal; disk ~79 GiB free).
 
-| attempt | result | provenance |
-|---|---|---|
-| **Vectorized Q8_0 matvec.** `block_q8_0` is 34 bytes so `qs` is never 4-byte aligned — hence the shipped kernel's 8 scalar `int8_t` loads. Metal `packed_char4` has alignment 1; wrote `kernel_mul_mv_q8_0_f32_4` with `packed_char4` + `packed_float4`, bit-identical arithmetic, 4× fewer load instructions. | **20.55 / 20.38 vs scalar 21.79 / 20.67 — no gain.** Reverted. | 3 alternating pairs, first discarded as cold |
-| **`DS4_METAL_Q8_MV_NSG` sweep** (2 / 4 / 8) | 9.82 / 16.15 / 12.62 — 4 is best of the three | **1 run each, cold.** Ordering is stark but evidence is thin |
-| **Fusing BF16 rounding into producing kernels.** `kernel_dsv41_bf16_linear` is a pure in-place BF16 round, 9.7 dispatches/layer at 8.1 µs each for ~20 KB of work. Fused into `kernel_dsv4_hc_expand4`'s store (2 of ~9.7 sites/layer). | 21.21 / 22.03 — within noise of baseline. Reverted. | 3 runs |
-| **Concurrency** — server, 1 / 2 / 4 simultaneous completions | aggregate **11.0 / 11.2 / 11.3 t/s**, per-stream exactly 1/N | 2 rounds; cold round gave 6.1 / 10.0 / 10.9 |
-| **Bigger expert cache at 1M** (`--ssd-streaming-cache-experts 95GB`, 65.63 → 74.99 GiB) | 12.81 → 12.72 | 1 run each |
-| **Dropping `requestResidency`** on the cache set | no change (8.60 → 8.73) | 1 run each |
-| **`DS4_METAL_MAX_ASYNC_BATCHES=1`** | 6.33 vs 6.94 | 1 run each |
-| **One command buffer per token** (`DS4_METAL_DISABLE_V41_DECODE_OVERLAP=1`) | 20.11 / 20.08 vs 20.74 / 20.74 | 2 alternating pairs |
-| **Replaying deferred routing to the cache** (hotness + prefetcher + pruners) | neutral; pruning measured worse (3.34 vs 3.83 at 65k) | 1 run each; shipped without pruners |
-
-### ⚠️ A false result I nearly built on
-
-Skipping the BF16 rounding entirely measured **+24%** (15.20 → 18.59, 16.41 → 20.75) and looked like the largest prize of the session.
-
-It was an artifact. Rounding is idempotent, so I ran it **twice** — numerics-preserving, one extra dispatch per site — and it **cost nothing** (21.64 / 21.64 vs 19.89 / 21.94). The extra dispatch is free; the +24% came from *different rounding → different tokens → different expert routing → different cache behaviour*.
-
-**Generalize this:** on this system you cannot A/B a flag that changes numerics and attribute the delta to performance. Always construct a numerics-preserving version of the experiment — do the work twice, not zero times.
+Harness: `~/ds4-bench/ab16k.sh <tag> [ENV=VAL…]` (16k single-stream), `bp_run.sh <tag> [ENV…]` (server, 256k, four agent-turn requests), `bench256.sh <tag> <dir>` (ds4-bench sweep, `BUDGET/CTXSTART/CTXMAX/NOCOPY`), `acc_*.txt` acceptance logs, `probe1.txt` Edge0 probe, `bench/PLAN-50tps.md` dated notes for every step.
 
 ---
 
-## 6. Measurement methodology and traps
+## 8. Recommended plan for Astra, in order
 
-Read this before measuring anything.
+1. **Reboot. Rerun hints on/off, read recall.** Decide the hint default from the number (§5.4). Half a day.
+2. **Redo-from-missed-layer + early miss reads** (§5.1 items 1–2). Measure at 16k and 64k. Expect +5–15 % decode. This is the only stop-cost work not yet tried.
+3. **Copy mode as the small-budget default** and bisect its −5–10 % prefill cost (candidates: prefill pins, the 7.12 GiB prefill expert reserve, end-of-sweep seed). Cheap win for anyone on a 64 GB machine.
+4. **Trained prerouter head** (Edge0's real mechanism): per-layer small head predicting layer N+1 routing at token t+1, trained offline from ds4 routing logs (the hint table's readback is the data source; add a dump). Use it only as a prefetch hint, never as the routing (Edge0's "prediction is routing" needs a recovery LoRA and costs quality). Recall must clear ~50 % of misses to matter. This is the one lever that can turn stops into overlap without more memory.
+5. **Cross-session ragged batching** for the server (§5.5) once 1–4 are in, with a hard cap on distinct experts per layer per pass so it cannot drive the miss rate up.
+6. **Do not** retry: split-miss, previous-token predicted preload, WILLNEED warmer in copy mode, no-backoff, quant-alignment of the drafter, native experts as a speed fix (it is a quality knob only).
 
-### 6.1 `ds4-server` will corrupt your measurements
-
-`~/Library/LaunchAgents/com.ds4.server.plist` runs `~/.ds4/start-server.sh`, starting `ds4-server` with `--ctx 1048576`. It **respawned at least six times** during this session despite `launchctl bootout` **and** `launchctl disable`, sometimes within seconds. Two failure modes:
-
-- it takes the **single-instance lock**, so your run dies with `another ds4 process is already running (pid NNNN)` — into a log you may then misread as a result;
-- it holds a 1M-context working set, wrecking memory-dependent measurements. A batch of long-context numbers I collected mid-session ranged 3.5–15.8 t/s for identical configurations because of this.
-
-Before every run:
-```bash
-launchctl bootout gui/$UID/com.ds4.server 2>/dev/null
-launchctl disable gui/$UID/com.ds4.server 2>/dev/null
-pkill -9 -f ds4-server; sleep 6
-ps -eo command | grep -c "[d]s4-server"     # verify 0 — beware greps matching themselves
-```
-After the run, check the log for `already running` before believing the number.
-
-It is currently booted out and disabled. To restore: `launchctl enable gui/$UID/com.ds4.server`.
-
-(antirez's `QA_BEFORE_RELEASES.md` says *"Do not run multiple huge model processes at the same time."*)
-
-### 6.2 Cold vs warm is a 2× effect
-
-The first run of any set is cold and meaningless — 8.67 vs 20.21 at 1M for the identical command. Discard run 1. Run A and B arms **alternating and back-to-back**, never A×3 then B×3. A trustworthy result looks like `defer 20.93 / 20.87 / 20.74` vs `sync 18.34 / 18.30 / 18.30`. Scatter means something else is running.
-
-### 6.3 Background scripts get killed
-
-Multi-iteration benchmark scripts launched with `nohup … &` through the Desktop Commander bridge were repeatedly killed when the invoking shell exited — several died after one iteration. Run long measurements one invocation at a time and poll, or verify the script is still alive.
-
-### 6.4 Memory: sample mid-run
-
-`vm_stat` "Pages free" measured just after a process exits is reclaim lag, not footprint — it produced a spurious 39 GiB difference that I initially reported as real. Sample during steady-state decode.
-
-### 6.5 Instrumentation available
-
-| env | gives |
-|---|---|
-| `DS4_METAL_ENCODER_TIMELINE=/path.csv` | per-encoder GPU timestamps via counter sampling. Format: `E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <kernel>`; `B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns>` per command buffer. **Kernel name is the last field.** Forces one encoder per dispatch, inflating wall time — use for relative kernel breakdown, not absolute occupancy. Caller address is inside `ds4_gpu_dsv41_quantize` for all rounding passes, so it does not separate call sites. |
-| `DS4_METAL_GPU_BUSY_PROFILE=1` | cumulative GPU busy ms and command-buffer count |
-| `DS4_METAL_STREAMING_EXPERT_LAYER_STATS=1` + `DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY=1` | cache hit/miss, per-layer stats, `sync_avg`/`bind_avg`/`copy_avg`, and `deferred expert residency: layers=N tokens=N redos=N backed_off=N` |
-| `DS4_ENGRAM_DECODE_PROFILE=1` | decode-side Engram read time per token |
-| `DS4_V41_DSPARK_LOG=1` | per-cycle `n=`, `agreed=`, `committed=`, `verify=…ms`, `draft=…ms` |
-| `DS4_METAL_V41_DEFER_DEBUG=1` | which gate condition blocked deferral, per layer |
-| `DS4_METAL_MODEL_VIEW_DEBUG=1` | model-view table dump on a coverage failure |
-
-### 6.6 GPU occupancy picture
-
-`DS4_METAL_GPU_BUSY_PROFILE`: 3931 ms busy over 12,672 command buffers. Timeline restricted to the decode tail (last 160 command buffers = 4 tokens × 40 layers): **1,388 dispatches/token, 34.7/layer**; GPU busy 25.1 ms in an 85.2 ms instrumented token.
-
-Per-token kernel time, decode tail [measured, instrumented — absolute values inflated, relative shares valid]:
-
-| kernel | ms/token | n/layer | µs each | share |
-|---|---|---|---|---|
-| `kernel_mul_mv_q8_0_f32` | 11.25 | 3.5 | 81.1 | **35.1%** |
-| `kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32` | 3.77 | 0.5 | 191.0 | 11.8% |
-| `kernel_dsv41_bf16_linear` | 3.14 | 9.7 | 8.1 | 9.8% |
-| `kernel_mul_mv_addr_q2_K_sum6_f32` | 2.52 | 0.5 | 127.6 | 7.9% |
-| `kernel_swiglu_flat_f32` | 1.74 | 0.5 | 88.3 | 5.4% |
-| `blit:tensor_copy` | 1.74 | 1.1 | 37.9 | 5.4% |
-| `kernel_dsv4_attn_out_low_q8_0_f32` | 1.56 | 0.5 | 78.9 | 4.9% |
-
-`kernel_mul_mv_q8_0_f32` at a third of kernel time corresponds to the attention projections that are 51% of the bytes in §3.
+The honest ceiling with 1–4 on this machine is roughly 20–25 tok/s single-stream at 16k. 50 tok/s single-stream needs the routed experts to fit (a 192–256 GB machine, or a 2-bit-and-below format that halves 142 GiB without wrecking acceptance), or a prerouter good enough that stops disappear. Neither is engineering alone.
 
 ---
 
-## 7. DSpark
+## 9. Index of code touched this session
 
-### 7.1 Precision — mostly native, six tensors are not
+`ds4.c`: `ds41_gpu_graph.bank_prefill`; session-sync chunk loop (`bank_max/bank_total`, `bank_eligible`); prerouter probe (`DS4_V41_PREROUTE_PROBE=1`, `ds41_probe_*`); loader Engram hole (`hole_start/hole_end`); hint hooks in `ds41_verify_suffix_tops_once` and `ds41_graph_step_once`.
 
-The HF release stores DSpark's experts as 1,152 `I8` tensors (packed fp4 pairs) + 1,177 `F8_E8M0` scales — **exactly MXFP4's structure**. `gguf-tools/deepseek41_dspark.py` repacks them **bit-exact** into 9 stacked tensors (`mtp.{0,1,2}.ffn_{gate,up,down}_exps`, `[5120, 2304, 128]`, MXFP4). Nibble order differs (source packs `(2i, 2i+1)` per byte; MXFP4 packs `(j, j+16)`); values identical. The 2,401 → 81 tensor-count drop is **stacking, not dropping** — verified against the GGUF tensor table.
+`ds4_metal.m`: bank prefill begin/end and admission; `use_bank_mm` path in `ds4_gpu_routed_moe_batch_tensor`; `bank_transient` + victim hotness; `ds4_gpu_stream_expert_readahead_ranges_async`; `clear_entry_internal` reuse-path fix; owned-view counters and `ds4_gpu_stream_expert_bank_report`; draft-token hint module (table, `hint_note`, `hint_rows`, at-exit report); `DS4_METAL_V41_DEFER_NO_BACKOFF`.
 
-**Six tensors are genuinely requantized:** `mtp.{0,1,2}.attn_output_{a,b}` are **Q8_0**, from the release's `F8_E4M3` + E8M0. Forced — `ds4_gpu_dsv41_attention_output_batch` (`ds4_metal.m` ~27131) hardcodes `ds4_gpu_attention_output_q8_batch_impl` with no type parameter.
+`metal/moe.metal`: `kernel_mul_mm_id_q2_K_cached_f16(_mpp)`. `metal/argsort.metal`: tie-count/compact top-k (also on `pr/indexer-topk-select`, `be6a8ce`).
 
-Quantization error, measured by dequantizing the released fp8 blocks and round-tripping:
+`gguf-tools/deepseek41_native_expert_layers.py`: mixed-file builder.
 
-```
-mtp.0.attn.wo_a   Q8_0 rel-err 5.46e-03    F16 rel-err 0.00e+00
-mtp.0.attn.wo_b   Q8_0 rel-err 5.42e-03    F16 rel-err 0.00e+00
-```
-
-F16 is exactly lossless (fp8 fits F16). Whether 0.5% on two matrices affects acceptance is **[unverified]** — I did not test a F16 variant, which would need a new kernel.
-
-### 7.2 Economics [measured]
-
-`DS4_V41_DSPARK_LOG=1`, 21 cycles at ctx 131072:
-
-```
-n=4.90 rows    agreed=1.62    committed=1.10
-verify=254.8 ms    draft=0.0 ms
-5 of 21 cycles committed nothing (parity fallback)
-```
-
-255 ms ÷ 1.10 committed = **232 ms/token** against 76 ms for plain decode in the same conditions.
-
-**52 ms per verify row against 76 ms per full token.** The batch barely amortizes, because on a sparse MoE each speculative row routes independently and drags its own 6 experts per layer. Confirmed by counting: **1,021 expert lookups per output token with DSpark vs 415 without** (61,294 vs 24,897 for the same 60 tokens).
-
-[derived] At perfect 5-of-5 acceptance the cycle would be 255/5 = 51 ms/token vs 76 — a 1.5× gain. That is the arithmetic ceiling of the feature *as currently structured*, on the measured verify cost.
-
-Note also: the deferral work in §4.3 removed the fixed per-token overhead that speculation was positioned to exploit.
-
-### 7.3 Known DSpark defects
-
-- **The Q2 drafter does not run.** `DeepSeek-V4.1-Flash-DSpark-support.gguf` fails with `V4.1 DSpark draft failed at position 0`. **Not diagnosed.** One unverified lead: `use_iq2_selected_slots` requires `n_expert == 6`, and DSpark is 128 experts top-3, so IQ2_XXS/Q2_K at `n_expert == 3` may fall to a branch without support. **[unverified]** — I did not instrument the failure.
-- Because of that, the hypothesis that low acceptance stems from **drafter/target quantization mismatch** (a near-exact drafter predicting what the unquantized model would say, against a Q2 target) is **[unverified]** — it could not be tested without a working Q2 drafter.
-- **The parity constraint discards 24% of cycles** — 5 of 21 committed nothing after paying the full 255 ms verify. The compressor's ratio-2 pooled carry forces commits to an even `(start + commit)`; when that cannot be satisfied the cycle is discarded.
-- Acceptance measured 1.62/5 here vs ~2.02 in an earlier session — it drifts.
-
----
-
-## 8. Upstream state (antirez), 2026-09-14
-
-Three commits on `origin/main`, all **CUDA + prefill**:
-
-```
-6e4c285  Record CUDA SSD prefill gains and regression checks
-e9e1baa  Process medium CUDA SSD appends in one layer sweep
-c2c3ce3  Overlap CUDA SSD expert reads with V4.1 prefill
-```
-
-**Zero Metal files touched.** Every `ds4.c` hunk is inside `#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)`; `ds4_gpu.h` additions are CUDA-guarded. **No conflict with this branch.** Diffstat: `ds4_cuda.cu` +301, `ds4.c` +27, `ds4_gpu.h` +9, tests +99, `QA_BEFORE_RELEASES.md` +86 (new), `docs/DGX_SPARK.md`.
-
-Factual notes relevant to a future PR:
-
-- `c2c3ce3` implements read-ahead of the next layer's experts into reserved cache slots, overlapped with compute, for **prefill** — two 8 MiB staging buffers, enabled from 2K tokens.
-- `6e4c285`'s message states: *"Include the small automatic-cache decode cost instead of claiming a decoding speedup."*
-- `QA_BEFORE_RELEASES.md` names `mac-m5max-it` and `mac-m5max-us` as the preferred Metal/distributed QA hosts — M5 Max, the same silicon as Neil's — mandates zero compiler warnings, and forbids concurrent huge-model processes.
-
----
-
-## 9. Directions, with the facts that motivate them
-
-**No outcome estimates here.** Each entry gives the measured motivation and the code that would change.
-
-### Lead 1 — attention projections at Q4_K instead of Q8_0
-
-**Motivation** [derived, §3]: `attn_q_b` + `attn_output_a` + `attn_output_b` = 4.99 GB/token = 51% of weight traffic, all Q8_0 at 1.0625 B/weight. Q4_K is 0.5625 B/weight.
-
-**What would have to change:**
-- Requantize the target. `gguf-tools/deepseek41_quantize.py`'s `q2` profile sets `att=QTYPE_Q8_0`. This is a 340 GiB rebuild; the ds4 volume had 191 GiB free at last check, so space needs arranging.
-- A **decode-path** Q4_K attention-output kernel. `ds4_gpu_attention_output_q4_K_batch_tensor` exists (`ds4_metal.m` ~27154) but early-returns on `n_tokens < 32u` — it is prefill-only.
-- Relax `tensor_expect_layout(l->attn_output_a, DS4_TENSOR_Q8_0, …)` at `ds4.c:5641` and the sibling checks at 5539/5541.
-- Output changes. Validation on real review tasks would be needed; perplexity alone would not establish fitness for Neil's use.
-
-### Lead 2 — two machines, tensor parallel over Thunderbolt 5
-
-**Motivation:** Neil has a second M5 Max. `tp_world == 2` support is threaded through `ds4.c` / `ds4_metal.m`, and antirez QA-tests this configuration on `mac-m5max-it` / `mac-m5max-us` over TB5 (his QA doc notes TB5 is preferred but fragile and sometimes requires `ds4` in the foreground).
-
-**Known interaction:** the deferral work in §4.3 is disabled under TP — `g->tp_world != 2` in the `overlap` gate, and `tp_world == 2` short-circuits the defer gate. Whether deferral can be made TP-safe, or whether TP needs it, is undetermined.
-
-### Lead 3 — measure a genuinely full 1M context
-
-**Motivation:** this number does not exist. Everything at "1M" in this document is an allocated window with a ten-token prompt; largest real occupancy tested is 65k. Measured points: ~10 tokens → 20.2 t/s; 65k → 9.5–10.2 t/s. The shape of the curve beyond 65k is unknown. V4.1 has `sliding_window` 128 plus compressed KV, so whether it continues linearly is an open question.
-
-**What it takes:** a ~1M-token prompt. Prefill on the 65k prompt measured ~700 t/s; extrapolating that rate to 1M tokens is itself an assumption.
-
-### Lead 4 — determine why concurrency is flat
-
-**Motivation** [measured]: aggregate throughput 11.0 / 11.2 / 11.3 t/s at concurrency 1 / 2 / 4, per-stream exactly 1/N.
-
-**What to establish:** whether `ds4-server` time-slices slots or batches them into shared forward passes. `server_slot` / `slot_threads` in `ds4_server.c` (~9464, ~9591). The two cases have different implications and I did not distinguish them.
-
-Reproduce with the server on a spare port:
-```bash
-./ds4-server -m gguf/DeepSeek-V4.1-Flash-Q2.gguf --ssd-streaming --metal \
-  --ctx 32768 --host 127.0.0.1 --port 8111
-# then N concurrent POSTs to /v1/completions, measure wall time and summed usage.completion_tokens
-```
-
-### Lead 5 — no-copy mode has no adaptive switch
-
-**Motivation** [measured]: no-copy is +24% at 8k and 4.94 vs 10.21 t/s at 65k. It is selected by a manual env var with no in-code guidance and no context-dependent default.
-
-### Lead 6 — auxiliary models are outside the cache budget
-
-**Motivation** [measured]: `ds4_ssd_auto_cache_plan` ignores both the vision tower and the support model; the cache target is byte-identical with and without each. No memory pressure was observed on this 128 GiB machine (§2).
-
-### Directions where I have contrary evidence
-
-Not prohibitions — the evidence and its weight, for you to weigh:
-
-- **DSpark acceptance tuning.** The measured verify cost caps the feature at 1.5× even at perfect acceptance (§7.2). Changing the verify structure would change that ceiling.
-- **Dispatch-count reduction / kernel fusion.** Extra dispatches measured free (§5, the "twice" experiment, 2 pairs).
-- **Q8_0 matvec micro-optimization.** One vectorization approach (`packed_char4`) measured slightly slower [3 pairs]. That rules out that approach, not all approaches.
-- **Larger expert cache.** 65.63 → 74.99 GiB changed 1M decode by −0.09 t/s [1 run each]. Measured at 1M only.
-
----
-
-## 10. Reference
-
-### Branch state
-```
-branch  ssd-decode-bank-shrink
-HEAD    b77b624
-base    a04f46f  (origin/main now 6e4c285, no conflicts)
-tree    clean, zero compiler warnings
-```
-
-### Code landmarks
-
-`ds4_metal.m`
-```
-13291  ds4_gpu_stream_expert_nocopy_enabled
-15157  "Residency for deferred expert dispatch"  (MTLResidencySet for the bank)
-15530  "Deferred expert residency"               (state, backoff, token mode)
-15584  ds4_gpu_stream_expert_miss_flag           (per-token miss word)
-15646  DS4_METAL_DEFER_BACKOFF_MIN / MAX / FORGIVE
-15732  ds4_gpu_stream_expert_defer_replay_routing
-17604  batched pending loader (no-copy branch)
-17924  load_selected_missing   (no-copy branch, e4b81b1)
-18556  prepare_selected_batch  (no-copy branch, e4b81b1)
-27131  ds4_gpu_dsv41_attention_output_batch      (hardcoded Q8_0 — Lead 1)
-27154  ds4_gpu_attention_output_q4_K_batch_tensor (n_tokens < 32 early-return — Lead 1)
-~41300 ds4_gpu_routed_moe_one_tensor (V4.1) — deferral decision lives here
-```
-
-`ds4.c`
-```
- 5539/5541/5641  tensor_expect_layout attn_output_* Q8_0   (Lead 1)
-~40922  ds41_verify_snapshot_encode
-~41044  decode-side Engram reads
-~41068  ds41_engram_decode_bg   (background layer-14 read)
-~41095  queue_layers / overlap / drain / blocking
-~41210  ds41_graph_step         (deferred decode + rollback wrapper)
-~64470  SSD auto cache plan
-~67600  static weight mlock;  ~67930  support model mlock (276a3fe)
-~78785  ds4_session_ds41_dspark_cycle
-```
-
-`metal/moe.metal`
-```
-~3974  kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32   (raises the miss atomic)
-~6103  kernel_mul_mv_addr_q2_K_sum6_f32             (raises the miss atomic)
-```
-
-### Environment variables added on this branch
-
-| var | effect |
-|---|---|
-| `DS4_METAL_STREAM_EXPERT_NOCOPY=1` | no-copy expert cache |
-| `DS4_METAL_V41_DISABLE_DEFER_EXPERT_SYNC=1` | disable deferred expert residency (default: on) |
-| `DS4_METAL_DISABLE_V41_DECODE_OVERLAP=1` | one command buffer per token instead of async per-layer |
-| `DS4_METAL_MAX_ASYNC_BATCHES=N` | in-flight command buffer cap (default 8) |
-| `DS4_ENGRAM_DECODE_SERIAL=1` | both Engram reads at the head of the token (old behaviour) |
-| `DS4_ENGRAM_DECODE_PROFILE=1` | report Engram decode read cost |
-| `DS4_DISABLE_SUPPORT_MODEL_MLOCK=1` | do not wire DSpark weights |
-| `DS4_METAL_V41_DEFER_DEBUG=1` | print which gate blocked deferral |
-| `DS4_METAL_MODEL_VIEW_DEBUG=1` | dump model-view table on coverage failure |
-| `DS4_METAL_ROUTE_REPEAT=1` | expert routing repeat between tokens (measured 37% expert, 0.6% full-layer) |
-| `DS4_V41_DSPARK_LOG=1` | per-cycle DSpark accounting |
-| `DS4_METAL_V41_DEFER_REPLAY_PRUNE=1` | re-enable pruning in the deferred routing replay (measured worse) |
-
-### Reproduction
-
-Short-context A/B — the best-conditioned measurement on this machine:
-```bash
-P="Write one paragraph explaining how a B-tree differs from a hash index."
-export DS4_METAL_STREAM_EXPERT_NOCOPY=1
-for i in 1 2 3; do
-  ./ds4 --ssd-streaming -m gguf/DeepSeek-V4.1-Flash-Q2.gguf -p "$P" -n 60 --temp 0 \
-    2>&1 | grep -oE "generation: [0-9.]+" | sed "s/^/defer $i /"
-  DS4_METAL_V41_DISABLE_DEFER_EXPERT_SYNC=1 ./ds4 --ssd-streaming \
-    -m gguf/DeepSeek-V4.1-Flash-Q2.gguf -p "$P" -n 60 --temp 0 \
-    2>&1 | grep -oE "generation: [0-9.]+" | sed "s/^/sync  $i /"
-done
-```
-Observed: `defer ≈ 21`, `sync ≈ 18.4`, discarding run 1.
-
-Correctness gate (must stay byte-identical):
-```bash
-P="Explain in detail how a write-ahead log guarantees durability, and why fsync placement matters."
-./ds4 --ssd-streaming -m gguf/DeepSeek-V4.1-Flash-Q2.gguf -p "$P" -n 150 --temp 0 \
-  2>&1 | grep -v "^ds4:" > /tmp/a.txt
-DS4_METAL_V41_DISABLE_DEFER_EXPERT_SYNC=1 ./ds4 --ssd-streaming \
-  -m gguf/DeepSeek-V4.1-Flash-Q2.gguf -p "$P" -n 150 --temp 0 \
-  2>&1 | grep -v "^ds4:" > /tmp/b.txt
-diff /tmp/a.txt /tmp/b.txt && echo IDENTICAL   # 3009 bytes at b77b624
-```
-This was run on two prompts across the branch (2913 B and 3009 B outputs). It is not a general equivalence proof — it is two prompts at 150 tokens.
-
-Re-derive §3: read the GGUF tensor table, compute bytes/weight from **consecutive tensor data offsets**, scale `*_exps` by 6/384, sum. Do not assume type codes.
-
----
-
-## 11. What I would not take on faith
-
-1. **The 546 GB/s peak bandwidth figure is unverified on this hardware.** Every headroom conclusion depends on it. Measure it first.
-2. **No genuinely full 1M-token context has been measured.** All "1M" figures are an allocated window with a short prompt.
-3. **I derived the weight-traffic table wrong twice before §3.** The first error produced a "9% of bandwidth" figure I asserted to Neil and later retracted. Re-derive from file layout.
-4. **Several results rest on single runs** — the support-model mlock throughput delta, the `nsg` sweep, the 65k arms, the cache-size test. They are labelled inline. The deferral result (§4.3) and the concurrency result (§5) are the best-evidenced.
-5. **The engram overlap block's absolute throughput (12.6–12.9) is not comparable** to the §0 table; those runs were almost certainly contended by `ds4-server`. The delta is credible, the absolutes are not.
+Commits, newest first: `1f99c22` hints results + at-exit report; `84f72cd` draft-token hints + no-backoff knob; `3a6f716` mixed native-expert files + loader; `2ab8d79` acceptance flat; `be5b6b6` final sweep table; `5d6cb16` residency leak fix; `e76188a` probe; `dbdb91e` top-k fix; `2dffde7` readahead thread; `bd972fb` whole tail; `1b6df89` bank prefill. Backup branch `backup/ssd-decode-bank-shrink-pre-rebase-*`.
