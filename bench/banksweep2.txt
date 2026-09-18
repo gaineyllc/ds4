@@ -1,0 +1,7 @@
+64GB rep1 gen=17.05 prefill=129.25  peak_wired=86G
+68GB rep1 gen=16.70 prefill=139.92  peak_wired=89G
+64GB rep2 gen=16.92 prefill=137.52  peak_wired=86G
+68GB rep2 gen=16.97 prefill=137.58  peak_wired=90G
+---
+64GB   median 16.98 t/s  samples [16.92, 17.05]
+68GB   median 16.84 t/s  samples [16.7, 16.97]
