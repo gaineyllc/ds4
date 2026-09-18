@@ -41945,12 +41945,130 @@ static bool ds41_probe_init(void) {
     return true;
 }
 
+/* Training-set dump for a real prerouter head (handoff 8 item 4).
+ *
+ * The probe above measures the zero-training warm start: apply layer N+1's
+ * router to layer N's hidden state. It reaches 22.6% recall, and handoff 8 puts
+ * the bar at about 50% of misses before a prefetch hint pays. Closing that gap
+ * needs a trained head, and training one needs (features, target) pairs that
+ * nothing currently writes out.
+ *
+ * DS4_V41_PREROUTE_DUMP=<path> writes one record per (token, layer):
+ *
+ *     uint32 token_index
+ *     uint16 layer
+ *     uint16 n_embd
+ *     int32  actual[DS4_N_EXPERT_USED]   this layer's real selection
+ *     half   norm[n_embd]                post-FFN-norm hidden state
+ *
+ * Offline, pair norm(t, il) with actual(t+1, il+1) to get exactly the
+ * prediction the prefetcher needs. Nothing is buffered across tokens in the
+ * engine: the pairing is a file operation, not a runtime one.
+ *
+ * Half precision because the head does not need more and the file does: at
+ * n_embd 7168, 40 layers and 400 tokens this is ~230 MB per run in fp16
+ * against ~460 MB in fp32. Writes are buffered and the file is closed at exit.
+ *
+ * Diagnostic only. The real router still routes; this reads state that already
+ * exists and changes no output.
+ */
+static FILE *g_probe_dump_fp;
+static uint64_t g_probe_dump_records;
+static float *g_probe_dump_norm;
+static uint16_t *g_probe_dump_half;
+
+static void ds41_probe_dump_close(void) {
+    if (!g_probe_dump_fp) return;
+    fclose(g_probe_dump_fp);
+    g_probe_dump_fp = NULL;
+    fprintf(stderr, "ds4: prerouter dump: %llu records\n",
+            (unsigned long long)g_probe_dump_records);
+}
+
+/* IEEE half, round-to-nearest-even, with the saturating overflow the training
+ * side expects; the hidden state is normalized so the range is never near the
+ * half limit in practice. */
+static uint16_t ds41_probe_f32_to_f16(float f) {
+    uint32_t x;
+    memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (exp >= 0x1F) return (uint16_t)(sign | 0x7C00u);          /* inf */
+    if (exp <= 0) return (uint16_t)sign;                          /* flush */
+    uint16_t h = (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+    /* round to nearest even on the dropped 13 bits */
+    const uint32_t dropped = mant & 0x1FFFu;
+    if (dropped > 0x1000u || (dropped == 0x1000u && (h & 1u))) h++;
+    return h;
+}
+
+static bool ds41_probe_dump_open(uint32_t n_embd) {
+    static int tried;
+    if (tried) return g_probe_dump_fp != NULL;
+    tried = 1;
+    const char *path = getenv("DS4_V41_PREROUTE_DUMP");
+    if (!path || !path[0]) return false;
+    g_probe_dump_fp = fopen(path, "wb");
+    if (!g_probe_dump_fp) {
+        fprintf(stderr, "ds4: prerouter dump: cannot open %s\n", path);
+        return false;
+    }
+    setvbuf(g_probe_dump_fp, NULL, _IOFBF, 1u << 22);
+    g_probe_dump_norm = malloc((size_t)n_embd * sizeof(float));
+    g_probe_dump_half = malloc((size_t)n_embd * sizeof(uint16_t));
+    if (!g_probe_dump_norm || !g_probe_dump_half) {
+        fprintf(stderr, "ds4: prerouter dump: allocation failed\n");
+        fclose(g_probe_dump_fp);
+        g_probe_dump_fp = NULL;
+        return false;
+    }
+    atexit(ds41_probe_dump_close);
+    fprintf(stderr, "ds4: prerouter dump -> %s (n_embd=%u, fp16)\n", path, n_embd);
+    return true;
+}
+
+/* Called from ds41_probe_layer, which already holds both halves. */
+static void ds41_probe_dump_record(ds41_gpu_graph *g, uint32_t il, uint32_t token_index) {
+    const uint32_t n_embd = DS4_N_EMBD;
+    if (!ds41_probe_dump_open(n_embd)) return;
+    if (!g->norm) return;
+
+    if (!ds4_gpu_tensor_read(g->norm, 0, g_probe_dump_norm,
+                             (uint64_t)n_embd * sizeof(float))) return;
+    int32_t actual[DS4_MAX_EXPERT_USED];
+    if (!ds4_gpu_tensor_read(g->selected, 0, actual,
+                             (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t))) return;
+
+    for (uint32_t i = 0; i < n_embd; i++)
+        g_probe_dump_half[i] = ds41_probe_f32_to_f16(g_probe_dump_norm[i]);
+
+    const uint16_t layer16 = (uint16_t)il, embd16 = (uint16_t)n_embd;
+    if (fwrite(&token_index, sizeof(token_index), 1, g_probe_dump_fp) != 1 ||
+        fwrite(&layer16, sizeof(layer16), 1, g_probe_dump_fp) != 1 ||
+        fwrite(&embd16, sizeof(embd16), 1, g_probe_dump_fp) != 1 ||
+        fwrite(actual, sizeof(int32_t), DS4_N_EXPERT_USED, g_probe_dump_fp)
+            != DS4_N_EXPERT_USED ||
+        fwrite(g_probe_dump_half, sizeof(uint16_t), n_embd, g_probe_dump_fp) != n_embd) {
+        fprintf(stderr, "ds4: prerouter dump: write failed, stopping\n");
+        fclose(g_probe_dump_fp);
+        g_probe_dump_fp = NULL;
+        return;
+    }
+    g_probe_dump_records++;
+}
+
 /* Encoded after layer il's real router ran: keep its selection, and predict
  * layer il+1's selection for the next token from g->norm. */
 static bool ds41_probe_layer(ds41_gpu_graph *g, const ds4_model *m, uint32_t il, uint32_t token) {
     if (!g_probe.enabled || !g_probe.w) return true;
     if (!ds4_gpu_tensor_copy(g_probe.actual[il], 0, g->selected, 0,
                              (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t))) return false;
+    /* Key on position, not the token id: ids repeat, and pairing (t, L) with
+     * (t+1, L+1) on a repeated id silently drops most of the set -- a first
+     * collection keyed on the id yielded 273 usable pairs out of 11960
+     * records. */
+    ds41_probe_dump_record(g, il, g->pos);
     if (il + 1u >= DS4_N_LAYER) return true;
     const ds4_layer_weights *n = &g_probe.w->layer[il + 1u];
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? n->ffn_exp_probs_vl : n->ffn_exp_probs_b;
