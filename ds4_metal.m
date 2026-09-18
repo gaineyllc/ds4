@@ -15783,14 +15783,85 @@ static void ds4_gpu_pass_expert_flush(void) {
     g_pass_rows = 0;
 }
 
+/* Is there anything for a popularity prefetcher to fetch?
+ *
+ * Offline analysis of a routing dump put a static per-layer top-12 popularity
+ * list at 40.3% recall of the next token's experts -- ahead of the Edge0
+ * next-layer-router proxy (23.1%), the same-layer previous-token baseline the
+ * engine prefetches today (25.3%), and a ridge head on the hidden state
+ * (28.6%). That makes a static list look like the best hint available.
+ *
+ * But popularity may predict well for the same reason it is useless to
+ * prefetch: eviction is already frequency-with-decay over
+ * g_stream_expert_cache_route_hotness, so the hottest experts per layer are
+ * exactly the ones the bank is keeping. If the top-N are already resident
+ * there is nothing to advise, and the recall number is measuring the part of
+ * routing that never stalls.
+ *
+ * So count it before building the prefetcher: at each pass, for every layer,
+ * how many of the N hottest experts are NOT resident. That is the entire
+ * population a popularity-based prefetch could ever act on.
+ *
+ * Reported with the pass stats. Read-only; changes nothing.
+ */
+enum { DS4_HOT_PREFETCH_N = 12 };
+
+static uint64_t g_hot_checked, g_hot_absent, g_hot_layers;
+
+static void ds4_gpu_pass_hot_residency_sample(void) {
+    if (!ds4_gpu_pass_stats_enabled()) return;
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        /* Top-N by route hotness for this layer, selection-sort style: N is 12
+         * against 384 experts, so a partial scan beats sorting. */
+        uint32_t best[DS4_HOT_PREFETCH_N];
+        uint32_t best_hot[DS4_HOT_PREFETCH_N];
+        uint32_t found = 0;
+        for (uint32_t e = 0; e < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; e++) {
+            const uint32_t h = g_stream_expert_cache_route_hotness[layer][e];
+            if (!h) continue;
+            if (found < DS4_HOT_PREFETCH_N) {
+                best[found] = e; best_hot[found] = h; found++;
+                continue;
+            }
+            uint32_t worst = 0;
+            for (uint32_t i = 1; i < DS4_HOT_PREFETCH_N; i++)
+                if (best_hot[i] < best_hot[worst]) worst = i;
+            if (h > best_hot[worst]) { best[worst] = e; best_hot[worst] = h; }
+        }
+        if (!found) continue;
+        g_hot_layers++;
+        for (uint32_t i = 0; i < found; i++) {
+            g_hot_checked++;
+            if (!g_stream_expert_cache[layer][best[i]].valid) g_hot_absent++;
+        }
+    }
+}
+
+static void ds4_gpu_pass_hot_report(void) {
+    if (!g_hot_checked) return;
+    fprintf(stderr,
+            "ds4: popularity prefetch headroom: top-%d per layer, %llu checked "
+            "over %llu layer-samples, %llu not resident (%.1f%%)\n",
+            DS4_HOT_PREFETCH_N,
+            (unsigned long long)g_hot_checked,
+            (unsigned long long)g_hot_layers,
+            (unsigned long long)g_hot_absent,
+            100.0 * (double)g_hot_absent / (double)g_hot_checked);
+    fprintf(stderr,
+            "ds4:   that percentage is the whole population a static "
+            "popularity prefetch could act on.\n");
+}
+
 /* Called once at the head of a token / verify batch. rows is how many rows the
  * pass will carry, which is what the distinct count has to be read against. */
 void ds4_gpu_stream_expert_pass_begin(uint32_t rows) {
     if (!ds4_gpu_pass_stats_enabled()) return;
     g_pass_begin_calls++;
+    ds4_gpu_pass_hot_residency_sample();
     if (!g_pass_report_armed) {
         g_pass_report_armed = 1;
         atexit(ds4_gpu_pass_expert_report);
+        atexit(ds4_gpu_pass_hot_report);
     }
     ds4_gpu_pass_expert_flush();
     g_pass_rows = rows ? rows : 1u;
