@@ -82699,7 +82699,8 @@ static bool qwen4_batch_spec_next(const ds4_engine *e) {
 #endif
 
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
-                                               int (*accepted)[2], int *n_accepted,
+                                               int (*accepted)[DS4_SPEC_ACCEPTED_MAX],
+                                               int *n_accepted,
                                                char *err, size_t errlen) {
     if (!items || count <= 0 || !accepted || !n_accepted) {
         if (err && errlen) snprintf(err, errlen, "empty speculative decode batch");
@@ -82869,19 +82870,25 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         return 0;
     }
 #endif
-    /* Sequential fallback: one speculative cycle per session. */
+    /* Sequential fallback: one speculative cycle per session.
+     *
+     * The cap here used to be 2, which for DSpark threw away everything past
+     * the second token of a block it had already drafted and verified -- the
+     * work was done and then discarded. Take whatever the cycle commits, up
+     * to DS4_SPEC_ACCEPTED_MAX. */
     for (int i = 0; i < count; i++) {
-        int toks[3];
+        int toks[DS4_SPEC_ACCEPTED_MAX];
         const int room = items[i].session->ctx_size - items[i].session->checkpoint.len;
-        const int n = ds4_session_eval_speculative_argmax(items[i].session, items[i].token, room < 2 ? room : 2, -1,
-                                                          toks, 2, err, errlen);
+        const int want = room < DS4_SPEC_ACCEPTED_MAX ? room : DS4_SPEC_ACCEPTED_MAX;
+        const int n = ds4_session_eval_speculative_argmax(items[i].session, items[i].token, want, -1,
+                                                          toks, want, err, errlen);
         if (n <= 0) {
             for (int j = 0; j < count; j++) ds4_session_invalidate(items[j].session);
             return 1;
         }
-        n_accepted[i] = n;
-        accepted[i][0] = toks[0];
-        accepted[i][1] = n > 1 ? toks[1] : -1;
+        n_accepted[i] = n > DS4_SPEC_ACCEPTED_MAX ? DS4_SPEC_ACCEPTED_MAX : n;
+        for (int t = 0; t < n_accepted[i]; t++) accepted[i][t] = toks[t];
+        for (int t = n_accepted[i]; t < DS4_SPEC_ACCEPTED_MAX; t++) accepted[i][t] = -1;
     }
     return 0;
 }
