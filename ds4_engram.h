@@ -42,6 +42,10 @@ typedef struct {
     int fd;
     uint64_t offset;
     uint32_t rows;
+    /* Zero-copy mapping (spec 3.A). Null base means the table is pread-only. */
+    void *map_base;          /* page-aligned mmap base, MAP_SHARED|PROT_READ */
+    uint64_t map_bytes;      /* mapped length from map_base */
+    uint64_t map_row0;       /* byte offset of row 0 within the mapping */
 } ds4_engram_table;
 
 /* A separate uncached file descriptor, never an mmap or Metal model view.
@@ -70,5 +74,30 @@ bool ds4_engram_reader_start(ds4_engram_reader *reader,
     const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out);
 bool ds4_engram_reader_wait(ds4_engram_reader *reader, unsigned table);
 void ds4_engram_reader_free(ds4_engram_reader *reader);
+/* ---- Zero-copy Engram offload (spec 3.A / 3.B) ----
+ *
+ * Maps the table's row region MAP_SHARED|PROT_READ and applies MADV_RANDOM so
+ * the kernel does not run its sequential read-ahead over a 94 GiB table and
+ * burn queue depth on rows no token asked for. The mapping is page-aligned
+ * below the table's GGUF offset; map_row0 carries the leading slack so row r
+ * lives at map_base + map_row0 + r * DS4_ENGRAM_ROW_BYTES.
+ *
+ * The mapping is additive: the pread path stays valid on the same table, and
+ * a failed map leaves the table usable (map_base stays NULL). */
+bool ds4_engram_table_map(ds4_engram_table *table);
+void ds4_engram_table_unmap(ds4_engram_table *table);
+
+/* Byte range of one row inside the mapping, for the Metal buffer's inner
+ * offset. Returns false if the table is not mapped or the row is out of range. */
+bool ds4_engram_row_span(const ds4_engram_table *table, uint32_t row,
+                         uint64_t *inner_offset, uint64_t *bytes);
+
+/* Stage rows into the unified page cache ahead of the GPU (spec 3.B.2).
+ * posix_madvise(WILLNEED) over the pages covering each row; adjacent rows are
+ * coalesced into one advise per contiguous page run. Advisory only: it never
+ * blocks on I/O and never changes what a later read returns. Returns the
+ * number of advise calls issued, or 0 when the table is not mapped. */
+size_t ds4_engram_prefetch_rows(const ds4_engram_table *table,
+                                const uint32_t *rows, size_t count);
 
 #endif

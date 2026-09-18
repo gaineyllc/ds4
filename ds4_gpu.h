@@ -3732,6 +3732,73 @@ int ds4_gpu_qwen4_mtp_stage_tensor(
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
+/* ---- Zero-copy Engram table binding (spec 3.A.3) ----
+ *
+ * Wraps an Engram table's mmap (ds4_engram_table_map) in a no-copy Metal
+ * buffer and holds it in a residency set, so a kernel can read FP8 rows
+ * straight from the file-backed pages with no staging copy and no device
+ * allocation. index selects the table (0 or 1).
+ *
+ * The caller keeps ownership of the mapping: unbind before unmapping, or the
+ * buffer outlives its pages. Binding a table twice replaces the previous
+ * buffer. Returns false if the device is unavailable or the range cannot be
+ * wrapped, in which case the pread path remains the only reader. */
+bool ds4_gpu_engram_bind_table(uint32_t index, const void *map_base, uint64_t map_bytes);
+void ds4_gpu_engram_unbind_table(uint32_t index);
+bool ds4_gpu_engram_table_bound(uint32_t index);
+
+/* Row byte offset within the mapping (from ds4_engram_row_span) to the flat
+ * GPU address the fused gather-gate kernel dereferences. 0 means the row is
+ * not addressable, which the kernel treats as a dead row and skips. */
+uint64_t ds4_gpu_engram_row_address(uint32_t index, uint64_t inner_offset);
+
+/* Dispatch the fused gather-gate over tokens*cols rows. row_addrs comes from
+ * ds4_gpu_engram_row_address (0 = dead row). accumulate adds into residual in
+ * place; otherwise it writes, for parity checks against the pread path. */
+bool ds4_gpu_engram_gather_gate(ds4_gpu_tensor *residual,
+                               const uint64_t *row_addrs,
+                               const float *gate_logits,
+                               uint32_t tokens,
+                               uint32_t cols,
+                               uint32_t dim,
+                               uint32_t stride,
+                               bool accumulate,
+                               uint64_t wait_ticket);
+
+/* Engram prefetch ring (spec Phase 3). Reserve a ticket before advising pages,
+ * signal it once the advise calls are issued, and pass it as wait_ticket so the
+ * dispatch waits on the queue instead of faulting inside the kernel. Ticket 0
+ * means no ordering. */
+uint64_t ds4_gpu_engram_prefetch_ticket(void);
+void ds4_gpu_engram_prefetch_signal(uint64_t ticket);
+uint64_t ds4_gpu_engram_prefetch_signaled(void);
+
+/* Gather + dequantize a token's rows into a tensor, the GPU drop-in for
+ * ds4_engram_read + ds4_gpu_tensor_write. No gate -- ds4 applies that
+ * downstream, so this must reproduce ds4_engram_read's output exactly.
+ * map_row0 is the mapping's page-alignment slack (ds4_engram_table.map_row0).
+ * Output layout is [cols][dim] floats. */
+bool ds4_gpu_engram_gather_rows(uint32_t table_index,
+                               ds4_gpu_tensor *out,
+                               const uint32_t *row_ids,
+                               uint32_t cols,
+                               uint32_t dim,
+                               uint64_t map_row0,
+                               uint64_t wait_ticket);
+
+/* Batch form: `tokens` groups of `cols` row ids, `stride` ids apart (the V4.1
+ * verify batch interleaves both tables, so its stride is 2*COLS). Output is
+ * [tokens][cols][dim], matching ds4_engram_read_batch. */
+bool ds4_gpu_engram_gather_rows_strided(uint32_t table_index,
+                                        ds4_gpu_tensor *out,
+                                        const uint32_t *row_ids,
+                                        uint32_t tokens,
+                                        uint32_t stride,
+                                        uint32_t cols,
+                                        uint32_t dim,
+                                        uint64_t map_row0,
+                                        uint64_t wait_ticket);
+
 #ifdef __cplusplus
 }
 #endif
