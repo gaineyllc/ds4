@@ -553,8 +553,14 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
  * n_accepted[i] how many; the session's logits then follow its last
  * committed token.  Engines without native batching run one cycle per
  * session in turn. */
+/* Widest speculative commit one batched decode step can return per session.
+ * The legacy MTP paths commit at most 2; DSpark commits up to its block size
+ * (5 for V4.1 Flash). This was [2] everywhere, which silently truncated a
+ * DSpark block to its first two tokens. */
+#define DS4_SPEC_ACCEPTED_MAX 16
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
-                                               int (*accepted)[2], int *n_accepted,
+                                               int (*accepted)[DS4_SPEC_ACCEPTED_MAX],
+                                               int *n_accepted,
                                                char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
