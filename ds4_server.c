@@ -10034,7 +10034,7 @@ struct server_slot {
     bool decode_done;
     int decode_token;
     bool decode_speculative;
-    int decode_accepted[2];
+    int decode_accepted[DS4_SPEC_ACCEPTED_MAX];
     int decode_accepted_count;
     int decode_rc;
     char decode_err[160];
@@ -10160,6 +10160,14 @@ struct server {
     pthread_cond_t model_cv;
     bool model_busy;
     bool qwen4_batch_mtp;
+    /* V4.1 DSpark in batched mode. The speculative branch below was gated
+     * on qwen4_batch_mtp alone, so a DeepSeek V4.1 engine with a DSpark
+     * drafter loaded never took it: every slot went down the plain path and
+     * decoded one token at a time, with the drafter loaded and idle. DSpark
+     * is live in the CLI and in non-batched server mode (the branch above
+     * keys off ds4_engine_mtp_draft_tokens(), which returns DSpark's block
+     * size); batched mode was the only place it was switched off. */
+    bool ds41_batch_dspark;
     bool model_stopping;
     int decode_pending;
     int active_generations;
@@ -13234,7 +13242,8 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
 }
 
 static int server_eval_tokens(server *s, server_slot *slot, int token,
-                              bool speculative, int accepted[2], int *n_accepted,
+                              bool speculative, int accepted[DS4_SPEC_ACCEPTED_MAX],
+                              int *n_accepted,
                               char *err, size_t errlen) {
     *n_accepted = 0;
     if (!s || !slot) return 1;
@@ -13307,7 +13316,7 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
 
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen) {
-    int accepted[2], count;
+    int accepted[DS4_SPEC_ACCEPTED_MAX], count;
     return server_eval_tokens(s, slot, token, false, accepted, &count, err, errlen);
 }
 
@@ -13333,7 +13342,8 @@ static void *decode_worker_main(void *arg) {
     server *s = arg;
     ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
-    int (*accepted)[2] = xmalloc((size_t)s->slot_count * sizeof(*accepted));
+    int (*accepted)[DS4_SPEC_ACCEPTED_MAX] =
+        xmalloc((size_t)s->slot_count * sizeof(*accepted));
     int *n_accepted = xmalloc((size_t)s->slot_count * sizeof(*n_accepted));
     const long coalesce_us = server_decode_coalesce_us();
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
@@ -14055,7 +14065,7 @@ decode_again:
             break;
         }
 
-        int toks[17];
+        int toks[DS4_SPEC_ACCEPTED_MAX + 1];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
         if (!s->batched_mode &&
@@ -14079,7 +14089,9 @@ decode_again:
                 finish = "error";
                 break;
             }
-        } else if (s->batched_mode && s->qwen4_batch_mtp &&
+        } else if (s->batched_mode &&
+                   (s->qwen4_batch_mtp ||
+                    (s->ds41_batch_dspark && temperature == 0.0f)) &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -16019,6 +16031,13 @@ int main(int argc, char **argv) {
     s.batched_mode = cfg.batched_sessions > 0;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
+    /* mtp_draft_tokens() returns the DSpark block size only when the drafter is
+     * loaded and enabled, so it doubles as the "DSpark is live" test here.
+     * DS4_V41_DISABLE_SERVER_DSPARK restores the old behaviour. */
+    s.ds41_batch_dspark = cfg.engine.backend == DS4_BACKEND_METAL &&
+                       ds4_engine_is_deepseek41(engine) &&
+                       ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                       getenv("DS4_V41_DISABLE_SERVER_DSPARK") == NULL;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
@@ -16074,7 +16093,11 @@ int main(int argc, char **argv) {
                    server_prefill_quantum_for(&s, false),
                    server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
-        if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
+        if (s.ds41_batch_dspark) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: DSpark speculative decoding active in batched mode (block=%d, greedy requests only)",
+                       ds4_engine_mtp_draft_tokens(engine));
+        } else if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }
