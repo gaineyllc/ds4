@@ -80953,8 +80953,17 @@ static bool glm53_graph_encode_native_session_batch(
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
                                           const ds4_engine *e) {
-    if (!items || count < 2 || count > DS4_TP_BATCH_MAX_ROWS || !e ||
-        e->support_kind != DS4_SUPPORT_NONE)
+    if (!items || count < 2 || count > DS4_TP_BATCH_MAX_ROWS || !e)
+        return false;
+    /* Upstream (a04f46f) refuses any loaded support model here, which means a
+     * DSpark build never batches sessions at all -- they decode one at a time.
+     * Whether lifting it helps is a bank question, not a correctness one: more
+     * rows per pass means more distinct experts per layer, and at 40% bank
+     * residency more distinct experts means more misses. Opt-in until measured.
+     * DSpark itself still runs one cycle per session; this only governs the
+     * plain (non-speculative) batch. */
+    if (e->support_kind != DS4_SUPPORT_NONE &&
+        getenv("DS4_V41_ALLOW_SUPPORT_SESSION_BATCH") == NULL)
         return false;
     /* Handoff 5.5: cross-session batching raises throughput but also raises
      * the distinct experts touched per layer per pass, and at ~55% bank
