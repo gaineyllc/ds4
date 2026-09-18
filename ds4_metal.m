@@ -15562,6 +15562,163 @@ static void ds4_gpu_stream_expert_cache_note_route_hotness(
     }
 }
 
+/* ---- Distinct routed experts per layer, per pass (handoff 5.5) ----
+ *
+ * Cross-session batching for V4.1 already exists (ds41_sessions_batch_supported
+ * admits up to DS4_TP_BATCH_MAX_ROWS sessions into one pass, and the
+ * address-table kernels read each expert's weights once per layer for every
+ * row that routes to it). What did not exist is the guard the handoff calls
+ * for: N sessions' rows can touch up to N*6 distinct experts per layer instead
+ * of 6, and at ~55% bank residency more distinct experts per pass means more
+ * misses, which is already half the cycle. Cross-session batching helps when
+ * the bank fits and hurts when it does not.
+ *
+ * A cap cannot be set from the worst case, because rows share experts far more
+ * often than the worst case assumes -- and nobody has measured by how much. So
+ * this counts the real thing: distinct experts per layer per pass, and how many
+ * of those were cache misses, bucketed by how many rows the pass carried.
+ *
+ * DS4_V41_BATCH_EXPERT_STATS=1 prints the table at exit.
+ * DS4_V41_BATCH_MAX_DISTINCT=<n> turns the measurement into a limit: admission
+ * asks ds4_gpu_stream_expert_batch_row_limit() how many rows keep the observed
+ * distinct-per-row ratio under n. 0 (the default) leaves admission unchanged.
+ */
+enum {
+    DS4_PASS_EXPERT_WORDS =
+        (DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT + 63u) / 64u,
+    DS4_PASS_MAX_ROW_BUCKET = 9,   /* rows 1..8 plus an overflow bucket */
+};
+
+static uint64_t g_pass_seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_PASS_EXPERT_WORDS];
+static uint32_t g_pass_distinct[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint32_t g_pass_missing[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint32_t g_pass_touched_layers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint32_t g_pass_rows;
+static int      g_pass_stats_enabled = -1;
+
+/* [row bucket] accumulators, summed over layers and passes. */
+static uint64_t g_pass_bucket_passes[DS4_PASS_MAX_ROW_BUCKET];
+static uint64_t g_pass_bucket_layers[DS4_PASS_MAX_ROW_BUCKET];
+static uint64_t g_pass_bucket_distinct[DS4_PASS_MAX_ROW_BUCKET];
+static uint64_t g_pass_bucket_missing[DS4_PASS_MAX_ROW_BUCKET];
+static uint64_t g_pass_bucket_maxdistinct[DS4_PASS_MAX_ROW_BUCKET];
+static int      g_pass_report_armed;
+
+static int ds4_gpu_pass_stats_enabled(void) {
+    if (g_pass_stats_enabled < 0) {
+        g_pass_stats_enabled = (getenv("DS4_V41_BATCH_EXPERT_STATS") != NULL ||
+                                getenv("DS4_V41_BATCH_MAX_DISTINCT") != NULL) ? 1 : 0;
+    }
+    return g_pass_stats_enabled;
+}
+
+static void ds4_gpu_pass_expert_report(void) {
+    uint64_t any = 0;
+    for (int b = 0; b < DS4_PASS_MAX_ROW_BUCKET; b++) any += g_pass_bucket_passes[b];
+    if (!any) return;
+    fprintf(stderr,
+            "ds4: routed experts per layer per pass (rows -> distinct):\n");
+    for (int b = 1; b < DS4_PASS_MAX_ROW_BUCKET; b++) {
+        if (!g_pass_bucket_passes[b]) continue;
+        const double layers = (double)g_pass_bucket_layers[b];
+        fprintf(stderr,
+                "ds4:   rows=%s%d passes=%llu layers=%llu distinct/layer avg=%.2f "
+                "max=%llu (worst case %d) missing/layer avg=%.2f\n",
+                b == DS4_PASS_MAX_ROW_BUCKET - 1 ? ">=" : "", b,
+                (unsigned long long)g_pass_bucket_passes[b],
+                (unsigned long long)g_pass_bucket_layers[b],
+                layers ? (double)g_pass_bucket_distinct[b] / layers : 0.0,
+                (unsigned long long)g_pass_bucket_maxdistinct[b],
+                b * 6,
+                layers ? (double)g_pass_bucket_missing[b] / layers : 0.0);
+    }
+}
+
+/* Fold the pass that just ended into the buckets, then clear for the next. */
+static void ds4_gpu_pass_expert_flush(void) {
+    if (!g_pass_rows) return;
+    int b = (int)g_pass_rows;
+    if (b >= DS4_PASS_MAX_ROW_BUCKET) b = DS4_PASS_MAX_ROW_BUCKET - 1;
+
+    uint64_t layers = 0, distinct = 0, missing = 0, peak = 0;
+    for (uint32_t l = 0; l < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; l++) {
+        if (!g_pass_touched_layers[l]) continue;
+        layers++;
+        distinct += g_pass_distinct[l];
+        missing += g_pass_missing[l];
+        if (g_pass_distinct[l] > peak) peak = g_pass_distinct[l];
+        memset(g_pass_seen[l], 0, sizeof(g_pass_seen[l]));
+        g_pass_distinct[l] = 0;
+        g_pass_missing[l] = 0;
+        g_pass_touched_layers[l] = 0;
+    }
+    if (layers) {
+        g_pass_bucket_passes[b]++;
+        g_pass_bucket_layers[b] += layers;
+        g_pass_bucket_distinct[b] += distinct;
+        g_pass_bucket_missing[b] += missing;
+        if (peak > g_pass_bucket_maxdistinct[b]) g_pass_bucket_maxdistinct[b] = peak;
+    }
+    g_pass_rows = 0;
+}
+
+/* Called once at the head of a token / verify batch. rows is how many rows the
+ * pass will carry, which is what the distinct count has to be read against. */
+void ds4_gpu_stream_expert_pass_begin(uint32_t rows) {
+    if (!ds4_gpu_pass_stats_enabled()) return;
+    if (!g_pass_report_armed) {
+        g_pass_report_armed = 1;
+        atexit(ds4_gpu_pass_expert_report);
+    }
+    ds4_gpu_pass_expert_flush();
+    g_pass_rows = rows ? rows : 1u;
+}
+
+static void ds4_gpu_pass_note_experts(uint32_t layer, const int32_t *ids, uint32_t n) {
+    if (!ds4_gpu_pass_stats_enabled() || !g_pass_rows) return;
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || !ids) return;
+    g_pass_touched_layers[layer] = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] < 0 ||
+            (uint32_t)ids[i] >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
+        const uint32_t e = (uint32_t)ids[i];
+        uint64_t *word = &g_pass_seen[layer][e >> 6];
+        const uint64_t bit = 1ull << (e & 63u);
+        if (*word & bit) continue;      /* another row already routed here */
+        *word |= bit;
+        g_pass_distinct[layer]++;
+        if (!g_stream_expert_cache[layer][e].valid) g_pass_missing[layer]++;
+    }
+}
+
+/* Rows admission may take without pushing distinct experts per layer past
+ * DS4_V41_BATCH_MAX_DISTINCT. Uses the measured distinct-per-row ratio rather
+ * than the 6-per-row worst case, because rows share experts: with no
+ * measurement yet it falls back to the worst case, which is conservative. */
+uint32_t ds4_gpu_stream_expert_batch_row_limit(uint32_t desired) {
+    const char *env = getenv("DS4_V41_BATCH_MAX_DISTINCT");
+    if (!env || !desired) return desired;
+    const unsigned long long ceiling = strtoull(env, NULL, 10);
+    if (ceiling == 0) return desired;
+
+    uint64_t layers = 0, distinct = 0, rows_weighted = 0;
+    for (int b = 1; b < DS4_PASS_MAX_ROW_BUCKET; b++) {
+        if (!g_pass_bucket_layers[b]) continue;
+        layers += g_pass_bucket_layers[b];
+        distinct += g_pass_bucket_distinct[b];
+        rows_weighted += g_pass_bucket_layers[b] * (uint64_t)b;
+    }
+    /* distinct experts per row, measured; 6.0 until there is data. */
+    double per_row = 6.0;
+    if (layers && rows_weighted) {
+        per_row = (double)distinct / (double)rows_weighted;
+        if (per_row < 0.25) per_row = 0.25;
+    }
+    uint32_t limit = (uint32_t)((double)ceiling / per_row);
+    if (limit < 1) limit = 1;
+    return limit < desired ? limit : desired;
+}
+
 static void ds4_gpu_stream_expert_cache_note_selected_hotness(
         uint32_t       layer,
         const int32_t *selected_ids,
@@ -16712,6 +16869,7 @@ static void ds4_gpu_stream_expert_defer_replay_routing(void) {
 
         ds4_gpu_stream_expert_hint_note(layer, row, ids, n_expert);
         ds4_gpu_stream_expert_cache_note_selected_hotness(layer, ids, n_expert);
+        ds4_gpu_pass_note_experts(layer, ids, n_expert);
         ds4_gpu_expert_prefetch_record(layer,
                                        n->model_map,
                                        n->model_size,
@@ -19987,6 +20145,7 @@ int ds4_gpu_stream_expert_cache_seed_selected(
     ds4_gpu_stream_expert_cache_note_selected_hotness(layer,
                                                       selected_ids,
                                                       n_selected);
+    ds4_gpu_pass_note_experts(layer, selected_ids, n_selected);
     for (uint32_t i = 0; i < n_selected; i++) {
         if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
             fprintf(stderr,
@@ -41016,6 +41175,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                 ds4_gpu_stream_expert_cache_note_selected_hotness(layer_index,
                                                                   stream_selected_ids,
                                                                   n_expert);
+                ds4_gpu_pass_note_experts(layer_index, stream_selected_ids, n_expert);
                 if (!ds4_gpu_moe_selected_hotlist_record(layer_index,
                                                          stream_selected_ids,
                                                          n_expert,
@@ -45047,6 +45207,7 @@ int ds4_gpu_routed_moe_one_tensor(
                 ds4_gpu_stream_expert_cache_note_selected_hotness(layer_index,
                                                                   selected_ids,
                                                                   n_expert);
+                ds4_gpu_pass_note_experts(layer_index, selected_ids, n_expert);
                 if (!ds4_gpu_moe_selected_trace_record(selected_ids, n_expert) ||
                     !ds4_gpu_moe_selected_hotlist_record(layer_index,
                                                          selected_ids,
