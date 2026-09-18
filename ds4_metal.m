@@ -15582,6 +15582,20 @@ static void ds4_gpu_stream_expert_cache_note_route_hotness(
  * DS4_V41_BATCH_MAX_DISTINCT=<n> turns the measurement into a limit: admission
  * asks ds4_gpu_stream_expert_batch_row_limit() how many rows keep the observed
  * distinct-per-row ratio under n. 0 (the default) leaves admission unchanged.
+ *
+ * SAMPLING BIAS, read before trusting a number out of this. The host only
+ * learns a layer's routing when it reads the router back, and under deferred
+ * expert sync it never does -- routing is resolved on the GPU, which is the
+ * point of the deferral. So the only decode passes this can see are the
+ * deferred REDO passes, which are by construction the passes that missed.
+ * Distinct-experts-per-layer should carry over (routing distinctness has no
+ * obvious reason to correlate with missing), but missing-per-layer is an
+ * overestimate of the typical pass and must not be read as an average.
+ * First run, 16k DSpark: 5 sampled passes, all redos -- rows=2 -> 10.00
+ * distinct, rows=4 -> 16.00, rows=5 -> 24.67. Treat as an order of magnitude,
+ * not a calibration. An unbiased sample costs a router readback per pass,
+ * which is exactly the stall the deferral exists to avoid; that trade is the
+ * reason this instrument is opt-in.
  */
 enum {
     DS4_PASS_EXPERT_WORDS =
@@ -15603,6 +15617,10 @@ static uint64_t g_pass_bucket_distinct[DS4_PASS_MAX_ROW_BUCKET];
 static uint64_t g_pass_bucket_missing[DS4_PASS_MAX_ROW_BUCKET];
 static uint64_t g_pass_bucket_maxdistinct[DS4_PASS_MAX_ROW_BUCKET];
 static int      g_pass_report_armed;
+/* Coverage counters. Without these the report cannot be told apart from an
+ * instrument that never fired: in the deferred path the host never reads the
+ * router back at all, so a silent zero is the expected state, not a bug. */
+static uint64_t g_pass_begin_calls, g_pass_note_calls;
 
 static int ds4_gpu_pass_stats_enabled(void) {
     if (g_pass_stats_enabled < 0) {
@@ -15615,9 +15633,19 @@ static int ds4_gpu_pass_stats_enabled(void) {
 static void ds4_gpu_pass_expert_report(void) {
     uint64_t any = 0;
     for (int b = 0; b < DS4_PASS_MAX_ROW_BUCKET; b++) any += g_pass_bucket_passes[b];
-    if (!any) return;
     fprintf(stderr,
-            "ds4: routed experts per layer per pass (rows -> distinct):\n");
+            "ds4: routed experts per layer per pass: pass_begin=%llu "
+            "routing_readbacks=%llu sampled_passes=%llu\n",
+            (unsigned long long)g_pass_begin_calls,
+            (unsigned long long)g_pass_note_calls,
+            (unsigned long long)any);
+    if (!any) {
+        fprintf(stderr,
+                "ds4:   no pass sampled -- the host never read the router back. "
+                "Expected under deferred expert sync, which resolves routing on "
+                "the GPU by design.\n");
+        return;
+    }
     for (int b = 1; b < DS4_PASS_MAX_ROW_BUCKET; b++) {
         if (!g_pass_bucket_passes[b]) continue;
         const double layers = (double)g_pass_bucket_layers[b];
@@ -15666,6 +15694,7 @@ static void ds4_gpu_pass_expert_flush(void) {
  * pass will carry, which is what the distinct count has to be read against. */
 void ds4_gpu_stream_expert_pass_begin(uint32_t rows) {
     if (!ds4_gpu_pass_stats_enabled()) return;
+    g_pass_begin_calls++;
     if (!g_pass_report_armed) {
         g_pass_report_armed = 1;
         atexit(ds4_gpu_pass_expert_report);
@@ -15677,6 +15706,7 @@ void ds4_gpu_stream_expert_pass_begin(uint32_t rows) {
 static void ds4_gpu_pass_note_experts(uint32_t layer, const int32_t *ids, uint32_t n) {
     if (!ds4_gpu_pass_stats_enabled() || !g_pass_rows) return;
     if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || !ids) return;
+    g_pass_note_calls++;
     g_pass_touched_layers[layer] = 1;
     for (uint32_t i = 0; i < n; i++) {
         if (ids[i] < 0 ||
@@ -16223,7 +16253,7 @@ static void ds4_gpu_stream_expert_bank_report(uint32_t new_tokens) {
     if (@available(macOS 15.0, *)) {
         members = (unsigned long)[g_stream_expert_cache_residency_members count];
         retired = (unsigned long)[g_stream_expert_cache_residency_retired count];
-        pending = (unsigned long)[g_stream_expert_cache_residency_pending count];
+        /* No pending set on this base: membership changes publish directly. */
     }
 #endif
     fprintf(stderr, "ds4: bank at prefill: tokens=%u entries=%u owned_views=%lld (%.2f GiB) "
@@ -16630,6 +16660,182 @@ static id<MTLBuffer> ds4_gpu_stream_expert_miss_flag(void) {
     return b;
 }
 
+/* ---- Early miss reads: start the SSD before the drain (handoff 5.1 item 2) --
+ *
+ * A deferred token runs all 40 layers without the host reading the router, then
+ * discovers its misses at the end and installs them. The install is a cold NVMe
+ * read (~2 ms per 9.49 MiB expert) that starts only once the GPU has fully
+ * drained -- so the disk sits idle through the whole pass and then the token
+ * waits on it. Handoff 4 puts expert-miss stops at roughly 55 ms of a ~100 ms
+ * cycle, and 80-95% of that window the SSD is doing nothing.
+ *
+ * The ids exist on the GPU the moment a layer's router resolves, and the
+ * selected buffer is MTLResourceStorageModeShared, so the host can read it --
+ * it just has no way to know when a given layer's write has landed. That is
+ * what the shared event supplies: the command buffer signals layer L's value
+ * right after L's MoE dispatch, and a listener block reads L's ids and issues
+ * F_RDADVISE for whichever experts are not resident, while the GPU is still
+ * working on L+1..39.
+ *
+ * SAFETY, and the reason this cannot change output. The listener only issues
+ * read-ahead advisories. It never installs an expert, never evicts one, never
+ * touches the residency set, and never writes cache state. It reads
+ * g_stream_expert_cache[].valid racily against the main thread on purpose: a
+ * stale answer costs one wasted advise or one missed prefetch, and F_RDADVISE
+ * has no semantic effect beyond warming the page cache. Correctness stays
+ * entirely with the existing install-on-redo path.
+ *
+ * MEASURED 2026-09-17, and the reason it is OFF by default. Interleaved
+ * A/B/A/B at 16k (abab.sh, medians): off 13.89 t/s, on 13.72 t/s, -1.2%.
+ * Not because the idea is wrong -- because there is almost nothing to apply
+ * it to. A 400-token run signalled 64 layers total, about 1.6 deferred passes
+ * out of 187 verify batches. The deferred path is gated off:
+ *
+ *     deferred tokens=0 redos=5 backed_off=181
+ *
+ * Every token is either in backoff cooldown (181) or cold-skipped for a short
+ * warm streak; g_stream_expert_defer_tokens never increments at all. Capping
+ * the backoff does not open the gate either: DS4_METAL_V41_DEFER_BACKOFF_MAX=16
+ * measured 13.72 vs 13.92 (-1.4%) and traded 5 redos for 12 while backed_off
+ * stayed at 181 -- shorter cooldowns, more of them, same total, more redos.
+ *
+ * So at a 36 GB bank the whole deferred-expert machinery is dormant, and with
+ * it both of handoff 5.1's stop-cost items. Anything aimed at deferred misses
+ * is aimed at roughly 3% of the work. This code is correct and stays for the
+ * bank size where deferral is viable; it is not a decode lever here.
+ *
+ * DS4_METAL_V41_EARLY_MISS_READS=1 enables it.
+ */
+static id<MTLSharedEvent> g_defer_early_event;
+static MTLSharedEventListener *g_defer_early_listener;
+static uint64_t g_defer_early_value;
+static uint64_t g_defer_early_layers, g_defer_early_experts, g_defer_early_bytes;
+static int g_defer_early_report_armed;
+
+static int ds4_gpu_defer_early_enabled(void) {
+    static int checked = 0, enabled = 0;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_EARLY_MISS_READS");
+        enabled = e && atoi(e) != 0;   /* off by default; see the note above */
+        checked = 1;
+    }
+    return enabled;
+}
+
+static void ds4_gpu_defer_early_report(void) {
+    if (!g_defer_early_layers) return;
+    fprintf(stderr,
+            "ds4: early miss reads: layers=%llu experts=%llu (%.2f GiB advised "
+            "before drain)\n",
+            (unsigned long long)g_defer_early_layers,
+            (unsigned long long)g_defer_early_experts,
+            ds4_gpu_gib(g_defer_early_bytes));
+}
+
+static bool ds4_gpu_defer_early_ready(void) {
+    if (!ds4_gpu_defer_early_enabled()) return false;
+#if TARGET_OS_OSX
+    if (@available(macOS 10.14, *)) {
+        if (g_defer_early_event) return true;
+        if (!g_device) return false;
+        g_defer_early_event = [g_device newSharedEvent];
+        if (!g_defer_early_event) return false;
+        g_defer_early_event.label = @"ds4_defer_early_miss";
+        g_defer_early_listener = [[MTLSharedEventListener alloc]
+                initWithDispatchQueue:dispatch_get_global_queue(
+                        QOS_CLASS_USER_INITIATED, 0)];
+        if (!g_defer_early_listener) { g_defer_early_event = nil; return false; }
+        if (!g_defer_early_report_armed) {
+            g_defer_early_report_armed = 1;
+            atexit(ds4_gpu_defer_early_report);
+        }
+        return true;
+    }
+#endif
+    return false;
+}
+
+/* Runs on the listener queue once layer's dispatch has completed on the GPU.
+ * Advisory only -- see the safety note above. */
+static void ds4_gpu_defer_early_scan(uint32_t layer) {
+    if (layer >= DS4_METAL_DEFER_MAX_LAYER) return;
+    const ds4_gpu_stream_expert_defer_note *n = &g_stream_expert_defer_notes[layer];
+    if (!n->valid || !n->selected_buf || !n->n_expert) return;
+
+    const uint32_t rows = 1u; /* notes are single-row on this base */
+    const uint64_t count = (uint64_t)rows * n->n_expert;
+    if (count == 0 || count > 4096) return;
+
+    const int32_t *ids =
+        (const int32_t *)((const char *)[n->selected_buf contents] + n->selected_off);
+    if (!ids) return;
+
+    /* Three ranges per expert (gate, up, down); dedupe so a batch whose rows
+     * share an expert advises it once. */
+    enum { EARLY_MAX_EXPERTS = 256 };
+    ds4_gpu_stream_expert_ra_range ranges[EARLY_MAX_EXPERTS * 3];
+    int32_t seen[EARLY_MAX_EXPERTS];
+    uint32_t n_seen = 0, n_ranges = 0;
+    uint64_t bytes = 0;
+
+    for (uint64_t i = 0; i < count && n_seen < EARLY_MAX_EXPERTS; i++) {
+        const int32_t id = ids[i];
+        if (id < 0 || (uint32_t)id >= n->n_total_expert ||
+            (uint32_t)id >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
+        bool dup = false;
+        for (uint32_t s = 0; s < n_seen; s++) if (seen[s] == id) { dup = true; break; }
+        if (dup) continue;
+        seen[n_seen++] = id;
+        /* Racy read of foreign state, deliberately: a wrong answer costs one
+         * advise, never correctness. */
+        if (g_stream_expert_cache[layer][(uint32_t)id].valid) continue;
+
+        const uint64_t gate_rel = (uint64_t)id * n->gate_expert_bytes;
+        const uint64_t down_rel = (uint64_t)id * n->down_expert_bytes;
+        ranges[n_ranges].offset = n->gate_offset + gate_rel;
+        ranges[n_ranges++].len = n->gate_expert_bytes;
+        ranges[n_ranges].offset = n->up_offset + gate_rel;
+        ranges[n_ranges++].len = n->gate_expert_bytes;
+        ranges[n_ranges].offset = n->down_offset + down_rel;
+        ranges[n_ranges++].len = n->down_expert_bytes;
+        bytes += 2u * n->gate_expert_bytes + n->down_expert_bytes;
+        g_defer_early_experts++;
+    }
+    if (!n_ranges) return;
+    g_defer_early_layers++;
+    g_defer_early_bytes += bytes;
+    /* Already on a background queue: issue directly rather than hopping again. */
+    for (uint32_t i = 0; i < n_ranges; i++) {
+        ds4_gpu_stream_expert_readahead_range(ranges[i].offset, ranges[i].len);
+    }
+}
+
+/* Encode layer's completion signal into the batch command buffer and arm the
+ * listener. Called right after the layer's deferred MoE dispatch is encoded. */
+static void ds4_gpu_defer_early_arm(uint32_t layer) {
+    if (!ds4_gpu_defer_early_ready()) return;
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    if (!cb) return;
+#if TARGET_OS_OSX
+    if (@available(macOS 10.14, *)) {
+        /* encodeSignalEvent is a command-buffer operation, so the open compute
+         * encoder has to end first. That costs an encoder boundary per
+         * deferred layer, which is the price of learning the routing early --
+         * whether it is worth paying is what the A/B measures, and
+         * DS4_METAL_V41_EARLY_MISS_READS=0 is the off switch. */
+        ds4_gpu_close_batch_encoder();
+        const uint64_t v = ++g_defer_early_value;
+        [cb encodeSignalEvent:g_defer_early_event value:v];
+        [g_defer_early_event notifyListener:g_defer_early_listener
+                                    atValue:v
+                                      block:^(id<MTLSharedEvent> e, uint64_t val) {
+            (void)e; (void)val;
+            ds4_gpu_defer_early_scan(layer);
+        }];
+    }
+#endif
+}
+
 static void ds4_gpu_stream_expert_defer_note_layer(
         uint32_t layer,
         id<MTLBuffer> selected_buf,
@@ -16867,7 +17073,7 @@ static void ds4_gpu_stream_expert_defer_replay_routing(void) {
         }
         if (!usable) continue;
 
-        ds4_gpu_stream_expert_hint_note(layer, row, ids, n_expert);
+        ds4_gpu_stream_expert_hint_note(layer, 0u, ids, n_expert);
         ds4_gpu_stream_expert_cache_note_selected_hotness(layer, ids, n_expert);
         ds4_gpu_pass_note_experts(layer, ids, n_expert);
         ds4_gpu_expert_prefetch_record(layer,
