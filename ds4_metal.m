@@ -24,6 +24,8 @@
 
 #include "ds4.h"
 #include "ds4_gpu.h"
+#include "ds4_engram.h"   /* DS4_ENGRAM_ROW_BYTES, for the zero-copy table windows */
+#include <stdatomic.h>
 #include "ds4_image.h"
 
 /*
@@ -1116,6 +1118,346 @@ static uint64_t g_stream_support_bytes;
 void ds4_gpu_stream_note_support_bytes(uint64_t bytes) {
     g_stream_support_bytes = bytes;
 }
+
+/* ---- Zero-copy Engram tables: on-demand LRU residency windows ----
+ *
+ * Binding a whole table does not work. requestResidency on a file-backed
+ * no-copy buffer WIRES its pages: measured 2026-09-17, binding both 94.42 GiB
+ * tables drove wired from 4 GB to 93 GB in 20 s and the bench watchdog killed
+ * the run before prefill ever started. The spec's "binds the disk-backed
+ * virtual addresses to the GPU without copying or allocating additional
+ * physical RAM" holds only until the GPU actually has to read the buffer;
+ * madvise(WILLNEED) is not a barrier, and the residency commit that is one is
+ * exactly what wires the pages.
+ *
+ * So residency follows the access pattern instead of the file. A token touches
+ * 24 scattered 264 B rows per table. Each row is covered by one small aligned
+ * window created on demand, and windows live in an LRU pool with a hard cap on
+ * how many are resident at once. 48 windows of 64 KiB is about 3 MiB a token,
+ * which is tractable; 189 GiB is not.
+ *
+ * A window carries one page of overlap past win_size, so a row starting
+ * anywhere inside the window is wholly contained: row -> window stays
+ * arithmetic and the kernel never sees a straddle.
+ *
+ * Eviction is safe only because the gather encoder commits and waits before
+ * returning, so no evicted buffer can still be referenced by an in-flight
+ * command buffer. An async gather would need the epoch tracking the expert
+ * cache uses (inflight_seq / done_seq), not this.
+ *
+ * MEASURED 2026-09-17, and the reason this stays off by default. The path is
+ * correct -- generated text is byte-identical to the pread path over 400
+ * tokens -- and bounded, but it is slower than what it replaces:
+ *
+ *     pread baseline          14.45 t/s
+ *     zero-copy, 64 KiB win   10.47 t/s   22.0% window hit, 12736 evictions
+ *     zero-copy, 16 KiB win   11.06 t/s   21.9% window hit, 12773 evictions
+ *
+ * Window size barely moves it because the hit rate does not move: Engram rows
+ * are hash-scattered over 94 GiB, so two rows almost never share a window at
+ * any granularity. Every row is therefore a fresh newBufferWithBytesNoCopy
+ * plus a residency commit to wire one 264 B row, against a pread path that
+ * already coalesces same-page rows and costs ~32-64 KB a token off the
+ * critical path. The bytes are not the problem; the per-row VM and residency
+ * work is, and it does not amortize when there is no locality to amortize over.
+ *
+ * Keep it for the machinery (windowing, the LRU pool, the event ring) and for
+ * a future Engram layout with real row locality. Do not turn it on expecting
+ * decode throughput.
+ */
+enum {
+    DS4_METAL_ENGRAM_TABLES = 2,
+    DS4_METAL_ENGRAM_MAX_WINDOWS = 4096,            /* slots per table */
+    DS4_METAL_ENGRAM_WINDOW_KIB_DEFAULT = 64,
+};
+
+typedef struct {
+    __strong id<MTLBuffer> buffer;
+    uint64_t win_index;      /* start / win_size */
+    uint64_t start;          /* byte offset into the mapping */
+    uint64_t len;
+    uint64_t gpu_addr;       /* base GPU address, for the kernel's flat pointers */
+    uint64_t last_used;
+} ds4_engram_window;
+
+typedef struct {
+    const char *map_base;
+    uint64_t    map_bytes;
+    uint64_t    win_size;
+    uint64_t    resident_bytes;
+    uint32_t    live_count;  /* live windows occupy slots [0, live_count) */
+    uint32_t    max_live;
+    uint8_t     bound;
+    ds4_engram_window slots[DS4_METAL_ENGRAM_MAX_WINDOWS];
+} ds4_engram_table_pool;
+
+static double ds4_gpu_mib(uint64_t bytes);
+
+static ds4_engram_table_pool g_engram_pool[DS4_METAL_ENGRAM_TABLES];
+static id g_engram_residency_set;
+static int g_engram_residency_added_to_queue;
+static int g_engram_set_dirty;
+static uint64_t g_engram_clock;
+static uint64_t g_engram_epoch;
+static uint64_t g_engram_hits, g_engram_misses, g_engram_evictions, g_engram_commits;
+static int g_engram_report_armed;
+
+static void ds4_gpu_engram_pool_report(void) {
+    const uint64_t lookups = g_engram_hits + g_engram_misses;
+    if (!lookups) return;
+    fprintf(stderr,
+            "ds4: Engram zero-copy windows: lookups=%llu hits=%llu (%.1f%%) "
+            "misses=%llu evictions=%llu commits=%llu resident=%.2f+%.2f MiB\n",
+            (unsigned long long)lookups,
+            (unsigned long long)g_engram_hits,
+            100.0 * (double)g_engram_hits / (double)lookups,
+            (unsigned long long)g_engram_misses,
+            (unsigned long long)g_engram_evictions,
+            (unsigned long long)g_engram_commits,
+            ds4_gpu_mib(g_engram_pool[0].resident_bytes),
+            ds4_gpu_mib(g_engram_pool[1].resident_bytes));
+}
+
+static bool ds4_gpu_engram_set_ready(void) {
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (g_engram_residency_set) return true;
+        if (!g_device) return false;
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"ds4_engram";
+        desc.initialCapacity = 256;
+        NSError *error = nil;
+        g_engram_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+        if (!g_engram_residency_set) {
+            fprintf(stderr, "ds4: Engram residency set creation failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            return false;
+        }
+        [g_engram_residency_set commit];
+        [g_engram_residency_set requestResidency];
+        if (g_queue && [g_queue respondsToSelector:@selector(addResidencySet:)]) {
+            [g_queue addResidencySet:g_engram_residency_set];
+            g_engram_residency_added_to_queue = 1;
+        }
+        if (!g_engram_report_armed) {
+            g_engram_report_armed = 1;
+            atexit(ds4_gpu_engram_pool_report);
+        }
+        return true;
+    }
+#endif
+    return false;
+}
+
+/* Publish adds and removes to the GPU. One commit per gather, not per window:
+ * the commit is the expensive half, and it is what makes the pages readable. */
+static bool ds4_gpu_engram_residency_sync(void) {
+    if (!g_engram_set_dirty) return true;
+    if (!g_engram_residency_set) return false;
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        [g_engram_residency_set commit];
+        [g_engram_residency_set requestResidency];
+        g_engram_commits++;
+        g_engram_set_dirty = 0;
+        return true;
+    }
+#endif
+    return false;
+}
+
+static ds4_engram_window *ds4_gpu_engram_window_find(ds4_engram_table_pool *p,
+                                                     uint64_t win_index) {
+    for (uint32_t i = 0; i < p->live_count; i++) {
+        if (p->slots[i].win_index == win_index) return &p->slots[i];
+    }
+    return NULL;
+}
+
+/* Drop the least recently used window this resolve pass has not touched.
+ * Refusing to evict a window from the current pass is what stops one token's
+ * own rows from evicting each other. */
+static bool ds4_gpu_engram_window_evict(ds4_engram_table_pool *p) {
+    uint32_t victim = UINT32_MAX;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t i = 0; i < p->live_count; i++) {
+        if (p->slots[i].last_used >= g_engram_epoch) continue;
+        if (p->slots[i].last_used < oldest) {
+            oldest = p->slots[i].last_used;
+            victim = i;
+        }
+    }
+    if (victim == UINT32_MAX) return false;
+
+    ds4_engram_window *w = &p->slots[victim];
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (g_engram_residency_set && w->buffer) {
+            [g_engram_residency_set removeAllocation:w->buffer];
+            g_engram_set_dirty = 1;
+        }
+    }
+#endif
+    p->resident_bytes -= w->len;
+    w->buffer = nil;
+
+    const uint32_t last = p->live_count - 1;
+    if (victim != last) p->slots[victim] = p->slots[last];
+    p->slots[last].buffer = nil;
+    p->live_count = last;
+    g_engram_evictions++;
+    return true;
+}
+
+static ds4_engram_window *ds4_gpu_engram_window_acquire(uint32_t index, uint64_t offset) {
+    ds4_engram_table_pool *p = &g_engram_pool[index];
+    if (!p->bound || !p->win_size || offset >= p->map_bytes) return NULL;
+
+    const uint64_t wi = offset / p->win_size;
+    ds4_engram_window *found = ds4_gpu_engram_window_find(p, wi);
+    if (found) {
+        found->last_used = ++g_engram_clock;
+        g_engram_hits++;
+        return found;
+    }
+    g_engram_misses++;
+    if (!ds4_gpu_engram_set_ready()) return NULL;
+
+    while (p->live_count >= p->max_live) {
+        if (!ds4_gpu_engram_window_evict(p)) return NULL;
+    }
+
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const uint64_t start = wi * p->win_size;
+    uint64_t len = p->win_size + page;   /* overlap: a row never straddles */
+    if (start + len > p->map_bytes) len = p->map_bytes - start;
+    if (!len) return NULL;
+
+    id<MTLBuffer> buffer =
+        [g_device newBufferWithBytesNoCopy:(void *)(p->map_base + start)
+                                    length:(NSUInteger)len
+                                   options:MTLResourceStorageModeShared
+                               deallocator:nil];
+    if (!buffer) return NULL;
+
+    ds4_engram_window *slot = &p->slots[p->live_count++];
+    slot->buffer = buffer;
+    slot->win_index = wi;
+    slot->start = start;
+    slot->len = len;
+    slot->gpu_addr = (uint64_t)[buffer gpuAddress];
+    slot->last_used = ++g_engram_clock;
+    p->resident_bytes += len;
+
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        [g_engram_residency_set addAllocation:buffer];
+        g_engram_set_dirty = 1;
+    }
+#endif
+    return slot;
+}
+
+bool ds4_gpu_engram_bind_table(uint32_t index, const void *map_base, uint64_t map_bytes) {
+    if (index >= DS4_METAL_ENGRAM_TABLES || !map_base || !map_bytes) return false;
+    if (!g_initialized && !ds4_gpu_init()) return false;
+    if (!g_device) return false;
+
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    if (((uintptr_t)map_base & (uintptr_t)(page - 1)) != 0) {
+        fprintf(stderr, "ds4: Engram mapping is not page aligned; not binding\n");
+        return false;
+    }
+
+    ds4_gpu_engram_unbind_table(index);
+
+    uint64_t win = (uint64_t)DS4_METAL_ENGRAM_WINDOW_KIB_DEFAULT * 1024u;
+    {
+        const char *e = getenv("DS4_ENGRAM_WINDOW_KIB");
+        if (e) {
+            const unsigned long long v = strtoull(e, NULL, 10);
+            if (v >= 4ull && v <= 65536ull) win = (uint64_t)v * 1024u;
+        }
+    }
+    win = (win + page - 1) & ~(page - 1);
+    if (win == 0) win = page;
+
+    /* Pool cap, not a table cap: the table is never fully resident. */
+    uint64_t budget = 512ull << 20;
+    {
+        const char *e = getenv("DS4_ENGRAM_ZEROCOPY_BUDGET");
+        if (e) {
+            const unsigned long long v = strtoull(e, NULL, 10);
+            if (v >= (1ull << 20) && v <= (32ull << 30)) budget = (uint64_t)v;
+        }
+    }
+    uint64_t max_live = budget / win;
+    if (max_live < 1) max_live = 1;
+    if (max_live > DS4_METAL_ENGRAM_MAX_WINDOWS) max_live = DS4_METAL_ENGRAM_MAX_WINDOWS;
+
+    if (!ds4_gpu_engram_set_ready()) return false;
+
+    ds4_engram_table_pool *p = &g_engram_pool[index];
+    p->map_base = (const char *)map_base;
+    p->map_bytes = map_bytes;
+    p->win_size = win;
+    p->max_live = (uint32_t)max_live;
+    p->resident_bytes = 0;
+    p->live_count = 0;
+    p->bound = 1;
+
+    fprintf(stderr,
+            "ds4: Engram table %u zero-copy: %.2f GiB mapped, %llu KiB windows, "
+            "<= %u resident (%.0f MiB cap)\n",
+            index, ds4_gpu_gib(map_bytes),
+            (unsigned long long)(win / 1024u), p->max_live,
+            (double)(max_live * win) / (1024.0 * 1024.0));
+    return true;
+}
+
+void ds4_gpu_engram_unbind_table(uint32_t index) {
+    if (index >= DS4_METAL_ENGRAM_TABLES) return;
+    ds4_engram_table_pool *p = &g_engram_pool[index];
+    if (!p->bound && !p->live_count) return;
+
+    for (uint32_t i = 0; i < p->live_count; i++) {
+#if TARGET_OS_OSX
+        if (@available(macOS 15.0, *)) {
+            if (g_engram_residency_set && p->slots[i].buffer) {
+                [g_engram_residency_set removeAllocation:p->slots[i].buffer];
+                g_engram_set_dirty = 1;
+            }
+        }
+#endif
+        p->slots[i].buffer = nil;
+    }
+    p->live_count = 0;
+    p->resident_bytes = 0;
+    p->bound = 0;
+    p->map_base = NULL;
+    p->map_bytes = 0;
+    ds4_gpu_engram_residency_sync();
+}
+
+bool ds4_gpu_engram_table_bound(uint32_t index) {
+    return index < DS4_METAL_ENGRAM_TABLES && g_engram_pool[index].bound != 0;
+}
+
+/* Resolve a row's byte offset within the mapping (ds4_engram_row_span) to the
+ * flat GPU address the kernel dereferences, faulting in a window if needed.
+ * Returns 0 when the row cannot be addressed; callers must treat that as a
+ * hard failure and fall back, never as a zero-valued row -- ds4_engram_hash
+ * only ever produces in-range row ids, so 0 here means the pool failed, not
+ * that the row is absent. */
+uint64_t ds4_gpu_engram_row_address(uint32_t index, uint64_t inner_offset) {
+    if (index >= DS4_METAL_ENGRAM_TABLES) return 0;
+    ds4_engram_window *w = ds4_gpu_engram_window_acquire(index, inner_offset);
+    if (!w) return 0;
+    const uint64_t off = inner_offset - w->start;
+    if (off + (uint64_t)DS4_ENGRAM_ROW_BYTES > w->len) return 0;
+    return w->gpu_addr + off;
+}
+
 static uint64_t g_stream_expert_cache_cb_seq;
 static uint64_t g_stream_expert_cache_done_seq;
 static uint64_t g_stream_expert_cache_batch_seq;
@@ -4918,6 +5260,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_DEEPSEEK4_VISION_SOURCE", @"metal/deepseek4_vision.metal"],
         @[@"DS4_METAL_GLM53_KDA_SOURCE",  @"metal/glm53_kda.metal"],
         @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
+        @[@"DS4_METAL_ENGRAM_SOURCE",     @"metal/engram.metal"],
         @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
         @[@"DS4_METAL_UNARY_SOURCE",      @"metal/unary.metal"],
         @[@"DS4_METAL_DSV4_KV_SOURCE",    @"metal/dsv4_kv.metal"],
@@ -21571,6 +21914,160 @@ static int ds4_gpu_matmul_q8_0_tensor_impl(
         }
     }
     return ok;
+}
+
+/* ---- Engram prefetch ring (spec Phase 3) ----
+ *
+ * A ticket is reserved before the CPU worker starts advising pages and
+ * signalled once the advise calls have been issued. The command buffer that
+ * reads those rows waits on the ticket, so ordering between the worker thread
+ * and the queue is explicit instead of a hope that WILLNEED won the race. */
+static id<MTLSharedEvent> g_engram_event;
+static _Atomic uint64_t g_engram_ticket;
+
+static bool ds4_gpu_engram_event_ready(void) {
+    if (g_engram_event) return true;
+    if (!g_initialized && !ds4_gpu_init()) return false;
+    if (!g_device) return false;
+    g_engram_event = [g_device newSharedEvent];
+    if (!g_engram_event) {
+        fprintf(stderr, "ds4: Engram shared event creation failed\n");
+        return false;
+    }
+    g_engram_event.label = @"ds4_engram_prefetch";
+    g_engram_event.signaledValue = 0;
+    return true;
+}
+
+uint64_t ds4_gpu_engram_prefetch_ticket(void) {
+    if (!ds4_gpu_engram_event_ready()) return 0;
+    return atomic_fetch_add(&g_engram_ticket, 1) + 1;
+}
+
+void ds4_gpu_engram_prefetch_signal(uint64_t ticket) {
+    if (!ticket || !g_engram_event) return;
+    /* Monotonic: a late worker must not walk the value backwards and unblock
+     * nothing, or worse, strand a later waiter. */
+    if (g_engram_event.signaledValue < ticket) g_engram_event.signaledValue = ticket;
+}
+
+uint64_t ds4_gpu_engram_prefetch_signaled(void) {
+    return g_engram_event ? (uint64_t)g_engram_event.signaledValue : 0;
+}
+
+/* Gather + dequantize rows straight into a tensor, replacing the pread + CPU
+ * dequantize + upload sequence. No gate: ds4 applies that downstream in the
+ * graph layer, so this has to reproduce ds4_engram_read's output exactly, not
+ * fold extra math in.
+ *
+ * Handles the batch shape too. row_ids holds `tokens` groups of `cols` ids,
+ * `stride` ids apart (the V4.1 verify batch interleaves both tables, so its
+ * stride is 2*COLS). Output is [tokens][cols][dim] contiguous, which is the
+ * layout both ds4_engram_read and ds4_engram_read_batch produce. */
+bool ds4_gpu_engram_gather_rows_strided(uint32_t table_index,
+                                        ds4_gpu_tensor *out,
+                                        const uint32_t *row_ids,
+                                        uint32_t tokens,
+                                        uint32_t stride,
+                                        uint32_t cols,
+                                        uint32_t dim,
+                                        uint64_t map_row0,
+                                        uint64_t wait_ticket) {
+    if (!out || !row_ids || !tokens || !cols || !dim || stride < cols) return false;
+    if (!ds4_gpu_engram_table_bound(table_index)) return false;
+    if (!g_initialized && !ds4_gpu_init()) return false;
+
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_engram_gather_rows");
+    if (!pipeline) return false;
+    if ((NSUInteger)dim > [pipeline maxTotalThreadsPerThreadgroup]) return false;
+
+    DS4MetalTensor *dst = (__bridge DS4MetalTensor *)out;
+    if (!dst.buffer) return false;
+
+    const uint64_t rows_total = (uint64_t)tokens * cols;
+    if (rows_total > UINT32_MAX) return false;
+    if (dst.bytes < rows_total * dim * sizeof(float)) return false;
+
+    uint64_t stack_addrs[256];
+    uint64_t *addrs = stack_addrs;
+    if (rows_total > (uint64_t)(sizeof(stack_addrs) / sizeof(stack_addrs[0]))) {
+        addrs = malloc((size_t)rows_total * sizeof(uint64_t));
+        if (!addrs) return false;
+    }
+
+    /* Open a resolve pass: windows faulted in below are protected from being
+     * evicted by later rows of this same pass. */
+    g_engram_epoch = g_engram_clock + 1;
+
+    bool resolved = true;
+    for (uint32_t t = 0; t < tokens && resolved; t++) {
+        for (uint32_t c = 0; c < cols; c++) {
+            const uint32_t row = row_ids[(size_t)t * stride + c];
+            const uint64_t addr = ds4_gpu_engram_row_address(
+                    table_index,
+                    map_row0 + (uint64_t)row * (uint64_t)DS4_ENGRAM_ROW_BYTES);
+            /* 0 is not a dead row: ds4_engram_hash only emits in-range ids, so
+             * an unresolvable address means the window pool failed. Fail the
+             * whole gather and let the caller fall back to the CPU rows rather
+             * than silently contributing zeros. */
+            if (addr == 0) { resolved = false; break; }
+            addrs[(size_t)t * cols + c] = addr;
+        }
+    }
+    /* Make the new windows readable before anything dispatches against them.
+     * This commit is the barrier; the prefetch ticket only hides latency. */
+    if (resolved && !ds4_gpu_engram_residency_sync()) resolved = false;
+    if (!resolved) {
+        if (addrs != stack_addrs) free(addrs);
+        return false;
+    }
+
+    struct { uint32_t tokens, cols, dim, stride; } params = {
+        1, (uint32_t)rows_total, dim, dim
+    };
+    bool ok = false;
+    @autoreleasepool {
+        id<MTLBuffer> addr_buf =
+            [g_device newBufferWithBytes:addrs
+                                  length:(NSUInteger)rows_total * sizeof(uint64_t)
+                                 options:MTLResourceStorageModeShared];
+        if (addr_buf) {
+            id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+            if (cb) {
+                if (wait_ticket && g_engram_event)
+                    [cb encodeWaitForEvent:g_engram_event value:wait_ticket];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pipeline];
+                [enc setBuffer:dst.buffer offset:dst.offset atIndex:0];
+                [enc setBuffer:addr_buf offset:0 atIndex:1];
+                [enc setBytes:&params length:sizeof(params) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows_total, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(dim, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                ok = ([cb status] == MTLCommandBufferStatusCompleted);
+                if (!ok) {
+                    fprintf(stderr, "ds4: Engram gather dispatch failed: %s\n",
+                            [[[cb error] localizedDescription] UTF8String]);
+                }
+            }
+        }
+    }
+    if (addrs != stack_addrs) free(addrs);
+    return ok;
+}
+
+bool ds4_gpu_engram_gather_rows(uint32_t table_index,
+                               ds4_gpu_tensor *out,
+                               const uint32_t *row_ids,
+                               uint32_t cols,
+                               uint32_t dim,
+                               uint64_t map_row0,
+                               uint64_t wait_ticket) {
+    return ds4_gpu_engram_gather_rows_strided(table_index, out, row_ids,
+                                              1, cols, cols, dim,
+                                              map_row0, wait_ticket);
 }
 
 int ds4_gpu_matmul_q8_0_tensor(
@@ -42847,7 +43344,13 @@ static int ds4_gpu_stream_expert_hint_enabled(void) {
     static int mode = -1;
     if (mode < 0) {
         const char *env = getenv("DS4_METAL_V41_HINT");
-        mode = env ? atoi(env) : 1;
+        /* Default off. Measured 2026-09-17 (M5 Max, 16k, 36 GB bank, no-copy,
+         * clean boot): recall 11.7% (15681/134160) at TOPN=3/MIN=2 and 27.0%
+         * (36234/134160) at TOPN=6/MIN=1, both under the ~30% bar, and decode
+         * fell 16.44 -> 15.11 and 14.43 t/s while the wide setting read 126 GiB
+         * of readahead. The table stays as training data for a real prerouter;
+         * DS4_METAL_V41_HINT=1 still turns it on. */
+        mode = env ? atoi(env) : 0;
         if (mode < 0) mode = 0;
         const char *e;
         if ((e = getenv("DS4_METAL_V41_HINT_TOPN")) != NULL) g_hint_topn = atoi(e);
@@ -53575,4 +54078,87 @@ int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor
     }
     return qwen4_dispatch(QWEN4_K_HC_MIX_ROWS, &args, sizeof(args), b, 3,
                           MTLSizeMake((n_embd + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+/* Fused gather-gate dispatch (spec 3.C host side).
+ *
+ * row_addrs holds tokens*cols absolute GPU addresses from
+ * ds4_gpu_engram_row_address; a 0 entry is a dead row the kernel skips. The
+ * address arrays are small (24 rows * 8 B per token) and rebuilt per call,
+ * so they are staged in shared buffers rather than kept resident.
+ *
+ * accumulate=true adds into the residual in place; false writes, which is how
+ * the fused path gets compared against the CPU pread path without a
+ * read-modify-write in the way. */
+bool ds4_gpu_engram_gather_gate(ds4_gpu_tensor *residual,
+                               const uint64_t *row_addrs,
+                               const float *gate_logits,
+                               uint32_t tokens,
+                               uint32_t cols,
+                               uint32_t dim,
+                               uint32_t stride,
+                               bool accumulate,
+                               uint64_t wait_ticket) {
+    if (!residual || !row_addrs || !gate_logits) return false;
+    if (!tokens || !cols || !dim) return false;
+    if (!g_initialized && !ds4_gpu_init()) return false;
+
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+            accumulate ? "kernel_engram_fused_gather_gate"
+                       : "kernel_engram_fused_gather_gate_store");
+    if (!pipeline) return false;
+    if ((NSUInteger)dim > [pipeline maxTotalThreadsPerThreadgroup]) {
+        fprintf(stderr, "ds4: Engram dim %u past maxTotalThreadsPerThreadgroup %lu\n",
+                dim, (unsigned long)[pipeline maxTotalThreadsPerThreadgroup]);
+        return false;
+    }
+
+    DS4MetalTensor *out = (__bridge DS4MetalTensor *)residual;
+    if (!out.buffer) return false;
+
+    struct {
+        uint32_t tokens, cols, dim, stride;
+    } params = { tokens, cols, dim, stride };
+
+    const NSUInteger refs = (NSUInteger)tokens * cols;
+    bool ok = false;
+    @autoreleasepool {
+        id<MTLBuffer> addr_buf =
+            [g_device newBufferWithBytes:row_addrs
+                                  length:refs * sizeof(uint64_t)
+                                 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gate_buf =
+            [g_device newBufferWithBytes:gate_logits
+                                  length:refs * sizeof(float)
+                                 options:MTLResourceStorageModeShared];
+        if (!addr_buf || !gate_buf) return false;
+
+        id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+        if (!cb) return false;
+        /* Phase 3 ring: make the GPU wait on the prefetch worker's ticket
+         * rather than racing it. A WILLNEED that has not landed yet turns into
+         * a blocking bus fault inside the dispatch; waiting on the event moves
+         * that wait off the GPU and onto the queue, where it overlaps whatever
+         * the previous command buffer is still doing. */
+        if (wait_ticket && g_engram_event) {
+            [cb encodeWaitForEvent:g_engram_event value:wait_ticket];
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:out.buffer offset:out.offset atIndex:0];
+        [enc setBuffer:addr_buf offset:0 atIndex:1];
+        [enc setBuffer:gate_buf offset:0 atIndex:2];
+        [enc setBytes:&params length:sizeof(params) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(tokens, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(dim, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        ok = ([cb status] == MTLCommandBufferStatusCompleted);
+        if (!ok) {
+            fprintf(stderr, "ds4: Engram gather-gate dispatch failed: %s\n",
+                    [[[cb error] localizedDescription] UTF8String]);
+        }
+    }
+    return ok;
 }

@@ -41227,6 +41227,7 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     DS41_CARRY_ROWS(DS41_CARRY_FREE)
 #undef DS41_CARRY_FREE
     for (uint32_t i = 0; i < 2; i++) {
+        ds4_gpu_engram_unbind_table(i);   /* buffers must go before the pages */
         ds4_engram_table_close(&g->table[i]);
         ds4_gpu_tensor_free(g->engram_q_norm[i]);
         ds4_gpu_tensor_free(g->engram_k_norm[i]);
@@ -41359,6 +41360,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         const uint32_t il = i ? 14u : 1u;
         const ds4_tensor *table = required_tensorf(m, "blk.%u.engram_embd.weight", il);
         if (!ds4_engram_table_open(&g->table[i], path, table->abs_offset, g->engram.rows[i])) goto fail;
+        /* Zero-copy Engram offload (spec 3.A). Advisory: if either the mapping
+         * or the Metal bind fails the table keeps its pread path, so a device
+         * that cannot window 94 GiB simply runs as before. */
+        if (getenv("DS4_ENGRAM_ZEROCOPY") && atoi(getenv("DS4_ENGRAM_ZEROCOPY"))) {
+            if (!ds4_engram_table_map(&g->table[i])) {
+                fprintf(stderr, "ds4: Engram table %u mmap failed: %s\n", i, strerror(errno));
+            } else if (!ds4_gpu_engram_bind_table(i, g->table[i].map_base,
+                                                  g->table[i].map_bytes)) {
+                fprintf(stderr, "ds4: Engram table %u bind failed; pread path only\n", i);
+                ds4_engram_table_unmap(&g->table[i]);
+            }
+        }
         struct stat weights_stat, rows_stat;
         if (fstat(m->fd, &weights_stat) || fstat(g->table[i].fd, &rows_stat) ||
             weights_stat.st_dev != rows_stat.st_dev || weights_stat.st_ino != rows_stat.st_ino)
@@ -42854,6 +42867,26 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
             const uint32_t i = il == 1 ? 0 : 1;
             ok = (!overlap_engram || ds4_engram_reader_wait(g->engram_reader, i)) &&
                 ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            /* Zero-copy path: gather straight from the mapped table into the
+             * tensor, skipping the pread, the CPU dequantize and the upload.
+             * Only when the table actually bound; otherwise the write above
+             * already did the job. */
+            if (ok && ds4_gpu_engram_table_bound(i) && g->table[i].map_base) {
+                uint64_t ticket = 0;
+                if (g->table[i].map_base) {
+                    ticket = ds4_gpu_engram_prefetch_ticket();
+                    ds4_engram_prefetch_rows(&g->table[i], ids[i], DS4_ENGRAM_COLS);
+                    ds4_gpu_engram_prefetch_signal(ticket);
+                }
+                if (!ds4_gpu_engram_gather_rows(i, g->engram_rows, ids[i],
+                                                DS4_ENGRAM_COLS, DS4_ENGRAM_DIM,
+                                                g->table[i].map_row0, ticket)) {
+                    fprintf(stderr, "ds4: Engram gather failed on table %u; "
+                                    "falling back to the CPU rows\n", i);
+                    ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i],
+                                              sizeof(g->rows[i]));
+                }
+            }
         }
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -43588,8 +43621,29 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         ok = ds4_engram_read(&g->table[engram], ids[off + t][engram], DS4_ENGRAM_COLS,
                                              ds4_gpu_tensor_contents(g->rows_view[t].engram_rows));
                 } else {
-                    ok = ds4_engram_read_batch(&g->table[engram], ids[off][engram], count,
-                        2u * DS4_ENGRAM_COLS, ds4_gpu_tensor_contents(g->batch.engram_rows));
+                    /* Zero-copy first: gather straight from the mapped table
+                     * into the batch tensor. This is the site that matters --
+                     * with DSpark the verify batch is where Engram rows are
+                     * read, not the single-token step path. Falls back to the
+                     * pread batch read on any failure. */
+                    bool zc = false;
+                    if (ds4_gpu_engram_table_bound(engram) && g->table[engram].map_base) {
+                        uint64_t ticket = ds4_gpu_engram_prefetch_ticket();
+                        for (uint32_t t = 0; t < count; t++) {
+                            ds4_engram_prefetch_rows(&g->table[engram],
+                                                     ids[off + t][engram],
+                                                     DS4_ENGRAM_COLS);
+                        }
+                        ds4_gpu_engram_prefetch_signal(ticket);
+                        zc = ds4_gpu_engram_gather_rows_strided(
+                                engram, g->batch.engram_rows, ids[off][engram],
+                                count, 2u * DS4_ENGRAM_COLS, DS4_ENGRAM_COLS,
+                                DS4_ENGRAM_DIM, g->table[engram].map_row0, ticket);
+                    }
+                    if (!zc) {
+                        ok = ds4_engram_read_batch(&g->table[engram], ids[off][engram], count,
+                            2u * DS4_ENGRAM_COLS, ds4_gpu_tensor_contents(g->batch.engram_rows));
+                    }
                 }
             }
             const double t_engram = profile ? now_sec() : 0;
