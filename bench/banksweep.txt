@@ -1,0 +1,12 @@
+36GB rep1 14.29  wired=55G
+48GB rep1 15.38  wired=57G
+60GB rep1 16.34  wired=72G
+72GB rep1 FAILED  wired=93G
+36GB rep2 14.00  wired=56G
+48GB rep2 15.44  wired=44G
+60GB rep2 16.53  wired=80G
+72GB rep2 FAILED  wired=94G
+---
+36GB   median 14.14 t/s  samples [14.0, 14.29]
+48GB   median 15.41 t/s  samples [15.38, 15.44]
+60GB   median 16.44 t/s  samples [16.34, 16.53]
