@@ -16339,6 +16339,7 @@ static void ds4_gpu_stream_expert_cache_residency_drop(id<MTLBuffer> buffer) {
  * handed to the queue once, so every command buffer inherits it and a deferred
  * dispatch needs no per-encoder bookkeeping at all. */
 static int g_stream_expert_cache_residency_on_queue;
+static uint32_t g_stream_expert_cache_residency_skips;
 
 static void ds4_gpu_stream_expert_bank_report(uint32_t new_tokens) {
     unsigned long members = 0, retired = 0, pending = 0;
@@ -16366,8 +16367,38 @@ static void ds4_gpu_stream_expert_cache_residency_publish(void) {
     if (g_stream_expert_cache_residency_failed) return;
     if (!g_stream_expert_cache_residency_set) return;
     if (@available(macOS 15.0, *)) {
-        if (g_stream_expert_cache_residency_dirty ||
-            [g_stream_expert_cache_residency_retired count] != 0) {
+        /* Commit cost is proportional to the size of the set, and the set
+         * grows with the bank: measured 2026-09-17, 372 commits either way,
+         * 5.52 ms each at a 36 GB bank and 9.24 ms at 64 GB -- 7.3% and 14.6%
+         * of decode respectively. That tax is also why the bank curve turns
+         * over at 64 GB rather than continuing to climb.
+         *
+         * Skipping a commit is safe, not a correctness trade: covers() reports
+         * false for anything still in pending, so every dispatch that reads an
+         * uncommitted view names it explicitly with useResource. The trade is
+         * one 9 ms commit against a handful of per-dispatch useResource calls.
+         * DS4_METAL_V41_RESIDENCY_COMMIT_EVERY=N spends the commit once per N
+         * publishes; 1 (the default) is the old behaviour. */
+        static int commit_every = -1;
+        if (commit_every < 0) {
+            const char *e = getenv("DS4_METAL_V41_RESIDENCY_COMMIT_EVERY");
+            commit_every = e ? atoi(e) : 1;
+            if (commit_every < 1) commit_every = 1;
+            if (commit_every > 64) commit_every = 64;
+        }
+        int due = 1;
+        if (commit_every > 1) {
+            /* Pending is scanned linearly by covers(), so it cannot be allowed
+             * to grow without bound while commits are being skipped. */
+            const NSUInteger pending_now =
+                [g_stream_expert_cache_residency_pending count];
+            due = (++g_stream_expert_cache_residency_skips >= (uint32_t)commit_every) ||
+                  pending_now >= 512u;
+        }
+        if (due &&
+            (g_stream_expert_cache_residency_dirty ||
+             [g_stream_expert_cache_residency_retired count] != 0)) {
+            g_stream_expert_cache_residency_skips = 0;
             const double t0 = ds4_gpu_now_ms();
             [g_stream_expert_cache_residency_set commit];
             g_stream_expert_cache_residency_commit_ms += ds4_gpu_now_ms() - t0;
