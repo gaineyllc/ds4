@@ -201,6 +201,16 @@ void ds4_gpu_stream_expert_nocopy_block(void);
  * layer ran without all of its experts resident, in which case the token must
  * be decoded again with the deferral off. */
 void ds4_gpu_stream_expert_defer_begin_token(int disabled);
+
+/* Distinct-routed-expert accounting for a pass (handoff 5.5). Call
+ * pass_begin with the row count at the head of a token or verify batch;
+ * batch_row_limit tells admission how many rows keep distinct experts per
+ * layer under DS4_V41_BATCH_MAX_DISTINCT, using the measured
+ * distinct-per-row ratio rather than the 6-per-row worst case. Both are
+ * no-ops unless DS4_V41_BATCH_EXPERT_STATS or DS4_V41_BATCH_MAX_DISTINCT
+ * is set. */
+void ds4_gpu_stream_expert_pass_begin(uint32_t rows);
+uint32_t ds4_gpu_stream_expert_batch_row_limit(uint32_t desired);
 int ds4_gpu_stream_expert_defer_token_missed(void);
 void ds4_gpu_stream_expert_defer_stats(uint64_t *tokens, uint64_t *redos);
 uint64_t ds4_gpu_stream_expert_defer_layers(void);

@@ -42796,6 +42796,7 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
         if (g_engram_decode_profile) atexit(ds41_engram_decode_report);
     }
     ds4_gpu_stream_expert_defer_begin_token(defer_disabled);
+    ds4_gpu_stream_expert_pass_begin(1);
     if (getenv("DS4_V41_PREROUTE_PROBE") && ds41_probe_init()) g_probe.w = w;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds41_engram_decode_bg engram_bg = {0};
@@ -80833,6 +80834,14 @@ static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
                                           const ds4_engine *e) {
     if (!items || count < 2 || count > DS4_TP_BATCH_MAX_ROWS || !e ||
         e->support_kind != DS4_SUPPORT_NONE)
+        return false;
+    /* Handoff 5.5: cross-session batching raises throughput but also raises
+     * the distinct experts touched per layer per pass, and at ~55% bank
+     * residency more distinct experts means more misses -- which already cost
+     * half the cycle. Refuse the batch when the measured distinct-per-row
+     * ratio says this many rows would push past DS4_V41_BATCH_MAX_DISTINCT.
+     * Unset (the default) leaves admission exactly as it was. */
+    if ((uint32_t)count > ds4_gpu_stream_expert_batch_row_limit((uint32_t)count))
         return false;
     const bool cuda = e->backend == DS4_BACKEND_CUDA;
     if (cuda ? !metal_graph_tp_env_flag("DS4_CUDA_SESSION_BATCH_MOE", true) :
