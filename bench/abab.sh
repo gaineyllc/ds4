@@ -26,6 +26,8 @@ echo "B: ${B[*]:-<none>}"
 out=~/ds4-bench/abab_$tag.txt
 : > $out
 
+runner=${ABAB_RUNNER:-~/ds4-bench/ab16k.sh}
+
 gen() {  # $1 = run tag -> prints generation t/s
   grep -oE 'generation: [0-9.]+' ~/ds4-bench/run16k_$1.txt 2>/dev/null | tail -1 | awk '{print $2}'
 }
@@ -36,9 +38,9 @@ for i in $(seq 1 $reps); do
     sleep 2
     rt="${tag}_${arm}${i}"
     if [[ $arm == A ]]; then
-      ~/ds4-bench/ab16k.sh $rt "${A[@]}" > /dev/null 2>&1
+      $runner $rt "${A[@]}" > /dev/null 2>&1
     else
-      ~/ds4-bench/ab16k.sh $rt "${B[@]}" > /dev/null 2>&1
+      $runner $rt "${B[@]}" > /dev/null 2>&1
     fi
     g=$(gen $rt)
     echo "$arm$i ${g:-FAILED}" | tee -a $out
