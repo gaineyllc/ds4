@@ -4730,6 +4730,98 @@ static void ds4_gpu_print_task_memory_report(void) {
             ds4_gpu_gib((uint64_t)info.virtual_size));
 }
 
+/* ---- Streaming expert stats on the CLI path (DS4_METAL_V41_STREAM_STATS=1) --
+ *
+ * Every one of these counters already existed; they were only reachable
+ * through ds4_gpu_print_memory_report, which the V4.1 CLI never calls, so a
+ * bench run could measure throughput but never see the bank behaviour that
+ * produced it. Measuring decode without the hit rate and the residency commit
+ * cost means guessing at which half of a stall to attack.
+ *
+ * Read-only over existing state, armed by env, printed once at exit.
+ */
+static int g_v41_stream_stats_armed;
+
+static void ds4_gpu_v41_stream_stats_report(void) {
+    /* The residency set is the no-copy path's whole mechanism, so its commit
+     * cost is reported first and unconditionally. The hit/miss counters below
+     * belong to the copy-mode cache and stay at zero under no-copy -- worth
+     * knowing, because "55% bank residency" is quoted from those counters and
+     * they are not what a no-copy run is doing. */
+    {
+        double commit_ms = 0.0;
+        uint64_t commits = 0, members = 0;
+        ds4_gpu_stream_expert_cache_residency_commit_stats(&commit_ms, &commits, &members);
+        fprintf(stderr,
+                "ds4: residency set: commits=%llu total=%.1f ms avg=%.3f ms members=%llu\n",
+                (unsigned long long)commits, commit_ms,
+                commits ? commit_ms / (double)commits : 0.0,
+                (unsigned long long)members);
+    }
+
+    const uint64_t lookups = g_stream_expert_cache_hits + g_stream_expert_cache_misses;
+    if (!lookups) {
+        fprintf(stderr,
+                "ds4: expert bank: no copy-mode cache lookups (entries=%u live=%.2f GiB); "
+                "no-copy run, residency set above is the real story\n",
+                g_stream_expert_cache_entry_count,
+                ds4_gpu_gib(g_stream_expert_cache_bytes));
+        return;
+    }
+
+    fprintf(stderr,
+            "ds4: expert bank: entries=%u hits=%llu misses=%llu hit_rate=%.3f "
+            "evictions=%llu live=%.2f GiB\n",
+            g_stream_expert_cache_entry_count,
+            (unsigned long long)g_stream_expert_cache_hits,
+            (unsigned long long)g_stream_expert_cache_misses,
+            (double)g_stream_expert_cache_hits / (double)lookups,
+            (unsigned long long)g_stream_expert_cache_evictions,
+            ds4_gpu_gib(g_stream_expert_cache_bytes));
+
+    if (g_stream_expert_cache_pread_bytes || g_stream_expert_cache_pread_ms > 0.0) {
+        fprintf(stderr,
+                "ds4: expert bank io: pread=%.2f GiB in %.1f ms (%.2f GiB/s) "
+                "willneed=%.2f GiB dontneed=%.2f GiB\n",
+                ds4_gpu_gib(g_stream_expert_cache_pread_bytes),
+                g_stream_expert_cache_pread_ms,
+                g_stream_expert_cache_pread_ms > 0.0 ?
+                    ds4_gpu_gib(g_stream_expert_cache_pread_bytes) /
+                        (g_stream_expert_cache_pread_ms / 1000.0) : 0.0,
+                ds4_gpu_gib(g_stream_expert_cache_willneed_advise_bytes),
+                ds4_gpu_gib(g_stream_expert_cache_evict_advise_bytes));
+    }
+
+    {
+        double commit_ms = 0.0;
+        uint64_t commits = 0, members = 0;
+        ds4_gpu_stream_expert_cache_residency_commit_stats(&commit_ms, &commits, &members);
+        if (commits) {
+            fprintf(stderr,
+                    "ds4: residency set: commits=%llu total=%.1f ms avg=%.3f ms "
+                    "members=%llu\n",
+                    (unsigned long long)commits, commit_ms,
+                    commit_ms / (double)commits,
+                    (unsigned long long)members);
+        }
+    }
+
+    fprintf(stderr,
+            "ds4: expert bank buffers: allocs=%llu reuses=%llu wraps=%llu "
+            "decode_tokens=%llu\n",
+            (unsigned long long)g_stream_expert_cache_buffer_allocs,
+            (unsigned long long)g_stream_expert_cache_buffer_reuses,
+            (unsigned long long)g_stream_expert_cache_wraps,
+            (unsigned long long)g_stream_expert_cache_decode_tokens);
+}
+
+void ds4_gpu_v41_stream_stats_arm(void) {
+    if (g_v41_stream_stats_armed) return;
+    if (!getenv("DS4_METAL_V41_STREAM_STATS")) return;
+    g_v41_stream_stats_armed = 1;
+    atexit(ds4_gpu_v41_stream_stats_report);
+}
+
 void ds4_gpu_print_memory_report(const char *label) {
     uint64_t cached_prefill_mask_bytes = 0;
     uint64_t cached_prefill_blk_bytes = 0;
@@ -5112,6 +5204,7 @@ void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     ds4_gpu_stream_expert_cache_clear_all(1);
     if (g_ssd_streaming_mode) {
+        ds4_gpu_v41_stream_stats_arm();
         fprintf(stderr,
                 "ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped\n");
     }
