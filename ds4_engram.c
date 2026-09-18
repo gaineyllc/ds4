@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -125,6 +126,7 @@ fail: {
 
 void ds4_engram_table_close(ds4_engram_table *t) {
     if (!t) return;
+    ds4_engram_table_unmap(t);
     if (t->fd >= 0) close(t->fd);
     *t = (ds4_engram_table){.fd = -1};
 }
@@ -771,4 +773,130 @@ void ds4_engram_reader_free(ds4_engram_reader *r) {
     pthread_cond_destroy(&r->work);
     pthread_mutex_destroy(&r->mutex);
     free(r);
+/* ------------------------------------------------------------------------
+ * Zero-copy Engram offload (spec 3.A / 3.B).
+ *
+ * This is additive to the pread path above, not a replacement: the same table
+ * keeps its F_NOCACHE fd, and every existing reader stays valid while mapped.
+ * F_NOCACHE governs read()/pread() on the descriptor only; pages faulted
+ * through the mapping live in the unified buffer cache, which is what makes
+ * them shareable between sessions and visible to a no-copy Metal buffer.
+ *
+ * The mapping is page-aligned below the table's GGUF offset because the table
+ * does not begin on a page boundary; map_row0 carries that leading slack so
+ * callers can address a row without repeating the alignment arithmetic.
+ * ------------------------------------------------------------------------ */
+
+bool ds4_engram_table_map(ds4_engram_table *t) {
+    if (!t || t->fd < 0 || !t->rows) { errno = EINVAL; return false; }
+    if (t->map_base) return true;
+
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const uint64_t base = t->offset & ~(page - 1);
+    const uint64_t slack = t->offset - base;
+    const uint64_t bytes = (uint64_t)t->rows * DS4_ENGRAM_ROW_BYTES;
+    if (slack > UINT64_MAX - bytes) { errno = EINVAL; return false; }
+    uint64_t len = slack + bytes;
+    if (len > UINT64_MAX - (page - 1)) { errno = EINVAL; return false; }
+    len = (len + page - 1) & ~(page - 1);
+    if (len > (uint64_t)SIZE_MAX) { errno = ENOMEM; return false; }
+
+    /* MAP_SHARED, not MAP_PRIVATE: private pages are copy-on-write and would
+     * stop the kernel sharing one physical copy across sessions. */
+    void *p = mmap(NULL, (size_t)len, PROT_READ, MAP_SHARED, t->fd, (off_t)base);
+    if (p == MAP_FAILED) return false;
+
+    /* Without this the kernel runs its sequential read-ahead heuristic over a
+     * 94 GiB table on every fault. Engram access is a hash scatter, so that
+     * read-ahead is all waste and it competes with the expert streamer for the
+     * same NVMe queue. Advisory: failure costs throughput, not correctness. */
+    (void)madvise(p, (size_t)len, MADV_RANDOM);
+
+    t->map_base = p;
+    t->map_bytes = len;
+    t->map_row0 = slack;
+    return true;
+}
+
+void ds4_engram_table_unmap(ds4_engram_table *t) {
+    if (!t || !t->map_base) return;
+    munmap(t->map_base, (size_t)t->map_bytes);
+    t->map_base = NULL;
+    t->map_bytes = 0;
+    t->map_row0 = 0;
+}
+
+bool ds4_engram_row_span(const ds4_engram_table *t, uint32_t row,
+                         uint64_t *inner_offset, uint64_t *bytes) {
+    if (!t || !t->map_base || row >= t->rows) { errno = EINVAL; return false; }
+    if (inner_offset)
+        *inner_offset = t->map_row0 + (uint64_t)row * DS4_ENGRAM_ROW_BYTES;
+    if (bytes) *bytes = DS4_ENGRAM_ROW_BYTES;
+    return true;
+}
+
+/* One advise per contiguous page run. A token's 24 rows are scattered by
+ * construction, but a page holds 15.5 rows, so sorted rows still collapse into
+ * far fewer runs than rows -- and one advise over a run is one queue entry
+ * instead of 24. */
+size_t ds4_engram_prefetch_rows(const ds4_engram_table *t,
+                                const uint32_t *rows, size_t count) {
+    if (!t || !t->map_base || !rows || !count) return 0;
+
+    enum { PREFETCH_CHUNK = DS4_ENGRAM_COLS * 8 };
+    uint32_t sorted[PREFETCH_CHUNK];
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    size_t advises = 0;
+
+    for (size_t start = 0; start < count; start += PREFETCH_CHUNK) {
+        size_t n = count - start;
+        if (n > PREFETCH_CHUNK) n = PREFETCH_CHUNK;
+
+        size_t kept = 0;
+        for (size_t i = 0; i < n; i++) {
+            const uint32_t row = rows[start + i];
+            if (row < t->rows) sorted[kept++] = row;
+        }
+        if (!kept) continue;
+
+        /* Insertion sort: kept is at most 192 and already near-sorted in the
+         * common case, and this runs on the token path. */
+        for (size_t i = 1; i < kept; i++) {
+            const uint32_t v = sorted[i];
+            size_t j = i;
+            while (j && sorted[j - 1] > v) { sorted[j] = sorted[j - 1]; j--; }
+            sorted[j] = v;
+        }
+
+        uint64_t run_begin = 0, run_end = 0;
+        bool open = false;
+        for (size_t i = 0; i < kept; i++) {
+            if (i && sorted[i] == sorted[i - 1]) continue;
+            const uint64_t off = t->map_row0 +
+                                 (uint64_t)sorted[i] * DS4_ENGRAM_ROW_BYTES;
+            uint64_t first = off & ~(page - 1);
+            uint64_t last = (off + DS4_ENGRAM_ROW_BYTES + page - 1) & ~(page - 1);
+            if (last > t->map_bytes) last = t->map_bytes;
+            if (first >= last) continue;
+
+            if (open && first <= run_end) {
+                if (last > run_end) run_end = last;
+                continue;
+            }
+            if (open) {
+                posix_madvise((char *)t->map_base + run_begin,
+                              (size_t)(run_end - run_begin), POSIX_MADV_WILLNEED);
+                advises++;
+            }
+            run_begin = first;
+            run_end = last;
+            open = true;
+        }
+        if (open) {
+            posix_madvise((char *)t->map_base + run_begin,
+                          (size_t)(run_end - run_begin), POSIX_MADV_WILLNEED);
+            advises++;
+        }
+    }
+    return advises;
 }
