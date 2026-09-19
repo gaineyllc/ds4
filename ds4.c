@@ -88574,6 +88574,29 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
     if (ds4_session_rewind_speculative(s, pos)) return;
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    /* V4.1's compressor frontier only restores at even positions
+     * (ds41_graph_rewind rejects pos & 1).  Rewinding straight to an odd
+     * position therefore invalidated the whole checkpoint, and every caller
+     * then re-prefilled the full context from token 0 -- minutes of silent
+     * work at agent-sized contexts, hit by about half of all speculative
+     * boundaries and live-prefix reuses.  Rewind to the even position below
+     * and replay the single kept token: one decode step instead of a rebuild,
+     * and the caller gets exactly the state (and fresh logits) at pos. */
+    if ((pos & 1) && s->checkpoint_valid && ds4_session_is_ds41(s) &&
+        s->ds41_graph_ready) {
+        const int keep = s->checkpoint.v[pos - 1];
+        ds4_session_rewind(s, pos - 1);
+        if (s->checkpoint_valid) {
+            char e[160];
+            if (ds4_session_eval(s, keep, e, sizeof(e)) != 0 ||
+                s->checkpoint.len != pos) {
+                s->checkpoint_valid = false;
+            }
+        }
+        return;
+    }
+#endif
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         if (!ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos))
