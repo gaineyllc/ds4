@@ -12519,14 +12519,16 @@ static int server_session_sync(server *s, server_slot *slot,
     pthread_mutex_lock(&s->inference_mu);
     int live = ds4_session_pos(slot->session);
     int common = ds4_session_common_prefix(slot->session, prompt);
-    if (common > 0 && common < live) {
-        /* The live checkpoint carries a tail the new prompt does not share
-         * (a generated turn re-rendered differently, a discarded speculative
-         * block).  Rewind to the shared prefix and resume there.  Starting
-         * at zero made the first scheduling slice truncate a perfectly
-         * reusable long checkpoint to one quantum and refill the rest --
-         * the same bug the multimodal path below already documents. */
-        ds4_session_rewind(slot->session, common);
+    if (common > 0 && common < live && ds4_engine_is_deepseek41(s->engine) &&
+        ds4_session_vision_prefix_matches(slot->session, NULL, 0)) {
+        /* The live checkpoint has a tail this prompt does not share.  V4.1
+         * rewinds exactly, so drop back to the shared prefix and resume
+         * there: starting at zero made the first slice truncate a reusable
+         * checkpoint to one quantum and refill the rest (the multimodal path
+         * below documents the same trap).  Stop one short of a full match so
+         * the last prompt token is re-evaluated for fresh logits. */
+        const int target = common < prompt->len ? common : prompt->len - 1;
+        ds4_session_rewind(slot->session, target);
         live = ds4_session_pos(slot->session);
         common = ds4_session_common_prefix(slot->session, prompt);
     }
@@ -13491,18 +13493,6 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
-/* Execute one request on the worker-owned session.
- *
- * Clients resend full prompts as text.  The worker first tries the old exact
- * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,
- * then disk text-prefix restart snapshots, then a cold prefill.  On text-prefix
- * hits we build a fresh effective prompt from the checkpoint's exact token
- * history plus a newly tokenized string suffix; the canonical full-prompt
- * tokens are not sliced because BPE may merge across the byte boundary.  Cold
- * prompt caching is handled before generation: if the stable checkpoint is
- * shorter than the full prompt, we prefill to that boundary, store it, and
- * immediately continue to the real prompt.  The live graph therefore always
- * moves forward. */
 /* Rewind the live session to `rewind_to` for this request; returns the
  * cached prefix length on success, 0 when the backend could not keep the
  * state and the prompt has to be rebuilt. */
@@ -13528,6 +13518,18 @@ static int live_prefix_rewind(server *s, server_slot *slot, const job *j,
     return 0;
 }
 
+/* Execute one request on the worker-owned session.
+ *
+ * Clients resend full prompts as text.  The worker first tries the old exact
+ * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,
+ * then disk text-prefix restart snapshots, then a cold prefill.  On text-prefix
+ * hits we build a fresh effective prompt from the checkpoint's exact token
+ * history plus a newly tokenized string suffix; the canonical full-prompt
+ * tokens are not sliced because BPE may merge across the byte boundary.  Cold
+ * prompt caching is handled before generation: if the stable checkpoint is
+ * shorter than the full prompt, we prefill to that boundary, store it, and
+ * immediately continue to the real prompt.  The live graph therefore always
+ * moves forward. */
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
