@@ -184,6 +184,25 @@ int main(void) {
     greedy(rewound, &other, 4, vocab, g_b);
     if (memcmp(g_a, g_b, sizeof(g_a)) != 0) fail("short rewind changed greedy tokens");
 
+    /* An odd target.  V4.1's compressor frontier only restores at even
+     * positions; ds4_session_rewind must still land exactly on the odd
+     * position with the state kept (replaying one token), not invalidate the
+     * checkpoint and force a from-zero rebuild. */
+    {
+        const int odd = deep | 1;
+        int g_c[4], g_d[4];
+        sync_or_fail(rewound, &full, "odd setup");
+        greedy(rewound, &full, 4, vocab, g_c);
+        ds4_session_rewind(rewound, odd);
+        if (ds4_session_pos(rewound) != odd) fail("odd rewind position");
+        if (ds4_session_common_prefix(rewound, &full) != odd) fail("odd rewind kept no state");
+        sync_or_fail(rewound, &full, "odd tail");
+        greedy(rewound, &full, 4, vocab, g_d);
+        fprintf(stderr, "odd rewind to %d: greedy %d %d %d %d vs %d %d %d %d\n", odd,
+                g_c[0], g_c[1], g_c[2], g_c[3], g_d[0], g_d[1], g_d[2], g_d[3]);
+        if (memcmp(g_c, g_d, sizeof(g_c)) != 0) fail("odd rewind changed greedy tokens");
+    }
+
     fprintf(stderr, "V4.1 rewind PASS n=%d deep=%d\n", n, deep);
     free(l_fresh); free(l_staged); free(l_rewound); free(l_div); free(l_rw2);
     ds4_session_free(fresh); ds4_session_free(staged); ds4_session_free(rewound); ds4_session_free(diverged);
