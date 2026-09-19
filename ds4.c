@@ -41304,7 +41304,7 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
 static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
     ds4_context_memory m = {.prefill_cap = ds41_prefill_limit(ctx),
                            .raw_cap = 128, .comp_cap = ctx + 1u};
-    m.raw_bytes = 40u * 128u * 512u * sizeof(float);
+    m.raw_bytes = (uint64_t)40u * (128u + ds41_raw_log_rows(ctx)) * 512u * sizeof(float);
     for (uint32_t i = 0; i < 4; i++)
         m.compressed_bytes += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) *
                               (512u + 128u) * sizeof(float);
@@ -43582,6 +43582,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     if (!ds41_hash_tokens(g, &next_history, tokens, total_count, &ids[0][0][0]))
         return false;
     const uint32_t initial_start = g->pos;
+    /* With the decoder suffix, layers 20-39 compute only a shrinking tail of
+     * this sweep -- layer 39 just its last 128 rows -- so the rewind ring holds
+     * no raw rows of theirs before that.  Rewinds may not land inside it. */
+    if (decoder_suffix && initial_start + total_count - 128u > g->raw_log_from)
+        g->raw_log_from = initial_start + total_count - 128u;
     g->valid = false;
     ds41_gpu_graph row = *g;
     /* The complete current layer is mapped for prefill. Refresh the bounded
@@ -88584,7 +88589,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
      * and replay the single kept token: one decode step instead of a rebuild,
      * and the caller gets exactly the state (and fresh logits) at pos. */
     if ((pos & 1) && s->checkpoint_valid && ds4_session_is_ds41(s) &&
-        s->ds41_graph_ready) {
+        s->ds41_graph_ready && s->checkpoint_image_count == 0) {
         const int keep = s->checkpoint.v[pos - 1];
         ds4_session_rewind(s, pos - 1);
         if (s->checkpoint_valid) {
@@ -88640,7 +88645,10 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+    /* Text-only: the rebuilt Engram history (and an odd target's replayed
+     * token) would treat image positions as text. */
     if (s->checkpoint_valid && ds4_session_is_ds41(s) && s->ds41_graph_ready &&
+        s->checkpoint_image_count == 0 &&
         s->ds41_graph.pos == (uint32_t)s->checkpoint.len && ds4_gpu_synchronize())
         state_ok = ds41_graph_rewind(&s->ds41_graph, s->checkpoint.v, (uint32_t)pos);
 #endif
