@@ -11609,7 +11609,7 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  * it while scoring); slot_probe_reuse() is the worker-path wrapper.
  * ========================================================================= */
 
-static int live_prefix_rewind_target(bool backend_can_rewind,
+static int live_prefix_rewind_target(bool backend_can_rewind, int align,
                                      int old_pos, int prompt_len, int common);
 
 typedef enum {
@@ -11714,8 +11714,17 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     const int common = ds4_session_common_prefix(slot->session, &req->prompt);
     const bool token_image_prefix = ds4_session_vision_prefix_matches(
         slot->session, req->images, req->image_count);
+    /* V4.1 rewinds exactly, images included: the session retains its image
+     * spans so the rebuilt Engram history masks those positions instead of
+     * hashing placeholder ids as text (ds4.c). The condition is therefore the
+     * same one the other live tiers use -- the checkpoint's images must be a
+     * prefix of the request's -- not the old text-only test, which asked for a
+     * (NULL, 0) match and so was false for any checkpoint holding an image. */
+    const bool ds41_rewind = ds4_engine_is_deepseek41(s->engine) &&
+        token_image_prefix;
     const int rewind_to = live_prefix_rewind_target(
-        ds4_engine_is_glm_dsa(s->engine), live_pos, req->prompt.len, common);
+        ds41_rewind || ds4_engine_is_glm_dsa(s->engine), ds41_rewind ? 2 : 1,
+        live_pos, req->prompt.len, common == req->prompt.len ? common : 0);
     if (rewind_to >= 0 && token_image_prefix) {
         pr.kind = REUSE_MEMORY_REWIND;
         pr.reuse_tokens = rewind_to;
@@ -11761,6 +11770,17 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.reuse_tokens = live_pos;
         pr.suffix_off = slot->live_text_len;
         return pr;
+    }
+
+    if (ds41_rewind && token_image_prefix && common < live_pos &&
+        common < req->prompt.len) {
+        const int diverged_to = live_prefix_rewind_target(true, 2, live_pos,
+                                                          req->prompt.len, common);
+        if (diverged_to >= 0) {
+            pr.kind = REUSE_MEMORY_REWIND;
+            pr.reuse_tokens = diverged_to;
+            return pr;
+        }
     }
 
     return pr;
@@ -12465,8 +12485,11 @@ static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
     int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
     if (generation_active && quantum < 1024 && s->engine &&
-        ds4_engine_is_glm53(s->engine)) {
+        (ds4_engine_is_glm53(s->engine) || ds4_engine_is_deepseek41(s->engine))) {
         quantum = 1024;
+    }
+    if (!generation_active && s->engine && ds4_engine_is_deepseek41(s->engine)) {
+        quantum = 16384;
     }
     return quantum;
 }
@@ -12496,6 +12519,17 @@ static int server_session_sync(server *s, server_slot *slot,
     pthread_mutex_lock(&s->inference_mu);
     int live = ds4_session_pos(slot->session);
     int common = ds4_session_common_prefix(slot->session, prompt);
+    if (common > 0 && common < live) {
+        /* The live checkpoint carries a tail the new prompt does not share
+         * (a generated turn re-rendered differently, a discarded speculative
+         * block).  Rewind to the shared prefix and resume there.  Starting
+         * at zero made the first scheduling slice truncate a perfectly
+         * reusable long checkpoint to one quantum and refill the rest --
+         * the same bug the multimodal path below already documents. */
+        ds4_session_rewind(slot->session, common);
+        live = ds4_session_pos(slot->session);
+        common = ds4_session_common_prefix(slot->session, prompt);
+    }
     pthread_mutex_unlock(&s->inference_mu);
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
@@ -12649,11 +12683,25 @@ static int server_generation_rewind(server *s, server_slot *slot,
         return 0;
     }
     if (resample) pos--;
-    ds4_session_rewind(slot->session, pos);
+    /* Capture the target prefix before rewinding: the rewind below may land
+     * one token short of pos, and the sync must still reach pos exactly. */
     ds4_tokens prefix = {0};
-    ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
-    bool rebuild = ds4_session_common_prefix(slot->session, &prefix) != prefix.len;
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    const int live_len = live ? live->len : 0;
+    if (pos > live_len) pos = live_len;
+    tokens_copy_prefix(&prefix, live, pos);
+    /* ds4_session_rewind keeps V4.1 odd positions cheap (see ds4.c); if a
+     * backend still loses the frontier, say so -- a silent full rebuild at
+     * long context looks exactly like a hang. */
+    ds4_session_rewind(slot->session, pos);
+    const int common = ds4_session_common_prefix(slot->session, &prefix);
+    const bool rebuild = common != prefix.len;
     pthread_mutex_unlock(&s->inference_mu);
+    if (rebuild && prefix.len - common > 8) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: speculative rewind to %d lost the live frontier; re-prefilling %d tokens",
+                   pos, prefix.len - common);
+    }
     int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
         r->images, r->image_count, err, errlen) : 0;
     ds4_tokens_free(&prefix);

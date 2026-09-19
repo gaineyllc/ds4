@@ -16459,12 +16459,9 @@ static void ds4_gpu_stream_expert_cache_residency_publish(void) {
         }
         int due = 1;
         if (commit_every > 1) {
-            /* Pending is scanned linearly by covers(), so it cannot be allowed
-             * to grow without bound while commits are being skipped. */
-            const NSUInteger pending_now =
-                [g_stream_expert_cache_residency_pending count];
-            due = (++g_stream_expert_cache_residency_skips >= (uint32_t)commit_every) ||
-                  pending_now >= 512u;
+            /* This base publishes membership straight into the set (no
+             * pending list to bound), so only the skip count gates the commit. */
+            due = ++g_stream_expert_cache_residency_skips >= (uint32_t)commit_every;
         }
         if (due &&
             (g_stream_expert_cache_residency_dirty ||
