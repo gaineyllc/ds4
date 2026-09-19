@@ -9,6 +9,7 @@
  */
 
 #include "ds4.h"
+#include <stdbool.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -93,8 +94,12 @@ int main(void) {
         .model_path = model,
         .backend = DS4_BACKEND_METAL,
         .n_threads = 1,
-        .context_size = ctx,
+        .context_size = 16384,
         .ssd_streaming = getenv("DS4_TEST_SSD_STREAMING") != NULL,
+        /* DS4_TEST_SSD_CACHE_GB caps the expert bank (the long case adds two
+         * 16k-context sessions on top of it). */
+        .ssd_streaming_cache_bytes = getenv("DS4_TEST_SSD_CACHE_GB") ?
+            (uint64_t)strtoull(getenv("DS4_TEST_SSD_CACHE_GB"), NULL, 10) << 30 : 0,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) fail("engine open");
@@ -206,6 +211,64 @@ int main(void) {
     fprintf(stderr, "V4.1 rewind PASS n=%d deep=%d\n", n, deep);
     free(l_fresh); free(l_staged); free(l_rewound); free(l_div); free(l_rw2);
     ds4_session_free(fresh); ds4_session_free(staged); ds4_session_free(rewound); ds4_session_free(diverged);
+    /* A 10000-token prompt is prefilled as an 8192-token decoder-suffix sweep
+     * plus a tail; in that sweep layers 20-39 compute only its end (layer 39
+     * the last 128 rows).  A rewind to 6000 lands where those layers never
+     * computed raw rows, so it must drop the state, and the rebuild must match
+     * a fresh session exactly.  A rewind into the decoded tail past the prompt
+     * still keeps the state. */
+    {
+        const char *lp = getenv("DS4_TEST_LONG_PROMPT_FILE");
+        char *ltext = read_file(lp && lp[0] ? lp : "ds4_server.c", 400000);
+        if (!ltext) fail("long prompt file");
+        ds4_tokens lall = {0}, lfull = {0}, lnext = {0};
+        ds4_tokenize_text(engine, ltext, &lall);
+        if (lall.len < 10000) fail("long prompt too short (need 10000 tokens)");
+        slice(&lfull, &lall, 0, 10000);
+        const int lctx = 16384, hole = 6000;
+        ds4_session *lfresh = NULL, *lrw = NULL;
+        if (ds4_session_create(&lfresh, engine, lctx) ||
+            ds4_session_create(&lrw, engine, lctx)) fail("long session create");
+        int g_f[4], g_r[4], g_x[4], g_t[1];
+        /* Reference: the whole prompt from an empty session, which is what a
+         * dropped state rebuilds. */
+        sync_or_fail(lfresh, &lfull, "long fresh");
+        float *l_lf = logits_of(lfresh, vocab);
+        greedy(lfresh, &lfull, 4, vocab, g_f);
+        sync_or_fail(lrw, &lfull, "long setup");
+        greedy(lrw, &lfull, 4, vocab, g_x);
+        ds4_session_rewind(lrw, hole);
+        const bool kept = ds4_session_common_prefix(lrw, &lfull) == hole;
+        sync_or_fail(lrw, &lfull, "long resync");
+        float *l_lr = logits_of(lrw, vocab);
+        greedy(lrw, &lfull, 4, vocab, g_r);
+        if (kept) fail("long rewind kept state its raw rows never had");
+        const float vs_ref = max_abs_diff(l_lr, l_lf, vocab);
+        fprintf(stderr, "long rewind into a %d-token prompt at %d: state dropped; logits vs fresh sweep %g; greedy %d %d %d %d vs fresh %d %d %d %d\n",
+                lfull.len, hole, vs_ref,
+                g_r[0], g_r[1], g_r[2], g_r[3], g_f[0], g_f[1], g_f[2], g_f[3]);
+        if (vs_ref > 1e-4f) fail("long rebuild differs from a fresh sweep");
+        if (memcmp(g_r, g_f, sizeof(g_f)) != 0) fail("long rewind changed greedy tokens");
+        free(l_lf); free(l_lr);
+
+        /* Past the sweep: rewind by one decoded token (odd target) and
+         * regenerate the last greedy token from the kept state. */
+        slice(&lnext, &lfull, 0, lfull.len);
+        for (int i = 0; i < 3; i++) ds4_tokens_push(&lnext, g_r[i]);
+        ds4_session_rewind(lrw, lnext.len);
+        if (ds4_session_pos(lrw) != lnext.len ||
+            ds4_session_common_prefix(lrw, &lnext) != lnext.len)
+            fail("rewind past a long sweep kept no state");
+        greedy(lrw, &lnext, 1, vocab, g_t);
+        fprintf(stderr, "rewind past the sweep to %d: state kept, greedy %d vs %d\n",
+                lnext.len, g_t[0], g_r[3]);
+        if (g_t[0] != g_r[3]) fail("rewind past a long sweep changed greedy token");
+        ds4_session_free(lfresh); ds4_session_free(lrw);
+        ds4_tokens_free(&lall); ds4_tokens_free(&lfull); ds4_tokens_free(&lnext);
+        free(ltext);
+        fprintf(stderr, "V4.1 long-sweep rewind PASS\n");
+    }
+
     ds4_engine_close(engine);
     free(text);
     return 0;
