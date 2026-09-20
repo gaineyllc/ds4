@@ -904,6 +904,8 @@ static uint32_t ds4_gpu_stream_expert_reap_idle_tokens(void);
 static uint32_t ds4_gpu_stream_expert_reap_max_per_token(void);
 static uint64_t g_stream_expert_reap_evictions;
 static uint64_t g_stream_expert_reap_passes;
+static uint64_t g_stream_expert_reap_calls;
+static uint64_t g_stream_expert_reap_cand_hot, g_stream_expert_reap_cand_recent, g_stream_expert_reap_cand_inflight;
 static void ds4_gpu_stream_expert_cache_residency_flush_retired(void);
 static void ds4_gpu_stream_expert_cache_residency_detach(void);
 static int g_stream_expert_cache_prefill_pins;
@@ -1034,7 +1036,7 @@ enum {
      * resident, how many may be reaped per token, and the resident-entry floor
      * below which reaping is pointless. */
     DS4_METAL_STREAM_EXPERT_REAP_IDLE_TOKENS = 512,
-    DS4_METAL_STREAM_EXPERT_REAP_MAX_PER_TOKEN = 8,
+    DS4_METAL_STREAM_EXPERT_REAP_MAX_PER_TOKEN = 0,   /* off: measured, see below */
     DS4_METAL_STREAM_EXPERT_REAP_FLOOR_ENTRIES = 256,
     DS4_METAL_STREAM_EXPERT_VALIDATE_WORDS = 16,
 };
@@ -1064,6 +1066,10 @@ typedef struct {
     uint64_t down_expert_bytes;
     uint64_t logical_bytes;
     uint64_t last_used;
+    /* g_stream_expert_cache_decode_tokens at the last use. last_used counts
+     * cache uses (~6 experts x ~60 layers per token), so it cannot express an
+     * idle window in tokens; the reaper needs one that can. */
+    uint64_t last_used_token;
     uint64_t use_count;
     NSUInteger gate_inner;
     NSUInteger up_inner;
@@ -5035,10 +5041,50 @@ void ds4_gpu_print_memory_report(const char *label) {
                     (unsigned long long)g_stream_expert_cache_decode_tokens,
                     g_stream_expert_cache_first_decode_layer,
                     (unsigned long long)g_stream_expert_cache_hotness_decay_token);
+            {
+                /* Idle-age distribution of the resident bank: how many experts
+                 * have gone untouched for how long, and how many carry zero
+                 * route hotness. This is the population any proactive eviction
+                 * policy would act on -- if it is empty, experts do not go
+                 * cold and there is nothing to reap. */
+                static const uint64_t edge[7] =
+                    { 16, 64, 128, 256, 512, 1024, UINT64_MAX };
+                uint64_t bucket[7] = {0}, cold_hot0 = 0, resident = 0, never = 0;
+                const uint64_t now_tok = g_stream_expert_cache_decode_tokens;
+                for (uint32_t l = 0; l < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; l++) {
+                    for (uint32_t x = 0; x < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; x++) {
+                        const ds4_gpu_stream_expert_cache_entry *e =
+                            &g_stream_expert_cache[l][x];
+                        if (!e->valid) continue;
+                        resident++;
+                        if (g_stream_expert_cache_route_hotness[l][x] == 0) cold_hot0++;
+                        if (e->last_used == 0) { never++; continue; }
+                        const uint64_t age = now_tok > e->last_used_token ?
+                            now_tok - e->last_used_token : 0;
+                        for (uint32_t b = 0; b < 7; b++) {
+                            if (age < edge[b]) { bucket[b]++; break; }
+                        }
+                    }
+                }
+                fprintf(stderr,
+                        "ds4:   expert idle age (tokens since last use, of %llu resident, %llu never used, %llu with hotness 0): "
+                        "<16=%llu <64=%llu <128=%llu <256=%llu <512=%llu <1024=%llu >=1024=%llu\n",
+                        (unsigned long long)resident,
+                        (unsigned long long)never,
+                        (unsigned long long)cold_hot0,
+                        (unsigned long long)bucket[0], (unsigned long long)bucket[1],
+                        (unsigned long long)bucket[2], (unsigned long long)bucket[3],
+                        (unsigned long long)bucket[4], (unsigned long long)bucket[5],
+                        (unsigned long long)bucket[6]);
+            }
             fprintf(stderr,
-                    "ds4:   streaming cache reaper evictions=%llu passes=%llu resident=%u idle_tokens=%u budget=%u\n",
+                    "ds4:   streaming cache reaper evictions=%llu passes=%llu calls=%llu skip_hot=%llu skip_recent=%llu skip_inflight=%llu resident=%u idle_tokens=%u budget=%u\n",
                     (unsigned long long)g_stream_expert_reap_evictions,
                     (unsigned long long)g_stream_expert_reap_passes,
+                    (unsigned long long)g_stream_expert_reap_calls,
+                    (unsigned long long)g_stream_expert_reap_cand_hot,
+                    (unsigned long long)g_stream_expert_reap_cand_recent,
+                    (unsigned long long)g_stream_expert_reap_cand_inflight,
                     g_stream_expert_cache_entry_count,
                     ds4_gpu_stream_expert_reap_idle_tokens(),
                     ds4_gpu_stream_expert_reap_max_per_token());
@@ -15442,6 +15488,7 @@ void ds4_gpu_stream_expert_cache_shrink_for_decode(uint64_t context_bytes) {
             e->down_inner = 0;
             e->inflight_seq = 0;
             e->last_used = 0;
+    e->last_used_token = 0;
             e->use_count = 0;
             e->slab_slot = 0;
             e->valid = 0;
@@ -15668,7 +15715,27 @@ static void ds4_gpu_stream_expert_cache_maybe_decay_route_hotness(void) {
  * retire list bounded.
  *
  * Being wrong costs one re-stream of that expert from SSD; being right saves
- * commit time on every token until the conversation ends. */
+ * commit time on every token until the conversation ends.
+ *
+ * DEFAULT OFF -- measured 2026-09-20, M5 Max, 52 GB bank, two concurrent
+ * sessions x three turns on three different subjects, 2400 decode tokens.
+ * The idle-age histogram below reports the population this policy would act
+ * on, and it is empty: of 4841 resident experts, 1909 were used within the
+ * last 16 tokens, 2142 within 64, 790 within 128, and NOTHING was idle beyond
+ * 128 tokens. Experts do not go cold -- V4.1 routes broadly enough that the
+ * whole bank is a live working set, and the 10% miss rate comes from the
+ * working set being larger than the bank, not from the bank holding junk.
+ * Forced on with a 64-token window it evicted 6829 experts that were all
+ * immediately re-admitted: churn, no change in wall time (244.9 s against
+ * 246.3 s with it off, inside noise).
+ *
+ * Note also that 3148 of those 4841 carried zero route hotness while still
+ * being used within 128 tokens, so hotness==0 is not a drift signal on its
+ * own -- it decays faster than real reuse. Any future policy needs the idle
+ * age, not the hotness, and needs a bank large enough to hold cold entries
+ * before it has anything to do.
+ *
+ * DS4_METAL_V41_EXPERT_REAP_MAX_PER_TOKEN=8 turns it on. */
 static uint32_t ds4_gpu_stream_expert_reap_idle_tokens(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -15723,11 +15790,12 @@ static void ds4_gpu_stream_expert_cache_reap_idle(void) {
     if (g_stream_expert_cache_entry_count <= floor_entries) return;
     if (ds4_gpu_stream_expert_defer_in_flight()) return;
 
-    /* last_used is an install/use counter, not the token clock, so compare it
-     * against the clock's own horizon. */
-    if (g_stream_expert_cache_clock <= (uint64_t)idle_tokens) return;
-    const uint64_t horizon = g_stream_expert_cache_clock - (uint64_t)idle_tokens;
+    /* In tokens: last_used counts cache uses, which advance ~360x faster. */
+    if (g_stream_expert_cache_decode_tokens <= (uint64_t)idle_tokens) return;
+    const uint64_t horizon =
+        g_stream_expert_cache_decode_tokens - (uint64_t)idle_tokens;
 
+    g_stream_expert_reap_calls++;
     uint32_t reaped = 0;
     uint32_t live = g_stream_expert_cache_entry_count;
     for (uint32_t n = 0;
@@ -15742,9 +15810,19 @@ static void ds4_gpu_stream_expert_cache_reap_idle(void) {
              expert++) {
             if (live <= floor_entries) break;
             ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
-            if (!e->valid || e->inflight_seq != 0) continue;
-            if (g_stream_expert_cache_route_hotness[layer][expert] != 0) continue;
-            if (e->last_used == 0 || e->last_used > horizon) continue;
+            if (!e->valid) continue;
+            /* inflight_seq is a stamp, not a flag: it stays set after the
+             * command buffer that used the entry retired. Compare it against
+             * the completed sequence, as the cache's own helper does. */
+            if (ds4_gpu_stream_expert_cache_entry_inflight(e)) {
+                g_stream_expert_reap_cand_inflight++; continue;
+            }
+            if (g_stream_expert_cache_route_hotness[layer][expert] != 0) {
+                g_stream_expert_reap_cand_hot++; continue;
+            }
+            if (e->last_used == 0 || e->last_used_token > horizon) {
+                g_stream_expert_reap_cand_recent++; continue;
+            }
             ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 1);
             if (!e->valid) {
                 reaped++;
@@ -16770,6 +16848,7 @@ static void ds4_gpu_stream_full_expert_addr_clear_layer(uint32_t layer) {
     e->down_expert_bytes = 0;
     e->logical_bytes = 0;
     e->last_used = 0;
+    e->last_used_token = 0;
     e->use_count = 0;
     e->gate_inner = 0;
     e->up_inner = 0;
@@ -17672,6 +17751,7 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
     e->down_expert_bytes = 0;
     e->logical_bytes = 0;
     e->last_used = 0;
+    e->last_used_token = 0;
     e->use_count = 0;
     e->gate_inner = 0;
     e->up_inner = 0;
@@ -18618,6 +18698,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
     }
 
     e->last_used = ++g_stream_expert_cache_clock;
+    e->last_used_token = g_stream_expert_cache_decode_tokens;
     e->use_count++;
     if (g_stream_bank_prefill_rows == 0) e->bank_transient = 0;
     g_stream_expert_cache_hits++;
@@ -18699,6 +18780,7 @@ ds4_gpu_stream_expert_cache_install_loaded(
      * each of 40 layers, more than the bank holds). A hit outside a bank
      * prefill clears the mark. */
     e->last_used = ++g_stream_expert_cache_clock;
+    e->last_used_token = g_stream_expert_cache_decode_tokens;
     e->bank_transient = g_stream_bank_prefill_rows != 0;
     e->use_count = 1;
     e->gate_inner = gate_inner;
@@ -18771,6 +18853,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
                                                   gate_expert_bytes,
                                                   down_expert_bytes)) {
         e->last_used = ++g_stream_expert_cache_clock;
+    e->last_used_token = g_stream_expert_cache_decode_tokens;
         e->use_count++;
         if (g_stream_bank_prefill_rows == 0) e->bank_transient = 0;
         g_stream_expert_cache_hits++;
