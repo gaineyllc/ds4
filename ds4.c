@@ -62222,7 +62222,7 @@ typedef struct {
     float *data;
 } ds4_vision_identity;
 
-static void ds4_session_free_vision_identities(ds4_vision_identity *v, size_t n);
+static void ds4_session_free_vision_identities(ds4_vision_span *v, size_t n);
 
 struct ds4_session {
     ds4_engine *engine;
@@ -62279,7 +62279,9 @@ struct ds4_session {
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
-    ds4_vision_identity *checkpoint_images;
+    /* Owned deep copies of the session's image spans, embedding rows
+     * included. The graph points at these for the life of the session. */
+    ds4_vision_span *checkpoint_images;
     size_t checkpoint_image_count;
     const ds4_vision_span *sync_images;
     size_t sync_image_count;
@@ -77569,12 +77571,12 @@ bool ds4_session_vision_prefix_matches(
     if (!s->checkpoint_valid) return false;
     if (s->checkpoint_image_count > image_count) return false;
     for (size_t i = 0; i < s->checkpoint_image_count; i++) {
-        const ds4_vision_identity *old = &s->checkpoint_images[i];
+        const ds4_vision_span *old = &s->checkpoint_images[i];
         const ds4_vision_span *current = &images[i];
         if (old->token_start != current->token_start ||
-            old->token_count != current->embedding.token_count ||
-            memcmp(old->fingerprint, current->embedding.fingerprint,
-                   sizeof(old->fingerprint)) != 0) return false;
+            old->embedding.token_count != current->embedding.token_count ||
+            memcmp(old->embedding.fingerprint, current->embedding.fingerprint,
+                   sizeof(old->embedding.fingerprint)) != 0) return false;
     }
     if (s->checkpoint_image_count < image_count) {
         const ds4_vision_span *next = &images[s->checkpoint_image_count];
@@ -77600,11 +77602,11 @@ bool ds4_session_vision_fingerprint_prefix_matches(
     if ((image_count != 0 && !images)) return false;
     if (s->checkpoint_image_count > image_count) return false;
     for (size_t i = 0; i < s->checkpoint_image_count; i++) {
-        const ds4_vision_identity *old = &s->checkpoint_images[i];
+        const ds4_vision_span *old = &s->checkpoint_images[i];
         const ds4_vision_span *current = &images[i];
-        if (old->token_count != current->embedding.token_count ||
-            memcmp(old->fingerprint, current->embedding.fingerprint,
-                   sizeof(old->fingerprint)) != 0) return false;
+        if (old->embedding.token_count != current->embedding.token_count ||
+            memcmp(old->embedding.fingerprint, current->embedding.fingerprint,
+                   sizeof(old->embedding.fingerprint)) != 0) return false;
     }
     return true;
 }
@@ -77614,8 +77616,8 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
     if (!s || !s->checkpoint_valid || (image_count && !images) ||
         image_count != s->checkpoint_image_count) return false;
     for (size_t i = 0; i < image_count; i++) {
-        if (images[i].embedding.token_count != s->checkpoint_images[i].token_count ||
-            memcmp(images[i].embedding.fingerprint, s->checkpoint_images[i].fingerprint,
+        if (images[i].embedding.token_count != s->checkpoint_images[i].embedding.token_count ||
+            memcmp(images[i].embedding.fingerprint, s->checkpoint_images[i].embedding.fingerprint,
                    sizeof(images[i].embedding.fingerprint))) return false;
     }
     for (size_t i = 0; i < image_count; i++)
@@ -77642,34 +77644,32 @@ static bool ds4_session_vision_range_overlaps(
     return false;
 }
 
-static void ds4_session_free_vision_identities(ds4_vision_identity *v, size_t n) {
+static void ds4_session_free_vision_identities(ds4_vision_span *v, size_t n) {
     if (!v) return;
-    for (size_t i = 0; i < n; i++) free(v[i].data);
+    for (size_t i = 0; i < n; i++) free(v[i].embedding.data);
     free(v);
 }
 
 static bool ds4_session_store_vision_identities(ds4_session *s) {
-    ds4_vision_identity *copy = NULL;
+    ds4_vision_span *copy = NULL;
     if (s->sync_image_count != 0) {
         if (s->sync_image_count > SIZE_MAX / sizeof(copy[0])) return false;
         copy = calloc(s->sync_image_count, sizeof(copy[0]));
         if (!copy) return false;
         for (size_t i = 0; i < s->sync_image_count; i++) {
-            copy[i].token_start = s->sync_images[i].token_start;
-            copy[i].token_count = s->sync_images[i].embedding.token_count;
-            memcpy(copy[i].fingerprint,
-                   s->sync_images[i].embedding.fingerprint,
-                   sizeof(copy[i].fingerprint));
+            copy[i] = s->sync_images[i];
+            copy[i].embedding.data = NULL;
             const float *src = s->sync_images[i].embedding.data;
             const uint64_t values =
-                (uint64_t)copy[i].token_count * (uint64_t)DS4_N_EMBD;
+                (uint64_t)copy[i].embedding.token_count * (uint64_t)DS4_N_EMBD;
             if (src && values != 0 && values <= SIZE_MAX / sizeof(float)) {
-                copy[i].data = malloc((size_t)values * sizeof(float));
-                if (!copy[i].data) {
+                copy[i].embedding.data = malloc((size_t)values * sizeof(float));
+                if (!copy[i].embedding.data) {
                     ds4_session_free_vision_identities(copy, i + 1);
                     return false;
                 }
-                memcpy(copy[i].data, src, (size_t)values * sizeof(float));
+                memcpy(copy[i].embedding.data, src,
+                       (size_t)values * sizeof(float));
             }
         }
     }
@@ -77677,6 +77677,12 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
                                        s->checkpoint_image_count);
     s->checkpoint_images = copy;
     s->checkpoint_image_count = s->sync_image_count;
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (ds4_session_is_ds41(s)) {
+        s->ds41_graph.images = s->checkpoint_images;
+        s->ds41_graph.image_count = s->checkpoint_image_count;
+    }
+#endif
     return true;
 }
 
@@ -77924,8 +77930,12 @@ int ds4_session_sync_multimodal(
     const int rc = ds4_session_sync(s, prompt, err, errlen);
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
-        s->ds41_graph.images = NULL;
-        s->ds41_graph.image_count = 0;
+        /* Point at the session's own copies rather than dropping the view:
+         * ds41_image_at and ds41_text_mask must still know where the image
+         * rows are long after the caller's spans are gone, or a later rewind
+         * hashes image positions as text. */
+        s->ds41_graph.images = s->checkpoint_images;
+        s->ds41_graph.image_count = s->checkpoint_image_count;
     }
 #endif
 #ifndef DS4_NO_GPU
@@ -88707,7 +88717,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
      * and replay the single kept token: one decode step instead of a rebuild,
      * and the caller gets exactly the state (and fresh logits) at pos. */
     if ((pos & 1) && s->checkpoint_valid && ds4_session_is_ds41(s) &&
-        s->ds41_graph_ready && s->checkpoint_image_count == 0) {
+        s->ds41_graph_ready) {
         const int keep = s->checkpoint.v[pos - 1];
         ds4_session_rewind(s, pos - 1);
         if (s->checkpoint_valid) {
@@ -88763,10 +88773,10 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    /* Text-only: the rebuilt Engram history (and an odd target's replayed
-     * token) would treat image positions as text. */
+    /* Image positions are handled, not excluded: the graph still points at the
+     * session's retained spans, so ds41_text_mask keeps them out of the
+     * rebuilt Engram history instead of hashing placeholder ids as text. */
     if (s->checkpoint_valid && ds4_session_is_ds41(s) && s->ds41_graph_ready &&
-        s->checkpoint_image_count == 0 &&
         s->ds41_graph.pos == (uint32_t)s->checkpoint.len && ds4_gpu_synchronize())
         state_ok = ds41_graph_rewind(&s->ds41_graph, s->checkpoint.v, (uint32_t)pos);
 #endif
@@ -88828,12 +88838,8 @@ void ds4_session_set_test_images(ds4_session *s,
     if (n == 0 || !images) return;
     s->checkpoint_images = xcalloc(n, sizeof(*s->checkpoint_images));
     for (size_t i = 0; i < n; i++) {
-        s->checkpoint_images[i].token_start = images[i].token_start;
-        s->checkpoint_images[i].token_count =
-            images[i].embedding.token_count;
-        memcpy(s->checkpoint_images[i].fingerprint,
-               images[i].embedding.fingerprint,
-               sizeof(s->checkpoint_images[i].fingerprint));
+        s->checkpoint_images[i] = images[i];
+        s->checkpoint_images[i].embedding.data = NULL;
     }
     s->checkpoint_image_count = n;
 }
