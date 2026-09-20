@@ -507,6 +507,12 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
     return ok;
 }
 
+/* A checkpoint may carry sidecars (<file>.experts); they go with it. */
+static void kv_unlink_sidecars(const char *path) {
+    char side[4096];
+    if (snprintf(side, sizeof(side), "%s.experts", path) < (int)sizeof(side)) unlink(side);
+}
+
 static bool kv_cache_incoming_supersedes_continued(
         const ds4_kvstore_entry *e,
         const ds4_kvstore_eviction_context *incoming) {
@@ -593,6 +599,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
         }
         ds4_kvstore_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
+            kv_unlink_sidecars(e.path);
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                     "%s: kv cache evicted reason=disk-cache-full tokens=%u hits=%u size=%.2f MiB file=%s",
                     kv_log_name(kc),
@@ -861,6 +868,7 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
     ds4_kvstore_entry_free(&e);
     if (!compatible) {
         if (unlink(path) == 0) {
+            kv_unlink_sidecars(path);
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                     "%s: kv cache replaced incompatible file %s",
                     kv_log_name(kc), path);
@@ -1142,6 +1150,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         }
         unlink(tmp);
     } else {
+        if (hooks && hooks->stored) hooks->stored(hooks->ud, path);
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
                 kv_log_name(kc),
@@ -1300,6 +1309,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         } else {
             ds4_session_invalidate(session);
             unlink(path);
+            kv_unlink_sidecars(path);
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                     "%s: kv cache discarded corrupt text-prefix payload%s%s %s",
                     kv_log_name(kc),
