@@ -62210,7 +62210,19 @@ typedef struct {
     uint32_t token_start;
     uint32_t token_count;
     uint8_t fingerprint[32];
+    /* The projected image rows themselves (token_count * DS4_N_EMBD floats),
+     * owned by the session.  Kept because the identity alone cannot rebuild
+     * anything: at an image position checkpoint.v holds a placeholder token
+     * whose KV came from these rows, so any path that re-derives state from
+     * token ids (graph rewind, a disk restore) would treat the image as text.
+     * ~7.3 MB for a 256-token image at n_embd 7168, against ~3.8 MB of MLA KV
+     * for the same rows -- cheap enough to keep, and it means a restore never
+     * needs the vision tower.  NULL when the source span carried no data (test
+     * checkpoints). */
+    float *data;
 } ds4_vision_identity;
+
+static void ds4_session_free_vision_identities(ds4_vision_identity *v, size_t n);
 
 struct ds4_session {
     ds4_engine *engine;
@@ -75959,7 +75971,7 @@ void ds4_session_free(ds4_session *s) {
 #endif
     token_vec_free(&s->checkpoint);
     token_vec_free(&s->greedy_splitkv_segment);
-    free(s->checkpoint_images);
+    ds4_session_free_vision_identities(s->checkpoint_images, s->checkpoint_image_count);
     free(s->logits);
     free(s->sample_probs);
 #ifndef DS4_NO_GPU
@@ -77630,6 +77642,12 @@ static bool ds4_session_vision_range_overlaps(
     return false;
 }
 
+static void ds4_session_free_vision_identities(ds4_vision_identity *v, size_t n) {
+    if (!v) return;
+    for (size_t i = 0; i < n; i++) free(v[i].data);
+    free(v);
+}
+
 static bool ds4_session_store_vision_identities(ds4_session *s) {
     ds4_vision_identity *copy = NULL;
     if (s->sync_image_count != 0) {
@@ -77642,9 +77660,21 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
             memcpy(copy[i].fingerprint,
                    s->sync_images[i].embedding.fingerprint,
                    sizeof(copy[i].fingerprint));
+            const float *src = s->sync_images[i].embedding.data;
+            const uint64_t values =
+                (uint64_t)copy[i].token_count * (uint64_t)DS4_N_EMBD;
+            if (src && values != 0 && values <= SIZE_MAX / sizeof(float)) {
+                copy[i].data = malloc((size_t)values * sizeof(float));
+                if (!copy[i].data) {
+                    ds4_session_free_vision_identities(copy, i + 1);
+                    return false;
+                }
+                memcpy(copy[i].data, src, (size_t)values * sizeof(float));
+            }
         }
     }
-    free(s->checkpoint_images);
+    ds4_session_free_vision_identities(s->checkpoint_images,
+                                       s->checkpoint_image_count);
     s->checkpoint_images = copy;
     s->checkpoint_image_count = s->sync_image_count;
     return true;
@@ -88511,7 +88541,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
-    free(s->checkpoint_images);
+    ds4_session_free_vision_identities(s->checkpoint_images, s->checkpoint_image_count);
     s->checkpoint_images = NULL;
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
@@ -88785,14 +88815,14 @@ ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
 void ds4_session_free_test_checkpoint(ds4_session *s) {
     if (!s) return;
     token_vec_free(&s->checkpoint);
-    free(s->checkpoint_images);
+    ds4_session_free_vision_identities(s->checkpoint_images, s->checkpoint_image_count);
     free(s);
 }
 
 void ds4_session_set_test_images(ds4_session *s,
                                  const ds4_vision_span *images, size_t n) {
     if (!s) return;
-    free(s->checkpoint_images);
+    ds4_session_free_vision_identities(s->checkpoint_images, s->checkpoint_image_count);
     s->checkpoint_images = NULL;
     s->checkpoint_image_count = 0;
     if (n == 0 || !images) return;
