@@ -20,6 +20,13 @@ LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 ROCM_SRCS := $(wildcard rocm/*.cuh)
 DS4_TEST_MODEL ?= ds4flash.gguf
+# DeepSeek V4.1 is 341 GB and does not fit outright on a 128 GiB machine, so
+# the model-backed tests need the streaming path to run at all; without these
+# every engine open fails and those tests skip.  They also need the ds4
+# instance lock, so stop a running ds4-server first -- ds4_test says so and
+# skips rather than dying when one is up.
+DS4_TEST_SSD_STREAMING ?= 1
+DS4_TEST_SSD_STREAMING_CACHE_GB ?= 20
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
@@ -1311,7 +1318,8 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
-	./ds4_test
+	DS4_TEST_SSD_STREAMING=$(DS4_TEST_SSD_STREAMING) \
+	DS4_TEST_SSD_STREAMING_CACHE_GB=$(DS4_TEST_SSD_STREAMING_CACHE_GB) ./ds4_test
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
