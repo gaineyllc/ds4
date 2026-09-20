@@ -540,6 +540,14 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
 #ifdef __APPLE__
+/* The bank's resident experts (not the transient prefill ones), for saving
+ * with a KV checkpoint: layer, expert, route hotness and last-use clock.
+ * Returns how many were written (at most cap). */
+uint32_t ds4_gpu_stream_expert_cache_snapshot(uint16_t *layers,
+                                              uint16_t *experts,
+                                              uint32_t *hotness,
+                                              uint64_t *last_used,
+                                              uint32_t  cap);
 /* Seed from mapped weights with blits appended to the active command buffer. */
 int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const ds4_gpu_stream_expert_table *table,

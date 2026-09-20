@@ -95,6 +95,8 @@ typedef struct {
     bool (*write)(void *ud, FILE *fp, const char *text, uint64_t *written_bytes);
     int (*load)(void *ud, FILE *fp, const void *wanted);
     const void *load_wanted;
+    /* Called with the final path after a checkpoint file is committed. */
+    void (*stored)(void *ud, const char *path);
 } ds4_kvstore_trailer_hooks;
 
 typedef struct {
