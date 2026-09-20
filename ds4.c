@@ -75149,6 +75149,91 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+typedef struct { ds4_expert_ref ref; uint64_t last_used; } ds4_expert_snap_row;
+static int ds4_expert_snap_cmp(const void *a, const void *b) {
+    const ds4_expert_snap_row *x = a, *y = b;
+    if (x->ref.hotness != y->ref.hotness) return x->ref.hotness > y->ref.hotness ? -1 : 1;
+    if (x->last_used != y->last_used) return x->last_used > y->last_used ? -1 : 1;
+    return 0;
+}
+#endif
+
+int ds4_engine_expert_snapshot(ds4_engine *e, ds4_expert_ref *out, int cap) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!e || !out || cap <= 0 || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL)
+        return 0;
+    const uint32_t max = (uint32_t)DS4_N_LAYER * DS4_N_EXPERT;
+    uint16_t *layers = xmalloc(max * sizeof(*layers));
+    uint16_t *experts = xmalloc(max * sizeof(*experts));
+    uint32_t *hot = xmalloc(max * sizeof(*hot));
+    uint64_t *last = xmalloc(max * sizeof(*last));
+    const uint32_t n = ds4_gpu_stream_expert_cache_snapshot(layers, experts, hot, last, max);
+    ds4_expert_snap_row *rows = xmalloc((n ? n : 1) * sizeof(*rows));
+    for (uint32_t i = 0; i < n; i++)
+        rows[i] = (ds4_expert_snap_row){{layers[i], experts[i], hot[i]}, last[i]};
+    qsort(rows, n, sizeof(*rows), ds4_expert_snap_cmp);
+    const int take = (int)n < cap ? (int)n : cap;
+    for (int i = 0; i < take; i++) out[i] = rows[i].ref;
+    free(rows); free(layers); free(experts); free(hot); free(last);
+    return take;
+#else
+    (void)e; (void)out; (void)cap;
+    return 0;
+#endif
+}
+
+int ds4_engine_expert_bank_count(ds4_engine *e, int *capacity) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (capacity) *capacity = e && e->ssd_streaming ?
+        (int)ds4_gpu_stream_expert_cache_configured_count() : 0;
+    return e && e->ssd_streaming ? (int)ds4_gpu_stream_expert_cache_current_count() : 0;
+#else
+    (void)e;
+    if (capacity) *capacity = 0;
+    return 0;
+#endif
+}
+
+int ds4_engine_expert_restore(ds4_engine *e, const ds4_expert_ref *refs, int n) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!e || !refs || n <= 0 || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL)
+        return 0;
+    const int budget = (int)ds4_gpu_stream_expert_cache_configured_count();
+    if (budget > 0 && n > budget) n = budget;
+    /* refs arrive hottest first.  Rank maps to priority 8..1: route hotness
+     * halves every 16 decode tokens, so a larger seed would keep a stale
+     * working set pinned against the session's live experts (the prefill
+     * seeder learned the same limit). */
+    int32_t ids[DS4_MAX_EXPERT];
+    uint32_t prio[DS4_MAX_EXPERT];
+    int submitted = 0;
+    if (!ds4_gpu_begin_commands()) return 0;
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+        uint32_t k = 0;
+        for (int i = 0; i < n && k < (uint32_t)DS4_N_EXPERT; i++) {
+            if (refs[i].layer != il || refs[i].expert >= DS4_N_EXPERT) continue;
+            ids[k] = refs[i].expert;
+            prio[k] = 1u + (uint32_t)(7ull * (uint64_t)(n - i) / (uint64_t)n);
+            k++;
+        }
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        if (!k || !l->ffn_gate_exps || !l->ffn_down_exps) continue;
+        const ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(
+            &e->model, l, il,
+            routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP,
+            routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD);
+        if (ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(&table, ids, prio, k))
+            submitted += (int)k;
+    }
+    (void)ds4_gpu_end_commands();
+    return submitted;
+#else
+    (void)e; (void)refs; (void)n;
+    return 0;
+#endif
+}
+
 bool ds4_engine_is_deepseek41(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;

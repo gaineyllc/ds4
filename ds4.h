@@ -358,6 +358,15 @@ int ds4_dump_chat_tokenization(const char *model_path,
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_deepseek41(ds4_engine *e);
+/* SSD-streaming expert bank <-> KV checkpoints.  The bank is shared by every
+ * session, so a checkpoint records the bank's working set when it is written
+ * and restoring feeds that set back through the bank's own admission: the
+ * hottest first, with modest priorities, and the bank's global eviction
+ * (coldest route hotness first) deciding what stays when it is full. */
+typedef struct { uint16_t layer, expert; uint32_t hotness; } ds4_expert_ref;
+int ds4_engine_expert_snapshot(ds4_engine *e, ds4_expert_ref *out, int cap);
+int ds4_engine_expert_restore(ds4_engine *e, const ds4_expert_ref *refs, int n);
+int ds4_engine_expert_bank_count(ds4_engine *e, int *capacity);
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);

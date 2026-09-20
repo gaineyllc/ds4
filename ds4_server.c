@@ -11251,6 +11251,85 @@ static int kv_cache_tool_map_load_cb(void *ud, FILE *fp, const void *wanted) {
     return kv_tool_map_load_from_pos((server *)ud, fp, (const stop_list *)wanted);
 }
 
+/* Expert-bank sidecar: <checkpoint>.experts holds the bank's working set at
+ * store time; a load feeds it back into the bank.  DS4_KV_EXPERTS=0 turns
+ * both off. */
+#define KV_EXPERTS_MAGIC 0x58345344u /* "DS4X" */
+#define DS4_N_LAYER_MAX_EXPERT_REFS (80 * 384)
+static bool kv_experts_enabled(void) {
+    /* Off by default: measured neutral at best on this machine (see the commit
+     * message).  DS4_KV_EXPERTS=1 turns capture and restore on. */
+    const char *v = getenv("DS4_KV_EXPERTS");
+    return v && strcmp(v, "0") && strcmp(v, "");
+}
+
+/* How many of the saved experts to reinstall.  Filling the bank leaves the
+ * incoming request no free slots, so every expert it really needs arrives by
+ * eviction: DS4_KV_EXPERTS_MAX caps the restore and keeps headroom. */
+static int kv_experts_restore_max(void) {
+    const char *v = getenv("DS4_KV_EXPERTS_MAX");
+    if (!v || !v[0]) return 0;
+    const long n = strtol(v, NULL, 10);
+    return n > 0 && n < INT_MAX ? (int)n : 0;
+}
+
+static void kv_cache_experts_stored_cb(void *ud, const char *path) {
+    server *s = ud;
+    if (!s || !path || !kv_experts_enabled()) return;
+    const int cap = DS4_N_LAYER_MAX_EXPERT_REFS;
+    ds4_expert_ref *refs = xmalloc(cap * sizeof(*refs));
+    const int n = ds4_engine_expert_snapshot(s->engine, refs, cap);
+    if (n > 0) {
+        char tmp[4096], side[4096];
+        snprintf(side, sizeof(side), "%s.experts", path);
+        snprintf(tmp, sizeof(tmp), "%s.experts.tmp", path);
+        FILE *fp = fopen(tmp, "wb");
+        const uint32_t hdr[3] = {KV_EXPERTS_MAGIC, 1u, (uint32_t)n};
+        bool ok = fp && fwrite(hdr, sizeof(hdr), 1, fp) == 1 &&
+                  fwrite(refs, sizeof(*refs), (size_t)n, fp) == (size_t)n;
+        if (fp && fclose(fp) != 0) ok = false;
+        if (ok && rename(tmp, side) == 0) {
+            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache experts saved n=%d file=%s", n, side);
+        } else {
+            unlink(tmp);
+        }
+    }
+    free(refs);
+}
+
+/* Returns the number of experts submitted to the bank, or -1 without a sidecar. */
+static int kv_cache_restore_experts(server *s, const char *path) {
+    if (!s || !path || !kv_experts_enabled()) return -1;
+    char side[4096];
+    snprintf(side, sizeof(side), "%s.experts", path);
+    FILE *fp = fopen(side, "rb");
+    if (!fp) return -1;
+    uint32_t hdr[3];
+    int submitted = -1;
+    if (fread(hdr, sizeof(hdr), 1, fp) == 1 && hdr[0] == KV_EXPERTS_MAGIC &&
+        hdr[1] == 1u && hdr[2] > 0 && hdr[2] <= (uint32_t)DS4_N_LAYER_MAX_EXPERT_REFS) {
+        ds4_expert_ref *refs = xmalloc(hdr[2] * sizeof(*refs));
+        if (fread(refs, sizeof(*refs), hdr[2], fp) == hdr[2]) {
+            int cap = 0;
+            const double t0 = now_sec();
+            pthread_mutex_lock(&s->inference_mu);
+            const int before = ds4_engine_expert_bank_count(s->engine, &cap);
+            int want = (int)hdr[2];
+            const int limit = kv_experts_restore_max();
+            if (limit > 0 && want > limit) want = limit;
+            submitted = ds4_engine_expert_restore(s->engine, refs, want);
+            const int after = ds4_engine_expert_bank_count(s->engine, NULL);
+            pthread_mutex_unlock(&s->inference_mu);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache experts restored submitted=%d of %u bank %d->%d/%d %.1f ms",
+                       submitted, (unsigned)want, before, after, cap, (now_sec() - t0) * 1000.0);
+        }
+        free(refs);
+    }
+    fclose(fp);
+    return submitted;
+}
+
 static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
                                                          const stop_list *wanted) {
     return (ds4_kvstore_trailer_hooks){
@@ -11260,6 +11339,7 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
         .write = kv_cache_tool_map_write_cb,
         .load = kv_cache_tool_map_load_cb,
         .load_wanted = wanted,
+        .stored = kv_cache_experts_stored_cb,
     };
 }
 
@@ -13728,6 +13808,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
+            (void)kv_cache_restore_experts(s, disk_cache_path);
         }
     }
     const bool responses_reasoning_state_preserved =
