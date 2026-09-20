@@ -11565,8 +11565,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  * (generate_job) materializes:
  *
  *   responses-visible -> responses-tool-output -> anthropic-tool-output ->
- *   memory-rewind (GLM only) -> memory-token -> thinking-visible ->
- *   memory-text
+ *   memory-rewind (GLM, V4.1) -> memory-token -> thinking-visible ->
+ *   memory-text -> memory-rewind below a diverged prompt (V4.1)
  *
  * Both slot routing (job_slot_score, under dispatch) and the execution
  * ladder consume this probe, so routing decisions and execution-time reuse
@@ -11591,9 +11591,10 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  * - anthropic-tool-output: /v1/messages has no server-side response object,
  *   but tool_use_id is a precise continuation handle inside a live local
  *   agent loop.
- * - memory-rewind (GLM only): the prompt is a strict truncation of the
+ * - memory-rewind (GLM, V4.1): the prompt is a strict truncation of the
  *   checkpoint; the live KV is rewound and the final prompt token
- *   reevaluated.
+ *   reevaluated.  V4.1 rewinds to pair boundaries (its compressed caches hold
+ *   token pairs) and only text-only checkpoints.
  * - memory-token: the checkpoint is an exact token prefix of the prompt.
  * - thinking-visible: after a tool-less thinking answer the next prompt
  *   omits the hidden reasoning by design; the remembered visible transcript
@@ -11604,6 +11605,11 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  *   is authoritative, so the checkpoint tokens are kept verbatim and only
  *   the suffix text is tokenized (full-prompt BPE may have merged across
  *   the byte boundary).
+ * - memory-rewind below a diverged prompt (V4.1, last): the prompt shares
+ *   a token prefix with the checkpoint and then differs (an agent turn whose
+ *   history re-renders the sampled tail differently, an edited message).
+ *   Tried only after every tier that needs no recompute; the live KV is
+ *   rewound to the shared prefix and only the tail is re-read.
  *
  * Locking: slot_probe_reuse_locked() requires tool_mu held (dispatch holds
  * it while scoring); slot_probe_reuse() is the worker-path wrapper.
@@ -13493,31 +13499,6 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
-/* Rewind the live session to `rewind_to` for this request; returns the
- * cached prefix length on success, 0 when the backend could not keep the
- * state and the prompt has to be rebuilt. */
-static int live_prefix_rewind(server *s, server_slot *slot, const job *j,
-                              int old_pos, int rewind_to, bool multimodal) {
-    pthread_mutex_lock(&s->inference_mu);
-    ds4_session_rewind(slot->session, rewind_to);
-    const bool rewind_valid =
-        ds4_session_common_prefix(slot->session, &j->req.prompt) == rewind_to &&
-        (!multimodal ||
-         ds4_session_vision_prefix_matches(slot->session, j->req.images,
-                                          j->req.image_count));
-    pthread_mutex_unlock(&s->inference_mu);
-    if (rewind_valid) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: rewound live prefix from %d to %d; %d prompt tokens will be reevaluated",
-                   old_pos, rewind_to, j->req.prompt.len - rewind_to);
-        return rewind_to;
-    }
-    server_log(DS4_LOG_KVCACHE,
-               "ds4-server: live prefix rewind from %d to %d requires rebuild",
-               old_pos, rewind_to);
-    return 0;
-}
-
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -13537,7 +13518,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     pthread_mutex_lock(&s->inference_mu);
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    const bool ds41_live = ds4_engine_is_deepseek41(s->engine);
     const bool live_vision_match =
         ds4_session_vision_prefix_matches(slot->session,
                                          j->req.images, j->req.image_count);
@@ -13663,12 +13643,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = "memory-rewind";
             cache_diag.rewind_to = reuse.reuse_tokens;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                       old_pos, reuse.reuse_tokens);
+                       "ds4-server: rewound live prefix from %d to %d; %d prompt tokens will be reevaluated",
+                       old_pos, reuse.reuse_tokens, j->req.prompt.len - reuse.reuse_tokens);
         } else {
             cached = 0;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
+                       "ds4-server: live prefix rewind from %d to %d requires rebuild",
                        old_pos, reuse.reuse_tokens);
         }
         break;
@@ -16522,6 +16502,57 @@ static void test_slot_routing_staleness_tiers(void) {
     ds4_session_free_test_checkpoint(slots[3].session);
     ds4_tokens_free(&sub.req.prompt);
     ds4_tokens_free(&cont.req.prompt);
+}
+
+/* V4.1 rewind tiers of the reuse probe (V4.1 builds only): a strict
+ * truncation rewinds to a pair boundary; a prompt that diverged from the
+ * live tokens rewinds to the shared prefix, but only after every tier that
+ * needs no recompute -- a matching rendered-text prefix still wins. */
+static void test_slot_probe_v41_rewind_tiers(void) {
+    ds4_test_use_deepseek41_shape(1);
+    TEST_ASSERT(ds4_engine_is_deepseek41(NULL));
+    server s = {0};
+    int ckpt_tok[10];
+    for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
+    struct { int shared; int extra; slot_reuse_kind kind; int reuse; } cases[] = {
+        {8, 0, REUSE_MEMORY_REWIND, 6},   /* strict truncation: 8-1, paired */
+        {6, 6, REUSE_MEMORY_REWIND, 6},   /* diverged after 6 */
+        {7, 6, REUSE_MEMORY_REWIND, 6},   /* diverged after 7: paired down */
+        {10, 1, REUSE_MEMORY_TOKEN, 10},  /* exact extension */
+        {1, 6, REUSE_NONE, 0},            /* nothing worth a pair */
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        job j = {0};
+        for (int i = 0; i < cases[c].shared; i++) ds4_tokens_push(&j.req.prompt, i + 1);
+        for (int i = 0; i < cases[c].extra; i++) ds4_tokens_push(&j.req.prompt, 900 + i);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == cases[c].kind);
+        TEST_ASSERT(pr.reuse_tokens == cases[c].reuse);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+    /* Diverged tokens, but the live rendered text is a byte prefix of the
+     * request: memory-text keeps the whole checkpoint, no recompute. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        slot.live_text = xstrdup("<sys>turn1 ");
+        slot.live_text_len = strlen(slot.live_text);
+        slot.live_text_pos = 10;
+        job j = {0};
+        j.req.prompt_text = xstrdup("<sys>turn1 turn2");
+        for (int i = 0; i < 6; i++) ds4_tokens_push(&j.req.prompt, i + 1);
+        for (int i = 0; i < 6; i++) ds4_tokens_push(&j.req.prompt, 900 + i);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT);
+        TEST_ASSERT(pr.reuse_tokens == 10);
+        free(slot.live_text);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+    ds4_test_use_deepseek41_shape(0);
 }
 
 static void test_slot_probe_live_state_tiers(void) {
@@ -23096,6 +23127,7 @@ static void ds4_server_unit_tests_run(void) {
     test_live_continuation_contract();
     test_slot_probe_and_routing_scores();
     test_slot_probe_live_state_tiers();
+    test_slot_probe_v41_rewind_tiers();
     test_slot_probe_vision_tiers();
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
