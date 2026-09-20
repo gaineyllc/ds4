@@ -479,6 +479,18 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* The session's retained image spans (embedding rows included), read-only.
+ * Returns the count; *out is valid until the checkpoint next changes. */
+size_t ds4_session_vision_spans(const ds4_session *s, const ds4_vision_span **out);
+/* True when the session holds images whose projections are all retained and
+ * no multimodal sync is in flight -- i.e. its image state can be written to
+ * disk and restored without the vision tower. */
+bool ds4_session_vision_projections_retained(const ds4_session *s);
+/* Install image spans on a session whose checkpoint tokens were restored from
+ * disk. Deep-copies the rows. Every span must lie inside the checkpoint and
+ * cover only image placeholder tokens; returns 0 on success. */
+int ds4_session_restore_vision_spans(ds4_session *s, const ds4_vision_span *spans,
+                                     size_t n, char *err, size_t errlen);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

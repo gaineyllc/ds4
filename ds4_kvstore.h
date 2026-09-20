@@ -16,6 +16,9 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+/* The entry's KV is image-conditioned; its key carries the image fingerprints
+ * inline and its projections live in the <entry>.images sidecar. */
+#define DS4_KVSTORE_EXT_VISION            (1u << 4)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,

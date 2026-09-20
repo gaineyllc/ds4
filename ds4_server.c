@@ -10155,6 +10155,10 @@ struct server {
     bool enable_cors;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
+    /* Set, under kv_mu, for the duration of a store whose session holds
+     * images; the stored hook writes that session's projections beside the
+     * entry. NULL otherwise. */
+    ds4_session *kv_images_pending;
     pthread_mutex_t inference_mu;
     pthread_mutex_t model_mu;
     pthread_cond_t model_cv;
@@ -10831,6 +10835,7 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
 #define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
+#define KV_EXT_VISION DS4_KVSTORE_EXT_VISION
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
@@ -11273,8 +11278,11 @@ static int kv_experts_restore_max(void) {
     return n > 0 && n < INT_MAX ? (int)n : 0;
 }
 
+static void kv_cache_images_write(server *s, const char *path);
+
 static void kv_cache_experts_stored_cb(void *ud, const char *path) {
     server *s = ud;
+    kv_cache_images_write(s, path);
     if (!s || !path || !kv_experts_enabled()) return;
     const int cap = DS4_N_LAYER_MAX_EXPERT_REFS;
     ds4_expert_ref *refs = xmalloc(cap * sizeof(*refs));
@@ -11295,6 +11303,156 @@ static void kv_cache_experts_stored_cb(void *ud, const char *path) {
         }
     }
     free(refs);
+}
+
+/* ---- Image-bearing disk checkpoints ----
+ *
+ * Upstream never writes a session holding images to disk: the payload's KV is
+ * image-conditioned but the key is text, and every image's placeholder tokens
+ * render identically, so two different pictures behind the same words would
+ * share a key and one would be served the other's KV. The guard is right; the
+ * fix is to give the key what it lacks. The rendered transcript now carries
+ * each image inline as <|ds4-image:FINGERPRINT:ROWS|> at its position, so the
+ * key stays a true text prefix of any later turn that keeps the same images
+ * where they were, and differs the moment a pixel does. The projections go
+ * beside the entry in <entry>.images, so a restore reinstates the rows without
+ * the vision tower. */
+#define KV_IMAGES_MAGIC 0x49345344u /* "DS4I" */
+
+static void kv_sb_append(char **buf, size_t *len, size_t *cap, const char *p, size_t n) {
+    if (*len + n + 1 > *cap) {
+        size_t nc = *cap ? *cap : 256;
+        while (*len + n + 1 > nc) nc *= 2;
+        *buf = xrealloc(*buf, nc);
+        *cap = nc;
+    }
+    memcpy(*buf + *len, p, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+}
+
+static bool kv_sb_render(char **buf, size_t *len, size_t *cap, ds4_engine *e,
+                         const ds4_tokens *t, int from, int to) {
+    if (to <= from) return true;
+    ds4_tokens seg = { .v = t->v + from, .len = to - from, .cap = to - from };
+    size_t n = 0;
+    char *r = ds4_kvstore_render_tokens_text(e, &seg, &n);
+    if (!r) return false;
+    kv_sb_append(buf, len, cap, r, n);
+    free(r);
+    return true;
+}
+
+/* Render tokens[0..len) with each image in `spans` replaced by its inline
+ * marker. Spans past len are ignored; a span straddling len means the cut
+ * falls inside an image, which no checkpoint should do, so it fails. */
+static char *kv_render_with_images(ds4_engine *e, const ds4_tokens *t, int len,
+                                   const ds4_vision_span *spans, size_t n) {
+    char *buf = NULL;
+    size_t blen = 0, cap = 0;
+    int pos = 0;
+    for (size_t i = 0; i < n; i++) {
+        const int start = (int)spans[i].token_start;
+        const int end = start + (int)spans[i].embedding.token_count;
+        if (start >= len) break;
+        if (end > len || start < pos) { free(buf); return NULL; }
+        if (!kv_sb_render(&buf, &blen, &cap, e, t, pos, start)) { free(buf); return NULL; }
+        char marker[128];
+        int m = snprintf(marker, sizeof(marker), "<|ds4-image:");
+        for (int b = 0; b < 32; b++)
+            m += snprintf(marker + m, sizeof(marker) - (size_t)m, "%02x",
+                          spans[i].embedding.fingerprint[b]);
+        m += snprintf(marker + m, sizeof(marker) - (size_t)m, ":%u|>",
+                      spans[i].embedding.token_count);
+        kv_sb_append(&buf, &blen, &cap, marker, (size_t)m);
+        pos = end;
+    }
+    if (!kv_sb_render(&buf, &blen, &cap, e, t, pos, len)) { free(buf); return NULL; }
+    if (!buf) buf = xstrdup("");
+    return buf;
+}
+
+static void kv_cache_images_write(server *s, const char *path) {
+    if (!s || !path || !s->kv_images_pending) return;
+    const ds4_vision_span *spans = NULL;
+    const size_t n = ds4_session_vision_spans(s->kv_images_pending, &spans);
+    const ds4_tokens *live = ds4_session_tokens(s->kv_images_pending);
+    if (!n || !spans || !live) return;
+    const uint32_t embd = (uint32_t)ds4_engine_embd_dim(s->engine);
+    char tmp[4096], side[4096];
+    snprintf(side, sizeof(side), "%s.images", path);
+    snprintf(tmp, sizeof(tmp), "%s.images.tmp", path);
+    FILE *fp = fopen(tmp, "wb");
+    const uint32_t hdr[4] = { KV_IMAGES_MAGIC, 1u, (uint32_t)n, embd };
+    bool ok = fp && fwrite(hdr, sizeof(hdr), 1, fp) == 1;
+    uint64_t bytes = 0;
+    for (size_t i = 0; ok && i < n; i++) {
+        const uint32_t rec[2] = { spans[i].token_start, spans[i].embedding.token_count };
+        const size_t values = (size_t)rec[1] * embd;
+        ok = fwrite(rec, sizeof(rec), 1, fp) == 1 &&
+             fwrite(spans[i].embedding.fingerprint, 32, 1, fp) == 1 &&
+             fwrite(spans[i].embedding.data, sizeof(float), values, fp) == values;
+        bytes += values * sizeof(float);
+    }
+    if (fp && fclose(fp) != 0) ok = false;
+    if (ok && rename(tmp, side) == 0) {
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache images saved n=%zu %.1f MiB file=%s",
+                   n, (double)bytes / (1024.0 * 1024.0), side);
+    } else {
+        unlink(tmp);
+    }
+}
+
+/* Read <path>.images and install it on the slot's freshly restored session.
+ * Returns the image count, -1 without a sidecar, -2 on a bad or mismatched one
+ * (the caller must then drop the restore). */
+static int kv_cache_restore_images(server *s, server_slot *slot, const char *path) {
+    char side[4096];
+    snprintf(side, sizeof(side), "%s.images", path);
+    FILE *fp = fopen(side, "rb");
+    if (!fp) return -1;
+    uint32_t hdr[4];
+    const uint32_t embd = (uint32_t)ds4_engine_embd_dim(s->engine);
+    int rc = -2;
+    ds4_vision_span *spans = NULL;
+    size_t n = 0;
+    if (fread(hdr, sizeof(hdr), 1, fp) == 1 && hdr[0] == KV_IMAGES_MAGIC &&
+        hdr[1] == 1u && hdr[2] > 0 && hdr[2] <= 64u && hdr[3] == embd) {
+        n = hdr[2];
+        spans = calloc(n, sizeof(*spans));
+        if (!spans) { fclose(fp); return -2; }
+        bool ok = true;
+        for (size_t i = 0; ok && i < n; i++) {
+            uint32_t rec[2];
+            ok = fread(rec, sizeof(rec), 1, fp) == 1 && rec[1] > 0 && rec[1] <= 65536u;
+            if (!ok) break;
+            spans[i].token_start = rec[0];
+            spans[i].embedding.token_count = rec[1];
+            const size_t values = (size_t)rec[1] * embd;
+            spans[i].embedding.data = malloc(values * sizeof(float));
+            ok = spans[i].embedding.data &&
+                 fread(spans[i].embedding.fingerprint, 32, 1, fp) == 1 &&
+                 fread(spans[i].embedding.data, sizeof(float), values, fp) == values;
+        }
+        if (ok) {
+            char err[160] = {0};
+            pthread_mutex_lock(&s->inference_mu);
+            const int r = ds4_session_restore_vision_spans(slot->session, spans, n,
+                                                           err, sizeof(err));
+            pthread_mutex_unlock(&s->inference_mu);
+            if (r == 0) {
+                rc = (int)n;
+                server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache images restored n=%zu file=%s",
+                           n, side);
+            } else {
+                server_log(DS4_LOG_WARNING, "ds4-server: kv cache images rejected: %s", err);
+            }
+        }
+    }
+    for (size_t i = 0; spans && i < n; i++) free(spans[i].embedding.data);
+    free(spans);
+    fclose(fp);
+    return rc;
 }
 
 /* Returns the number of experts submitted to the bank, or -1 without a sidecar. */
@@ -11353,16 +11511,31 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
-    /* The payload contains image-conditioned KV rows, but the disk key and
-     * trailer do not contain image fingerprints. Never let generic image
-     * placeholder tokens become a cache hit for a different image.
-     * sync_image_count covers progress-callback writes during prefill;
-     * checkpoint_image_count covers completed sessions. */
-    if (ds4_session_has_vision_state(slot->session)) {
-        pthread_mutex_unlock(&s->inference_mu);
-        return false;
+    /* An image-bearing payload is image-conditioned, so its key must say which
+     * images: rendered with each image's fingerprint inline, never the bare
+     * placeholder tokens, which render the same for every picture. Stored only
+     * when every projection is retained and no multimodal sync is in flight
+     * (a progress-callback write mid-prefill holds the old image set), and not
+     * combined with a visible-transcript override, whose key is the client's
+     * text rather than our tokens. Anything else keeps upstream's refusal. */
+    char *vision_text = NULL;
+    const bool vision = ds4_session_has_vision_state(slot->session);
+    if (vision) {
+        const ds4_vision_span *spans = NULL;
+        const size_t n = ds4_session_vision_spans(slot->session, &spans);
+        if (!ds4_session_vision_projections_retained(slot->session) ||
+            (cache_text_override && cache_text_override[0]) ||
+            !(vision_text = kv_render_with_images(s->engine, tokens, store_len,
+                                                  spans, n))) {
+            pthread_mutex_unlock(&s->inference_mu);
+            return false;
+        }
+        cache_text_override = vision_text;
+        cache_text_ext = KV_EXT_VISION;
+        cache_text_key = "vision-transcript";
     }
     pthread_mutex_lock(&s->kv_mu);
+    s->kv_images_pending = vision ? slot->session : NULL;
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
                                                   tokens, store_len, reason,
@@ -11370,8 +11543,10 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_ext,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
+    s->kv_images_pending = NULL;
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
+    free(vision_text);
     return ok;
 }
 
@@ -11463,9 +11638,22 @@ static void kv_cache_store_current_and_anchor(server *s, server_slot *slot,
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live) return;
     const int len = live->len;
-    const int anchor = kv_cache_chat_anchor_pos(&s->kv, live,
-                                                ds4_token_user(s->engine),
-                                                ds4_token_assistant(s->engine));
+    /* Anchor at the prompt end: just past the last assistant header, where
+     * generation began. The client's next request is built on exactly that
+     * prefix -- prompt N ends "<|Assistant|>" and prompt N+1 repeats it before
+     * the replayed reply -- so it is the one boundary guaranteed to recur.
+     * kv_cache_chat_anchor_pos (the start of the last user turn) is kept as the
+     * fallback, but on its own it lands near position 0 for a first-turn
+     * session, under min_tokens, and stored nothing: found by the image disk
+     * test, and just as true of text. */
+    int anchor = -1;
+    const int assistant = ds4_token_assistant(s->engine);
+    for (int i = len - 1; i >= 0 && assistant >= 0; i--) {
+        if (live->v[i] == assistant) { anchor = i + 1; break; }
+    }
+    if (anchor < s->kv.opt.min_tokens || anchor >= len)
+        anchor = kv_cache_chat_anchor_pos(&s->kv, live, ds4_token_user(s->engine),
+                                          assistant);
     if (anchor < s->kv.opt.min_tokens || anchor >= len) return;
 
     /* Copy the prefix before the rewind: the session's own token vector is
@@ -11609,6 +11797,59 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
+    /* An image request looks up the image-aware key -- its own tokens rendered
+     * with each image's fingerprint inline, exactly as an image checkpoint was
+     * stored -- so it can only ever hit a checkpoint made from these same
+     * pictures at these same positions. On a hit it continues with its own
+     * tokens (re-tokenizing the rendered text would turn the markers into
+     * literal text) and reinstates the projections from the sidecar; the
+     * restored images must then be a prefix of the request's, or the restore
+     * is dropped. Text requests never render a marker, so they cannot reach an
+     * image entry. */
+    if (req && req->image_count > 0) {
+        if (req->prompt.len <= 0 || req->api == API_RESPONSES) return 0;
+        char *vkey = kv_render_with_images(s->engine, &req->prompt, req->prompt.len,
+                                           req->images, req->image_count);
+        if (!vkey) return 0;
+        char *path = NULL;
+        uint8_t ext = 0;
+        int loaded = kv_cache_try_load_text(s, slot, vkey, effective_prompt,
+                                            &path, &ext, false);
+        free(vkey);
+        bool ok = loaded > 0 && path && (ext & KV_EXT_VISION);
+        if (ok) {
+            pthread_mutex_lock(&s->inference_mu);
+            const ds4_tokens *live = ds4_session_tokens(slot->session);
+            ok = live && live->len == loaded && live->len <= req->prompt.len &&
+                 ds4_tokens_starts_with(&req->prompt, live);
+            pthread_mutex_unlock(&s->inference_mu);
+        }
+        if (ok) ok = kv_cache_restore_images(s, slot, path) > 0;
+        if (ok) {
+            pthread_mutex_lock(&s->inference_mu);
+            ok = ds4_session_vision_prefix_matches(slot->session, req->images,
+                                                   req->image_count);
+            if (ok) ds4_tokens_copy(effective_prompt, &req->prompt);
+            pthread_mutex_unlock(&s->inference_mu);
+        }
+        if (!ok) {
+            if (loaded > 0) {
+                pthread_mutex_lock(&s->inference_mu);
+                ds4_session_invalidate(slot->session);
+                pthread_mutex_unlock(&s->inference_mu);
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: kv cache image hit did not reinstate cleanly; rebuilding");
+            }
+            free(path);
+            return 0;
+        }
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache image hit tokens=%d images=%zu",
+                   loaded, req->image_count);
+        if (loaded_path_out) *loaded_path_out = path; else free(path);
+        if (loaded_ext_flags_out) *loaded_ext_flags_out = ext;
+        return loaded;
+    }
     int loaded = kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
                                         effective_prompt,
                                         loaded_path_out,
@@ -13857,14 +14098,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (!multimodal && s->kv.enabled && cached == 0 &&
+    /* The store decides from the evicted session's own state, not from the
+     * incoming request's modality: an image session can now be written. */
+    if (s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current_and_anchor(s, slot, "evict");
     }
-    if (!multimodal && cached == 0) {
+    if (cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
@@ -14059,7 +14302,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    kv_cache_maybe_store_continued(s, slot);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -14198,7 +14441,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+            kv_cache_maybe_store_continued(s, slot);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;

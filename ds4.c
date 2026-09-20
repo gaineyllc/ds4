@@ -77626,6 +77626,74 @@ bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }
 
+size_t ds4_session_vision_spans(const ds4_session *s, const ds4_vision_span **out) {
+    if (out) *out = s ? s->checkpoint_images : NULL;
+    return s ? s->checkpoint_image_count : 0;
+}
+
+bool ds4_session_vision_projections_retained(const ds4_session *s) {
+    if (!s || s->sync_image_count != 0 || s->checkpoint_image_count == 0) return false;
+    for (size_t i = 0; i < s->checkpoint_image_count; i++)
+        if (!s->checkpoint_images[i].embedding.data) return false;
+    return true;
+}
+
+int ds4_session_restore_vision_spans(ds4_session *s, const ds4_vision_span *spans,
+                                     size_t n, char *err, size_t errlen) {
+    if (!s || !s->checkpoint_valid || (n && !spans) || s->sync_image_count != 0) {
+        if (err && errlen) snprintf(err, errlen, "session cannot take image spans");
+        return 1;
+    }
+    const int image_token = s->engine ? s->engine->vision_image_token : -1;
+    uint64_t prev_end = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint64_t start = spans[i].token_start;
+        const uint64_t end = start + spans[i].embedding.token_count;
+        if (!spans[i].embedding.data || spans[i].embedding.token_count == 0 ||
+            start < prev_end || end > (uint64_t)s->checkpoint.len) {
+            if (err && errlen) snprintf(err, errlen, "image span %zu outside the checkpoint", i);
+            return 1;
+        }
+        /* The rows must sit on placeholder tokens: a span over real text would
+         * inject an image embedding where the model saw words. */
+        for (uint64_t k = start; image_token >= 0 && k < end; k++) {
+            if (s->checkpoint.v[k] != image_token) {
+                if (err && errlen)
+                    snprintf(err, errlen, "image span %zu covers a non-image token at %llu",
+                             i, (unsigned long long)k);
+                return 1;
+            }
+        }
+        prev_end = end;
+    }
+    ds4_vision_span *copy = NULL;
+    if (n) {
+        copy = calloc(n, sizeof(*copy));
+        if (!copy) return 1;
+        for (size_t i = 0; i < n; i++) {
+            copy[i] = spans[i];
+            const size_t bytes = (size_t)spans[i].embedding.token_count *
+                                 (size_t)DS4_N_EMBD * sizeof(float);
+            copy[i].embedding.data = malloc(bytes);
+            if (!copy[i].embedding.data) {
+                ds4_session_free_vision_identities(copy, i);
+                return 1;
+            }
+            memcpy(copy[i].embedding.data, spans[i].embedding.data, bytes);
+        }
+    }
+    ds4_session_free_vision_identities(s->checkpoint_images, s->checkpoint_image_count);
+    s->checkpoint_images = copy;
+    s->checkpoint_image_count = n;
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (ds4_session_is_ds41(s)) {
+        s->ds41_graph.images = s->checkpoint_images;
+        s->ds41_graph.image_count = s->checkpoint_image_count;
+    }
+#endif
+    return 0;
+}
+
 static bool ds4_session_vision_range_overlaps(
         const ds4_session *s,
         uint32_t           token_start,
