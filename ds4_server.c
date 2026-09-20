@@ -14120,8 +14120,13 @@ decode_again:
                 break;
             }
         } else if (s->batched_mode &&
-                   (s->qwen4_batch_mtp ||
-                    (s->ds41_batch_dspark && temperature == 0.0f)) &&
+                   /* Same rule as the one-session path: at temperature > 0 the
+                    * boundary token above was already sampled, and drafts are
+                    * committed while they match the target's greedy path
+                    * (opportunistic DSpark).  Only --mtp-exact-sampling needs
+                    * stochastic verification, which the batched verifier does
+                    * not implement, so that mode stays greedy-only below. */
+                   (s->qwen4_batch_mtp || s->ds41_batch_dspark) &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
