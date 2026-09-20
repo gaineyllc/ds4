@@ -20754,6 +20754,26 @@ static int ds4_gpu_stream_expert_cache_seed_experts_impl(
     return 1;
 }
 
+uint32_t ds4_gpu_stream_expert_cache_snapshot(uint16_t *layers,
+                                              uint16_t *experts,
+                                              uint32_t *hotness,
+                                              uint64_t *last_used,
+                                              uint32_t  cap) {
+    uint32_t n = 0;
+    for (uint32_t l = 0; l < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; l++) {
+        for (uint32_t e = 0; e < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT && n < cap; e++) {
+            const ds4_gpu_stream_expert_cache_entry *entry = &g_stream_expert_cache[l][e];
+            if (!entry->valid || entry->bank_transient) continue;
+            layers[n] = (uint16_t)l;
+            experts[n] = (uint16_t)e;
+            hotness[n] = g_stream_expert_cache_route_hotness[l][e];
+            last_used[n] = entry->last_used;
+            n++;
+        }
+    }
+    return n;
+}
+
 int ds4_gpu_stream_expert_cache_seed_experts(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *expert_ids,
