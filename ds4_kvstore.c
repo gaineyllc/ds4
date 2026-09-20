@@ -511,6 +511,7 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
 static void kv_unlink_sidecars(const char *path) {
     char side[4096];
     if (snprintf(side, sizeof(side), "%s.experts", path) < (int)sizeof(side)) unlink(side);
+    if (snprintf(side, sizeof(side), "%s.images", path) < (int)sizeof(side)) unlink(side);
 }
 
 static bool kv_cache_incoming_supersedes_continued(
