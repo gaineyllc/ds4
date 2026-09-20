@@ -11426,6 +11426,70 @@ static void kv_cache_store_current(server *s, server_slot *slot,
     }
 }
 
+
+/* ---- Prompt-end eviction checkpoint ----
+ *
+ * A live miss on this slot is about to load a disk snapshot, and loading one
+ * replaces the live Metal session outright -- so the state we are holding is
+ * already doomed. That makes a rewind free here, and worth doing: the
+ * full-length checkpoint we store first is keyed by the whole rendered live
+ * transcript, tail included, and a client that does not replay that tail
+ * verbatim (a tool call serialized differently, sampled tokens the protocol
+ * hides) will never produce that key again. The last user-turn boundary is a
+ * position the client does reproduce, because it is the boundary its own next
+ * request is built from.
+ *
+ * So: store the full prefix as before, then rewind to the anchor and store
+ * that too. The store path requires the live session to sit exactly at
+ * store_len (ds4_kvstore_store_live_prefix_text refuses otherwise), which is
+ * why this is a rewind and not just a shorter length. Both files stay
+ * candidates for the next load and the loader takes the longest match; if the
+ * tail does come back verbatim, nothing is lost. Budget eviction handles the
+ * extra file.
+ *
+ * DS4_KV_EVICT_ANCHOR=0 turns the second store off. */
+static void kv_cache_slot_note_store(server_slot *slot, int tokens);
+
+static bool kv_evict_anchor_enabled(void) {
+    const char *v = getenv("DS4_KV_EVICT_ANCHOR");
+    return !v || (strcmp(v, "0") != 0 && v[0] != 0);
+}
+
+static void kv_cache_store_current_and_anchor(server *s, server_slot *slot,
+                                              const char *reason) {
+    kv_cache_store_current(s, slot, reason);
+    if (!s || !slot || !s->kv.enabled || !kv_evict_anchor_enabled()) return;
+
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    if (!live) return;
+    const int len = live->len;
+    const int anchor = kv_cache_chat_anchor_pos(&s->kv, live,
+                                                ds4_token_user(s->engine),
+                                                ds4_token_assistant(s->engine));
+    if (anchor < s->kv.opt.min_tokens || anchor >= len) return;
+
+    /* Copy the prefix before the rewind: the session's own token vector is
+     * what the rewind truncates. */
+    ds4_tokens prefix = {0};
+    tokens_copy_prefix(&prefix, live, anchor);
+
+    pthread_mutex_lock(&s->inference_mu);
+    ds4_session_rewind(slot->session, anchor);
+    const bool at_anchor = ds4_session_pos(slot->session) == anchor;
+    pthread_mutex_unlock(&s->inference_mu);
+
+    if (at_anchor) {
+        if (kv_cache_store_live_prefix(s, slot, &prefix, anchor, "evict-anchor")) {
+            kv_cache_slot_note_store(slot, anchor);
+        }
+    } else {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: evict-anchor rewind to %d left session at %d; skipped",
+                   anchor, ds4_session_pos(slot->session));
+    }
+    ds4_tokens_free(&prefix);
+}
+
 #ifdef DS4_SERVER_TEST
 static int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_suppress_continued_store(kc, tokens);
@@ -13798,7 +13862,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, slot, "evict");
+        kv_cache_store_current_and_anchor(s, slot, "evict");
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,

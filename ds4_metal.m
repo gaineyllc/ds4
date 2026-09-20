@@ -896,6 +896,14 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
 static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_cache_residency_drop(id<MTLBuffer> buffer);
+static void ds4_gpu_stream_expert_cache_clear_entry(uint32_t layer,
+                                                    uint32_t expert,
+                                                    int      count_eviction);
+int ds4_gpu_stream_expert_defer_in_flight(void);
+static uint32_t ds4_gpu_stream_expert_reap_idle_tokens(void);
+static uint32_t ds4_gpu_stream_expert_reap_max_per_token(void);
+static uint64_t g_stream_expert_reap_evictions;
+static uint64_t g_stream_expert_reap_passes;
 static void ds4_gpu_stream_expert_cache_residency_flush_retired(void);
 static void ds4_gpu_stream_expert_cache_residency_detach(void);
 static int g_stream_expert_cache_prefill_pins;
@@ -1022,6 +1030,12 @@ enum {
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS = 256,
     DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS = 16,
+    /* Idle-expert reaper: how long an entry with zero route hotness may stay
+     * resident, how many may be reaped per token, and the resident-entry floor
+     * below which reaping is pointless. */
+    DS4_METAL_STREAM_EXPERT_REAP_IDLE_TOKENS = 512,
+    DS4_METAL_STREAM_EXPERT_REAP_MAX_PER_TOKEN = 8,
+    DS4_METAL_STREAM_EXPERT_REAP_FLOOR_ENTRIES = 256,
     DS4_METAL_STREAM_EXPERT_VALIDATE_WORDS = 16,
 };
 
@@ -5021,6 +5035,13 @@ void ds4_gpu_print_memory_report(const char *label) {
                     (unsigned long long)g_stream_expert_cache_decode_tokens,
                     g_stream_expert_cache_first_decode_layer,
                     (unsigned long long)g_stream_expert_cache_hotness_decay_token);
+            fprintf(stderr,
+                    "ds4:   streaming cache reaper evictions=%llu passes=%llu resident=%u idle_tokens=%u budget=%u\n",
+                    (unsigned long long)g_stream_expert_reap_evictions,
+                    (unsigned long long)g_stream_expert_reap_passes,
+                    g_stream_expert_cache_entry_count,
+                    ds4_gpu_stream_expert_reap_idle_tokens(),
+                    ds4_gpu_stream_expert_reap_max_per_token());
             const ds4_gpu_stream_expert_timing_snapshot total =
                 ds4_gpu_stream_expert_timing_current();
             if (ds4_gpu_stream_expert_timing_has_data(total)) {
@@ -15627,6 +15648,118 @@ static void ds4_gpu_stream_expert_cache_maybe_decay_route_hotness(void) {
     }
 }
 
+/* ---- Idle-expert reaper ----
+ *
+ * Eviction used to be purely on demand: an entry stayed resident until some
+ * install needed its slot. That is the right policy when holding a cold entry
+ * is free, and it is not. Publishing the residency set costs time proportional
+ * to the size of the set (measured 2026-09-17: 5.52 ms per commit at a 36 GB
+ * bank, 9.24 ms at 64 GB -- 7.3% and 14.6% of decode), and a commit happens
+ * about once per token. So every expert a drifted conversation left behind
+ * lengthens every later token, for every session sharing the bank. That tax is
+ * the same reason the bank curve turns over at 64 GB.
+ *
+ * Route hotness already identifies drift: it halves every
+ * DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS decode tokens, so an expert a
+ * session stopped routing to reaches zero within a few hundred tokens while
+ * anything still in use is re-bumped. Reap those. The idle window on last_used
+ * is the guard against reaping something installed recently that has not had
+ * time to accumulate hotness, and the per-token budget keeps the scan and the
+ * retire list bounded.
+ *
+ * Being wrong costs one re-stream of that expert from SSD; being right saves
+ * commit time on every token until the conversation ends. */
+static uint32_t ds4_gpu_stream_expert_reap_idle_tokens(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_V41_EXPERT_REAP_IDLE_TOKENS");
+        cached = e ? atoi(e) : DS4_METAL_STREAM_EXPERT_REAP_IDLE_TOKENS;
+        if (cached < 0) cached = 0;
+    }
+    return (uint32_t)cached;
+}
+
+static uint32_t ds4_gpu_stream_expert_reap_max_per_token(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_V41_EXPERT_REAP_MAX_PER_TOKEN");
+        cached = e ? atoi(e) : DS4_METAL_STREAM_EXPERT_REAP_MAX_PER_TOKEN;
+        if (cached < 0) cached = 0;
+        if (cached > 256) cached = 256;
+    }
+    return (uint32_t)cached;
+}
+
+/* Keep a floor of resident entries so the reaper cannot strip a bank that is
+ * merely small: below this there is no commit tax worth chasing and every
+ * eviction is a likely re-stream. */
+static uint32_t ds4_gpu_stream_expert_reap_floor_entries(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_V41_EXPERT_REAP_FLOOR");
+        cached = e ? atoi(e) : DS4_METAL_STREAM_EXPERT_REAP_FLOOR_ENTRIES;
+        if (cached < 0) cached = 0;
+    }
+    return (uint32_t)cached;
+}
+
+static uint32_t g_stream_expert_reap_layer_cursor;
+
+void ds4_gpu_stream_expert_cache_reap_stats(uint64_t *evictions, uint64_t *passes) {
+    if (evictions) *evictions = g_stream_expert_reap_evictions;
+    if (passes) *passes = g_stream_expert_reap_passes;
+}
+
+/* Once per token, from defer_begin_token, where no deferred dispatch can still
+ * be naming an entry. Resumes the layer sweep where the last pass stopped so
+ * one hot layer cannot starve the rest. */
+static void ds4_gpu_stream_expert_cache_reap_idle(void) {
+    if (!g_ssd_streaming_mode) return;
+    const uint32_t budget = ds4_gpu_stream_expert_reap_max_per_token();
+    if (budget == 0) return;
+    const uint32_t idle_tokens = ds4_gpu_stream_expert_reap_idle_tokens();
+    if (idle_tokens == 0) return;
+    const uint32_t floor_entries = ds4_gpu_stream_expert_reap_floor_entries();
+    if (g_stream_expert_cache_entry_count <= floor_entries) return;
+    if (ds4_gpu_stream_expert_defer_in_flight()) return;
+
+    /* last_used is an install/use counter, not the token clock, so compare it
+     * against the clock's own horizon. */
+    if (g_stream_expert_cache_clock <= (uint64_t)idle_tokens) return;
+    const uint64_t horizon = g_stream_expert_cache_clock - (uint64_t)idle_tokens;
+
+    uint32_t reaped = 0;
+    uint32_t live = g_stream_expert_cache_entry_count;
+    for (uint32_t n = 0;
+         n < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER && reaped < budget;
+         n++) {
+        const uint32_t layer =
+            (g_stream_expert_reap_layer_cursor + n) %
+            DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+        if (g_stream_expert_cache_layer_count[layer] == 0) continue;
+        for (uint32_t expert = 0;
+             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT && reaped < budget;
+             expert++) {
+            if (live <= floor_entries) break;
+            ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+            if (!e->valid || e->inflight_seq != 0) continue;
+            if (g_stream_expert_cache_route_hotness[layer][expert] != 0) continue;
+            if (e->last_used == 0 || e->last_used > horizon) continue;
+            ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 1);
+            if (!e->valid) {
+                reaped++;
+                if (live > 0) live--;
+            }
+        }
+        g_stream_expert_reap_layer_cursor =
+            (layer + 1u) % DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+    }
+    if (reaped != 0) {
+        g_stream_expert_reap_evictions += reaped;
+        g_stream_expert_reap_passes++;
+    }
+}
+
 /* Victim rank of a resident entry: route hotness shifted up one so a
  * transient (bank prefill) entry ranks below every hot entry. */
 static uint32_t ds4_gpu_stream_expert_cache_victim_hotness(
@@ -17156,6 +17289,9 @@ void ds4_gpu_stream_expert_defer_begin_token(int disabled) {
     g_stream_expert_defer_in_flight = 0;
     /* The previous token is done with the set: let its evictions go. */
     ds4_gpu_stream_expert_cache_residency_flush_retired();
+    /* ...and let the drifted-away ones go with them, so the set the next
+     * commit publishes is the working set rather than everything ever routed. */
+    ds4_gpu_stream_expert_cache_reap_idle();
     g_stream_expert_defer_token_mode = disabled ? 2 : 0;
     /* Cleared for every token, deferred or not: a stale flag left over from an
      * earlier token would send this one down the rollback path for nothing. */
@@ -17624,6 +17760,9 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         g_stream_expert_cache_evictions = 0;
         g_stream_expert_cache_wraps = 0;
         g_stream_expert_cache_clock = 0;
+        g_stream_expert_reap_evictions = 0;
+        g_stream_expert_reap_passes = 0;
+        g_stream_expert_reap_layer_cursor = 0;
         g_stream_expert_cache_evict_advise_bytes = 0;
         g_stream_expert_cache_willneed_advise_bytes = 0;
         g_stream_expert_cache_pread_bytes = 0;
@@ -43917,6 +44056,22 @@ static int32_t  g_hint_row_tok[DS4_HINT_MAX_ROWS];
 static int      g_hint_topn = 3, g_hint_max = 128, g_hint_min_cnt = 2;
 static uint64_t g_hint_calls, g_hint_issued, g_hint_issued_bytes;
 static uint64_t g_hint_pred_total, g_hint_pred_hit;
+/* Recall at every K in one run: the 2026-09-17 measurement needed a separate
+ * run per TOPN because only the configured K was scored. */
+static uint64_t g_hint_pred_hit_k[DS4_HINT_K];
+
+/* Probe mode: maintain and score the table but issue no readahead. Recall is
+ * what sizes a real prerouter, and the 2026-09-17 run had to pay 1.3 t/s of
+ * readahead to learn it. DS4_V41_PREROUTE_PROBE=1 (or DS4_METAL_V41_HINT=2)
+ * buys the number without the traffic. */
+static int ds4_gpu_stream_expert_hint_probe_only(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *p = getenv("DS4_V41_PREROUTE_PROBE");
+        cached = (p && atoi(p) != 0) ? 1 : 0;
+    }
+    return cached;
+}
 
 static int ds4_gpu_stream_expert_hint_enabled(void) {
     static int mode = -1;
@@ -43930,6 +44085,10 @@ static int ds4_gpu_stream_expert_hint_enabled(void) {
          * DS4_METAL_V41_HINT=1 still turns it on. */
         mode = env ? atoi(env) : 0;
         if (mode < 0) mode = 0;
+        if (mode == 0 && getenv("DS4_V41_PREROUTE_PROBE") != NULL &&
+            atoi(getenv("DS4_V41_PREROUTE_PROBE")) != 0) {
+            mode = 2;   /* scored, but hint_rows issues no readahead */
+        }
         const char *e;
         if ((e = getenv("DS4_METAL_V41_HINT_TOPN")) != NULL) g_hint_topn = atoi(e);
         if ((e = getenv("DS4_METAL_V41_HINT_MAX")) != NULL) g_hint_max = atoi(e);
@@ -44008,11 +44167,21 @@ static void ds4_gpu_stream_expert_hint_note(uint32_t layer, uint32_t row,
     if (!c) return;
     uint16_t top[DS4_HINT_K];
     const uint32_t nt = ds4_hint_cell_top(c, (uint32_t)g_hint_topn, top);
+    uint16_t topk[DS4_HINT_K];
+    const uint32_t ntk = ds4_hint_cell_top(c, (uint32_t)DS4_HINT_K, topk);
     for (uint32_t i = 0; i < n; i++) {
         if (ids[i] < 0) continue;
         g_hint_pred_total++;
         for (uint32_t j = 0; j < nt; j++) {
             if (top[j] == (uint16_t)ids[i]) { g_hint_pred_hit++; break; }
+        }
+        /* Rank of this selection in the table's ordering, if present: it
+         * counts as a hit for every K at or above that rank. */
+        for (uint32_t j = 0; j < ntk; j++) {
+            if (topk[j] == (uint16_t)ids[i]) {
+                for (uint32_t k = j; k < DS4_HINT_K; k++) g_hint_pred_hit_k[k]++;
+                break;
+            }
         }
     }
     for (uint32_t i = 0; i < n; i++) {
@@ -44045,6 +44214,17 @@ static void ds4_gpu_stream_expert_hint_report_atexit(void) {
             (unsigned long long)g_hint_pred_hit, (unsigned long long)g_hint_pred_total,
             (unsigned long long)dt, (unsigned long long)dr,
             (unsigned long long)ds4_gpu_stream_expert_defer_backed_off());
+    if (g_hint_pred_total != 0) {
+        fprintf(stderr, "ds4: prerouter recall curve (probe=%d, min_cnt=%d):",
+                ds4_gpu_stream_expert_hint_probe_only(), g_hint_min_cnt);
+        for (uint32_t k = 0; k < DS4_HINT_K; k++) {
+            fprintf(stderr, " top%u=%.1f%%", k + 1u,
+                    100.0 * (double)g_hint_pred_hit_k[k] /
+                    (double)g_hint_pred_total);
+        }
+        fprintf(stderr, " (of %llu selections)\n",
+                (unsigned long long)g_hint_pred_total);
+    }
 }
 
 void ds4_gpu_stream_expert_hint_rows(const int *tokens, uint32_t n, uint32_t n_vocab) {
@@ -44059,6 +44239,10 @@ void ds4_gpu_stream_expert_hint_rows(const int *tokens, uint32_t n, uint32_t n_v
     for (uint32_t r = 0; r < n; r++) g_hint_row_tok[r] = tokens[r];
     g_hint_n_rows = n;
     g_hint_calls++;
+
+    /* Probe mode stops here: the rows are announced and will be scored by
+     * hint_note when their routing comes back, but nothing is read ahead. */
+    if (ds4_gpu_stream_expert_hint_probe_only()) return;
 
     const uint32_t max_exp = (uint32_t)g_hint_max;
     ds4_gpu_stream_expert_ra_range *ranges =
