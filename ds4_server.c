@@ -13682,6 +13682,14 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
     return true;
 }
 
+/* Speculation counters, so "is DSpark engaged?" is answerable directly rather
+ * than inferred from throughput -- which on a cold expert bank is pure noise:
+ * a spec-disabled control measured FASTER than spec-on at two of three
+ * temperatures. calls counts speculative decode steps, tokens the tokens they
+ * returned; tokens/calls > 1 means drafts are being accepted. Reported per
+ * request at DS4_LOG_KVCACHE. */
+static _Atomic uint64_t g_spec_calls, g_spec_tokens;
+
 static int server_eval_tokens(server *s, server_slot *slot, int token,
                               bool speculative, int accepted[DS4_SPEC_ACCEPTED_MAX],
                               int *n_accepted,
@@ -13702,6 +13710,7 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
         return rc;
     }
 
+    if (speculative) g_spec_calls++;
     pthread_mutex_lock(&s->model_mu);
     if (g_stop_requested || slot_job_cancelled(slot)) {
         pthread_mutex_unlock(&s->model_mu);
@@ -13750,6 +13759,7 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
     if (rc == 0) {
         *n_accepted = slot->decode_accepted_count;
         memcpy(accepted, slot->decode_accepted, (size_t)*n_accepted * sizeof(int));
+        if (speculative) g_spec_tokens += (uint64_t)*n_accepted;
     }
     pthread_mutex_unlock(&s->model_mu);
     return rc;
@@ -15194,6 +15204,18 @@ decode_again:
                   thinking.inside,
                   saw_tool_start,
                   saw_tool_end);
+        {
+            static _Atomic uint64_t last_calls, last_tokens;
+            const uint64_t c = g_spec_calls, t = g_spec_tokens;
+            const uint64_t dc = c - last_calls, dt = t - last_tokens;
+            last_calls = c; last_tokens = t;
+            if (dc) {
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: dspark spec calls=%llu tokens=%llu (%.2f per call)",
+                           (unsigned long long)dc, (unsigned long long)dt,
+                           (double)dt / (double)dc);
+            }
+        }
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
@@ -16517,9 +16539,18 @@ int main(int argc, char **argv) {
                    server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
         if (s.ds41_batch_dspark) {
+            /* Stale text until a86d2e9: batched DSpark is opportunistic and
+             * runs at any temperature -- the boundary token is sampled, then
+             * drafts commit while they match the target's greedy path. Only
+             * --mtp-exact-sampling needs stochastic verification, which the
+             * batched verifier does not implement, and stays greedy-only. */
             server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: DSpark speculative decoding active in batched mode (block=%d, greedy requests only)",
-                       ds4_engine_mtp_draft_tokens(engine));
+                       "ds4-server: DSpark speculative decoding active in batched mode "
+                       "(block=%d, %s)",
+                       ds4_engine_mtp_draft_tokens(engine),
+                       ds4_engine_mtp_exact_sampling(engine) ?
+                           "exact sampling: greedy requests only" :
+                           "opportunistic: any temperature");
         } else if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
