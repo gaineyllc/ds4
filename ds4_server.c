@@ -11793,6 +11793,39 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     return loaded;
 }
 
+/* Tokens the disk cache could restore for this request, found without loading
+ * anything: the same lookups kv_cache_try_load would make (the prompt text,
+ * then the request's own tokens rendered, image-aware when it has images),
+ * reporting the longest entry. 0 when the store is off or nothing matches. */
+static int kv_cache_disk_best_tokens(server *s, server_slot *slot, const request *req) {
+    if (!s || !slot || !req || !s->kv.enabled || req->api == API_RESPONSES) return 0;
+    const int model_id = ds4_engine_model_id(s->engine);
+    const int quant = ds4_engine_routed_quant_bits(s->engine);
+    const int ctx = ds4_session_ctx(slot->session);
+    int best = 0;
+    pthread_mutex_lock(&s->kv_mu);
+    if (req->image_count == 0 && req->prompt_text) {
+        const int i = ds4_kvstore_find_text_prefix(&s->kv, req->prompt_text,
+                                                   model_id, quant, ctx);
+        if (i >= 0 && (int)s->kv.entry[i].tokens > best) best = (int)s->kv.entry[i].tokens;
+    }
+    pthread_mutex_unlock(&s->kv_mu);
+    if (req->prompt.len > 0) {
+        char *r = req->image_count ?
+            kv_render_with_images(s->engine, &req->prompt, req->prompt.len,
+                                  req->images, req->image_count) :
+            ds4_kvstore_render_tokens_text(s->engine, &req->prompt, NULL);
+        if (r) {
+            pthread_mutex_lock(&s->kv_mu);
+            const int i = ds4_kvstore_find_text_prefix(&s->kv, r, model_id, quant, ctx);
+            if (i >= 0 && (int)s->kv.entry[i].tokens > best) best = (int)s->kv.entry[i].tokens;
+            pthread_mutex_unlock(&s->kv_mu);
+            free(r);
+        }
+    }
+    return best;
+}
+
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
@@ -14018,6 +14051,45 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         prompt_for_sync = &effective_prompt;
         break;
     case REUSE_MEMORY_REWIND: {
+        /* A live rewind is cheap, but it is only a win when nothing better
+         * exists. On 2026-09-21 a Hermes turn landed on a slot holding a
+         * 158-token leftover that shared 26 tokens of system-prompt header
+         * with it: the probe took that 26-token rewind, cached became 26, and
+         * because the disk path runs only when cached == 0 it never looked --
+         * so a ~186k-token prompt was re-prefilled from scratch for 515.8 s
+         * while the disk held checkpoints of that conversation. So before
+         * rewinding (which destroys the live state), ask the disk; if it can
+         * restore materially more, drop the live tier and let the disk path
+         * run -- the evict store there still saves this session first. */
+        {
+            const int disk = kv_cache_disk_best_tokens(s, slot, &j->req);
+            if (disk > reuse.reuse_tokens + s->kv.opt.min_tokens) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: live rewind to %d skipped; disk cache offers %d tokens",
+                           reuse.reuse_tokens, disk);
+                cached = 0;
+                cache_source = "none";
+                break;
+            }
+        }
+        /* A rewind that throws away most of the live session is an eviction
+         * in all but name, and the eviction store runs only on a full miss --
+         * so a short request landing on a slot that held a long conversation
+         * destroyed that conversation unsaved (a 5,738-token session rewound
+         * to a 28-token header by "Say hi." in the reproduction). Persist it
+         * first. Scoped to rewinds that keep less than half the session: an
+         * ordinary turn rewinds only its generated tail and keeps the prefix
+         * live, and writing a 200k-token checkpoint every turn for that would
+         * be pure churn. */
+        if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens &&
+            reuse.reuse_tokens < old_pos / 2) {
+            kv_cache_store_current_and_anchor(s, slot, "evict");
+            if (ds4_session_pos(slot->session) < reuse.reuse_tokens) {
+                cached = 0;
+                cache_source = "none";
+                break;
+            }
+        }
         pthread_mutex_lock(&s->inference_mu);
         ds4_session_rewind(slot->session, reuse.reuse_tokens);
         /* Rewinding mutates the session, so re-validate before trusting the
