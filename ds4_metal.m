@@ -16261,7 +16261,11 @@ static uint32_t ds4_gpu_stream_prefill_batch_selected_addr_auto_min(
             return (uint32_t)v;
         }
     }
-    if (n_total_expert == 384 || n_total_expert == 256) return 2u;
+    /* One row included: a decoder-suffix sweep ends on a single row at the
+     * last layer, and without this it fell to wrapping the whole layer's
+     * expert tensor, which fails under the no-copy bank (HTTP 500 on a
+     * second back-to-back 8192-token read). */
+    if (n_total_expert == 384 || n_total_expert == 256) return 1u;
     return 0;
 }
 
@@ -16272,7 +16276,7 @@ static int ds4_gpu_stream_prefill_batch_selected_addr_enabled(
         uint32_t gate_type,
         uint32_t down_type) {
     if (!g_ssd_streaming_mode ||
-        n_tokens <= 1 ||
+        n_tokens == 0 ||
         n_total_expert == 0 ||
         n_expert != 6 ||
         gate_type != DS4_METAL_TENSOR_IQ2_XXS ||
@@ -47575,7 +47579,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                                n_expert,
                                                                gate_type,
                                                                down_type) &&
-            n_tokens > 1 &&
+            n_tokens >= 1 &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
             !g_quality_mode &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
