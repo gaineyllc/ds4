@@ -11807,16 +11807,11 @@ static int kv_cache_segment_long_prefill(server *s, server_slot *slot,
      * 2,048-token segments made a 5,723-token read 37.5 s -> 50.5 s (+35%),
      * while 16,384-token segments on a 32,521-token read cost nothing
      * measurable (88.7 s segmented, 102.0 s not, one run each).
-     *
-     * And not exactly 8,192 either: a sweep is "wide" only when it exceeds the
-     * 8,192-row encoder chunk, so an exactly-8,192-row segment is a narrow
-     * sweep, and the second such sweep in a row failed at layer 39 ("V4.1
-     * layer-major prefill failed") -- from zero and after a disk restore
-     * alike -- then discarded the checkpoint it had resumed from. Every full
-     * segment must be a wide sweep, the path the 16,384 test exercised. So an
-     * interval under 16,384 never segments; the prompt-end store still keeps
-     * a recent checkpoint, and production's 65,536 always does. */
-    if (step < 16384) return 0;
+     * So an interval under 8,192 never segments; the prompt-end store still
+     * keeps a recent checkpoint, and production's 65,536 always does.
+     * (Exactly-8,192 segments once failed at layer 39 on the second sweep;
+     * that was an engine bug in the one-row routed MoE path, now fixed.) */
+    if (step < 8192) return 0;
     const int pos = ds4_session_pos(slot->session);
     int last = slot->continued_last_store_tokens;
     if (last < pos) last = pos;

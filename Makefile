@@ -146,6 +146,12 @@ tests/test_metal_splice_probe: tests/test_metal_splice_probe.o $(CORE_OBJS)
 test-metal-splice-probe: tests/test_metal_splice_probe
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_splice_probe
 
+tests/test_metal_prefill_segments.o: tests/test_metal_prefill_segments.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_metal_prefill_segments.c
+
+tests/test_metal_prefill_segments: tests/test_metal_prefill_segments.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ tests/test_metal_prefill_segments.o $(CORE_OBJS) $(METAL_LDLIBS)
+
 tests/test_metal_rewind_vision.o: tests/test_metal_rewind_vision.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_metal_rewind_vision.c
 
