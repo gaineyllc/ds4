@@ -43167,13 +43167,20 @@ static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
     if (target > DS4_N_EXPERT) target = DS4_N_EXPERT;
     if (!target) return true;
     const int32_t *selected = ds4_gpu_tensor_contents(g->batch.selected);
-    if (!selected) return false;
+    if (!selected) {
+        fprintf(stderr, "ds4: V4.1 prefill seed: no routing buffer (layer %u)\n", il);
+        return false;
+    }
     uint32_t frequency[DS4_MAX_EXPERT] = {0};
     const uint32_t recent = count < 32u ? count : 32u;
     for (uint32_t t = 0; t < count; t++) {
         for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
             const int32_t id = selected[t * DS4_N_EXPERT_USED + j];
-            if (id < 0 || (uint32_t)id >= DS4_N_EXPERT) return false;
+            if (id < 0 || (uint32_t)id >= DS4_N_EXPERT) {
+                fprintf(stderr, "ds4: V4.1 prefill seed: row %u/%u slot %u routed to expert %d "
+                                "(layer %u)\n", t, count, j, id, il);
+                return false;
+            }
             frequency[id] += 1u + (t >= count - recent ? count * DS4_N_EXPERT_USED : 0u);
         }
     }
@@ -43197,9 +43204,15 @@ static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
     const ds4_gpu_stream_expert_table table = graph_stream_expert_table_make(m, l, il,
         routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP,
         routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD);
-    if (!ds4_gpu_begin_commands()) return false;
+    if (!ds4_gpu_begin_commands()) {
+        fprintf(stderr, "ds4: V4.1 prefill seed: begin_commands failed (layer %u)\n", il);
+        return false;
+    }
     const bool ok = ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(&table, experts, priority, n) != 0;
     const bool ended = ds4_gpu_end_commands() != 0;
+    if (!ok || !ended)
+        fprintf(stderr, "ds4: V4.1 prefill seed: seed=%d end=%d for %u experts (layer %u)\n",
+                ok, ended, n, il);
     return ended && ok;
 #else
     (void)g; (void)m; (void)l; (void)il; (void)count;
