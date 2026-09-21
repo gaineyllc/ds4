@@ -15196,6 +15196,21 @@ decode_again:
                    req_flags[0] ? " " : "",
                    req_flags);
     }
+    /* Outside the has_tools branch: parked in there, this reported only for
+     * requests carrying tool definitions and looked exactly like DSpark being
+     * disabled on the production config. */
+    {
+        static _Atomic uint64_t last_calls, last_tokens;
+        const uint64_t c = g_spec_calls, t = g_spec_tokens;
+        const uint64_t dc = c - last_calls, dt = t - last_tokens;
+        last_calls = c; last_tokens = t;
+        if (dc) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: dspark spec calls=%llu tokens=%llu (%.2f per call)",
+                       (unsigned long long)dc, (unsigned long long)dt,
+                       (double)dt / (double)dc);
+        }
+    }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -15204,18 +15219,6 @@ decode_again:
                   thinking.inside,
                   saw_tool_start,
                   saw_tool_end);
-        {
-            static _Atomic uint64_t last_calls, last_tokens;
-            const uint64_t c = g_spec_calls, t = g_spec_tokens;
-            const uint64_t dc = c - last_calls, dt = t - last_tokens;
-            last_calls = c; last_tokens = t;
-            if (dc) {
-                server_log(DS4_LOG_GENERATION,
-                           "ds4-server: dspark spec calls=%llu tokens=%llu (%.2f per call)",
-                           (unsigned long long)dc, (unsigned long long)dt,
-                           (double)dt / (double)dc);
-            }
-        }
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
