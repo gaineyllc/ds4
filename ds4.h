@@ -204,6 +204,10 @@ typedef struct {
     uint64_t raw_bytes;
     uint64_t compressed_bytes;
     uint64_t scratch_bytes;
+    /* Part of total_bytes a session gives back to the OS between prompt
+     * reads (V4.1 prefill rows past the verify window, and carry rows): paid
+     * only while a prompt is being read, and prompt reads are serialized. */
+    uint64_t transient_bytes;
     uint32_t prefill_cap;
     uint32_t raw_cap;
     uint32_t comp_cap;

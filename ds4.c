@@ -41035,6 +41035,9 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
  */
 #define DS41_PREFILL_CAP 8192u
 #define DS41_INDEX_BATCH 32u
+/* Prefill rows kept resident between prompt reads; see
+ * ds41_graph_release_prefill_rows. */
+#define DS41_RESIDENT_ROWS 64u
 #define DS41_CARRY_ROWS(X) \
     X(residual, DS4_N_HC * DS4_N_EMBD, DS4_V41_CARRY_BF16) \
     X(pre, DS4_N_HC, DS4_V41_CARRY_F32) X(ffn_split, 24, DS4_V41_CARRY_F32) \
@@ -41301,6 +41304,31 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
     return floats * sizeof(float) + sizeof(*g) + (uint64_t)DS4_N_VOCAB * 4u + packed + sort;
 }
 
+static void ds41_graph_breakdown(uint32_t ctx) {
+    const ds41_gpu_graph shape = {.ctx = ctx,
+        .prefill_cap = ds41_prefill_limit(ctx),
+        .carry_cap = ds41_carry_cap(ctx),
+        .prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS"),
+        .compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY")}, *g = &shape;
+    const double mib = 1048576.0;
+    double raw = 40.0 * (128 + ds41_raw_log_rows(ctx)) * 512 * 4, comp = 0, batch = 0, carry = 0;
+    for (uint32_t i = 0; i < 4; i++) comp += ((double)ctx / (i < 3 ? 2 : 1) + 1) * 640 * 4;
+    fprintf(stderr, "ds4: V4.1 mem: raw %.0f MiB, compressed+index %.0f MiB\n", raw / mib, comp / mib);
+#define DS41_P(name, count) if ((double)(count) * 4 > 64 * mib) \
+    fprintf(stderr, "ds4: V4.1 mem: scratch %-16s %.0f MiB\n", #name, (double)(count) * 4 / mib);
+    DS41_SCRATCH(DS41_P)
+#undef DS41_P
+#define DS41_B(name, count) batch += (double)(count) * g->prefill_cap * 4;
+    DS41_PREFILL_STORAGE(DS41_B)
+#undef DS41_B
+#define DS41_C(name, count, format) carry += (double)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap * 4;
+    DS41_CARRY_ROWS(DS41_C)
+#undef DS41_C
+    fprintf(stderr, "ds4: V4.1 mem: prefill batch %.0f MiB (cap %u), carry %.0f MiB (cap %u), sort %.0f MiB\n",
+            batch / mib, g->prefill_cap, carry / mib, g->carry_cap,
+            (double)DS41_INDEX_BATCH * ctx * 8 / mib);
+}
+
 static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
     ds4_context_memory m = {.prefill_cap = ds41_prefill_limit(ctx),
                            .raw_cap = 128, .comp_cap = ctx + 1u};
@@ -41310,6 +41338,22 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
                               (512u + 128u) * sizeof(float);
     m.total_bytes = ds41_graph_bytes(ctx);
     m.scratch_bytes = m.total_bytes - m.raw_bytes - m.compressed_bytes;
+    {
+        const ds41_gpu_graph shape = {.ctx = ctx, .prefill_cap = m.prefill_cap,
+            .carry_cap = ds41_carry_cap(ctx),
+            .compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY")}, *g = &shape;
+        uint64_t t = 0;
+        if (g->prefill_cap > DS41_RESIDENT_ROWS && !getenv("DS4_METAL_KEEP_PREFILL_ROWS")) {
+#define DS41_T_BATCH(name, count) t += (uint64_t)(count) * (g->prefill_cap - DS41_RESIDENT_ROWS) * 4u;
+            DS41_PREFILL_STORAGE(DS41_T_BATCH)
+#undef DS41_T_BATCH
+#define DS41_T_CARRY(name, count, format) \
+            t += (uint64_t)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap * 4u;
+            DS41_CARRY_ROWS(DS41_T_CARRY)
+#undef DS41_T_CARRY
+        }
+        m.transient_bytes = t < m.scratch_bytes ? t : m.scratch_bytes;
+    }
     return m;
 }
 
@@ -41452,6 +41496,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->engram_reader = ds4_engram_reader_create();
 #endif
     ds41_graph_reset(g);
+    if (getenv("DS4_V41_MEM_BREAKDOWN")) ds41_graph_breakdown(ctx);
     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
             (double)ds41_graph_bytes(ctx) / 1048576.0, ctx);
     return true;
@@ -41754,12 +41799,54 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     return true;
 }
 
+/* DS4_V41_TOPK_TRACE=<file>: record every one-token decode's indexer picks
+ * (index-source layers) for measuring KV access locality.  A GPU copy per
+ * layer; written after the token's logits are read. */
+static FILE *g_ds41_topk_trace;
+static ds4_gpu_tensor *g_ds41_topk_dbg[64];
+static uint32_t g_ds41_topk_n[64], g_ds41_topk_comp[64];
+static bool ds41_topk_trace_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *p = getenv("DS4_V41_TOPK_TRACE");
+        v = p && p[0] && (g_ds41_topk_trace = fopen(p, "w")) != NULL;
+    }
+    return v != 0;
+}
+static void ds41_topk_trace_flush(uint32_t pos) {
+    if (!ds41_topk_trace_on()) return;
+    int32_t *buf = NULL;
+    for (uint32_t il = 0; il < 64; il++) {
+        const uint32_t n = g_ds41_topk_n[il];
+        if (!n || !g_ds41_topk_dbg[il]) continue;
+        buf = realloc(buf, (size_t)n * sizeof(*buf));
+        if (buf && ds4_gpu_tensor_read(g_ds41_topk_dbg[il], 0, buf, (uint64_t)n * 4u)) {
+            fprintf(g_ds41_topk_trace, "%u %u %u %u", pos, il, g_ds41_topk_comp[il], n);
+            for (uint32_t i = 0; i < n; i++) fprintf(g_ds41_topk_trace, " %d", buf[i]);
+            fputc('\n', g_ds41_topk_trace);
+        }
+        g_ds41_topk_n[il] = 0;
+    }
+    free(buf);
+    fflush(g_ds41_topk_trace);
+}
+
 static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (g->pos + 1u) / ratio : 0;
     const uint32_t top = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    return ds41_attention_candidates(g, il) && (!n_comp || !ds41_index_source(il) ||
+    const bool ok = ds41_attention_candidates(g, il) && (!n_comp || !ds41_index_source(il) ||
         ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top));
+    if (ok && n_comp && ds41_index_source(il) && il < 64 && ds41_topk_trace_on()) {
+        if (!g_ds41_topk_dbg[il])
+            g_ds41_topk_dbg[il] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_INDEXER_TOP_K * 4u);
+        if (g_ds41_topk_dbg[il] &&
+            ds4_gpu_tensor_copy(g_ds41_topk_dbg[il], 0, g->selected_comp, 0, (uint64_t)top * 4u)) {
+            g_ds41_topk_n[il] = top;
+            g_ds41_topk_comp[il] = n_comp;
+        }
+    }
+    return ok;
 }
 
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,
@@ -43044,6 +43131,7 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
     /* Even a failed GPU layer must finish the reader before this graph (or
      * a borrowed row graph) can leave scope or reuse its host output rows. */
     if (overlap_engram && !ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
+    if (ok && logits) ds41_topk_trace_flush(g->pos);
     if (!ok) {
         g->valid = false;
         return false;
@@ -43514,7 +43602,6 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
  * experts in instead. The rows are reclaimed before the next sweep that
  * reaches them; whatever the OS took back refaults zero-filled, which every
  * such row is rewritten over before it is read. */
-#define DS41_RESIDENT_ROWS 64u
 static uint64_t ds41_graph_release_prefill_rows(ds41_gpu_graph *g) {
     if (!g->batch.residual || g->prefill_batch_released || g->prefill_carry_released ||
         g->prefill_cap <= DS41_RESIDENT_ROWS || getenv("DS4_METAL_KEEP_PREFILL_ROWS"))

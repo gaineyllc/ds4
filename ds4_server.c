@@ -16379,7 +16379,8 @@ static uint64_t server_self_footprint(void) {
  * pageable footprint, plus DS4_MEM_RESERVE_GB for macOS and everything else
  * (default 16).  DS4_MEM_GUARD=warn logs without clamping, =off skips. */
 static int startup_session_budget(ds4_engine *e, int want, uint64_t wired_before,
-                                  uint64_t per_session_estimate) {
+                                  uint64_t per_session_estimate,
+                                  uint64_t transient_once) {
 #ifdef __APPLE__
     const char *mode = getenv("DS4_MEM_GUARD");
     if (mode && !strcmp(mode, "off")) return want;
@@ -16388,11 +16389,15 @@ static int startup_session_budget(ds4_engine *e, int want, uint64_t wired_before
     if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) != 0 || memsize == 0) return want;
     const double gib = 1024.0 * 1024.0 * 1024.0;
     const uint64_t wired = server_sys_wired_bytes();
-    /* Session buffers are wired on first use, not at creation, so session 0
-     * may not show up in `wired` yet: charge whatever of it is missing. */
+    /* Each session keeps its caches and decode scratch resident; the prefill
+     * workspace (transient_once) is given back between prompt reads and only
+     * one session reads at a time, so it is paid once.  Session buffers wire
+     * on first use, not at creation, so session 0 may not show up in `wired`
+     * yet: charge whatever of it is missing. */
     const uint64_t grew = wired > wired_before ? wired - wired_before : 0;
-    const uint64_t per = grew > per_session_estimate ? grew : per_session_estimate;
-    const uint64_t first_missing = per > grew ? per - grew : 0;
+    const uint64_t per = per_session_estimate;
+    const uint64_t first_full = per + transient_once;
+    const uint64_t first_missing = first_full > grew ? first_full - grew : 0;
     const uint64_t stream = ds4_engine_stream_cache_bytes(e);
     const uint64_t fp = server_self_footprint();
     const char *re = getenv("DS4_MEM_RESERVE_GB");
@@ -16408,9 +16413,11 @@ static int startup_session_budget(ds4_engine *e, int want, uint64_t wired_before
                                stream + fp + reserve;
     server_log(DS4_LOG_DEFAULT,
                "ds4-server: memory guard: %.1f GiB RAM; wired now %.1f (+%.1f not yet "
-               "wired, +%.1f per extra session) + expert bank %.1f + process %.1f + "
+               "wired, incl. %.1f prefill workspace paid once; +%.1f per extra session) "
+               "+ expert bank %.1f + process %.1f + "
                "reserve %.1f -> %d session%s need %.1f GiB",
-               memsize / gib, wired / gib, first_missing / gib, per / gib,
+               memsize / gib, wired / gib, first_missing / gib, transient_once / gib,
+               per / gib,
                stream / gib, fp / gib,
                reserve / gib, want, want == 1 ? "" : "s", need_want / gib);
     if (need > memsize) {
@@ -16433,7 +16440,7 @@ static int startup_session_budget(ds4_engine *e, int want, uint64_t wired_before
     }
     return fit;
 #else
-    (void)e; (void)wired_before; (void)per_session_estimate;
+    (void)e; (void)wired_before; (void)per_session_estimate; (void)transient_once;
     return want;
 #endif
 }
@@ -16927,8 +16934,11 @@ int main(int argc, char **argv) {
                                                               cfg.ctx_size,
                                                               ds4_engine_prefill_chunk(engine),
                                                               cfg.engine.ssd_streaming);
+            const uint64_t transient = cm.transient_bytes < cm.total_bytes ?
+                                       cm.transient_bytes : 0;
             s.slot_count = startup_session_budget(engine, slot_count,
-                                                  wired_before_sessions, cm.total_bytes);
+                                                  wired_before_sessions,
+                                                  cm.total_bytes - transient, transient);
             s.last_prefill_slot = s.slot_count - 1;
             if (i >= s.slot_count) break;
         }
