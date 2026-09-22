@@ -40,6 +40,10 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
@@ -10028,6 +10032,13 @@ struct server_slot {
     job *running;
     bool busy;
     bool prefill_waiting;
+    /* Experts this slot's session touched in its last decode (bit =
+     * layer * n_expert + expert), read from the bank clock when the job ends;
+     * drives concurrent-session admission.  Written under s->mu. */
+    uint64_t *expert_bits;
+    int expert_count;
+    bool expert_known;
+    uint64_t expert_decode_clock;   /* bank clock at prompt done; 0 = none */
 
     bool decode_pending;
     bool decode_in_flight;
@@ -10145,6 +10156,11 @@ struct server {
     int slot_count;
     int ctx_size;
     bool batched_mode;
+    /* Concurrent-session admission (admit_concurrent_locked). */
+    int expert_universe;            /* footprint bits; 0 = no expert bank */
+    int expert_capacity;            /* experts the bank holds at once */
+    const job *admit_logged_job;
+    char admit_logged_reason[128];
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
@@ -14481,6 +14497,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     kv_cache_maybe_store_continued(s, slot);
     kv_cache_store_prompt_end_continued(s, slot);
+    slot->expert_decode_clock = ds4_engine_expert_clock(s->engine);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -15551,6 +15568,108 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     return SLOT_PROTECTED_SCORE_BASE - live;
 }
 
+/* Concurrent-session admission.
+ *
+ * 2026-09-21: two resident 1M-context sessions (about 20 GiB of context
+ * buffers each), the DSpark drafter and a 52 GiB expert bank left macOS with
+ * no reclaimable memory; a second request was being admitted when a model-file
+ * read wedged in the kernel and took the server with it.  Running two
+ * sessions at once only pays when they route through largely the same
+ * experts: otherwise each evicts the other's working set, and under the
+ * no-copy bank every miss is a page fault on the model file -- the page cache
+ * that was already exhausted.
+ *
+ * So a job may start beside a running one only when (1) the kernel reports no
+ * memory pressure and swap is under half full, and (2) both sessions' last
+ * measured decode footprints are known and their union fits the bank
+ * (DS4_ADMIT_UNION_FRAC of capacity, default 0.80).  When unsure -- a new
+ * conversation, a footprint never measured -- the job waits in FIFO order for
+ * the running one to finish.  DS4_ADMIT_CONCURRENT=always|never overrides. */
+static int server_mem_pressure_level(void) {
+#ifdef __APPLE__
+    int level = 0;
+    size_t len = sizeof(level);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, NULL, 0) == 0)
+        return level;   /* 1 normal, 2 warning, 4 critical */
+#endif
+    return 0;
+}
+
+static double server_swap_used_frac(void) {
+#ifdef __APPLE__
+    struct xsw_usage sw;
+    size_t len = sizeof(sw);
+    if (sysctlbyname("vm.swapusage", &sw, &len, NULL, 0) == 0 && sw.xsu_total > 0)
+        return (double)sw.xsu_used / (double)sw.xsu_total;
+#endif
+    return 0.0;
+}
+
+static bool admit_concurrent_locked(server *s, const job *j,
+                                    const server_slot *target, int score) {
+    int busy = 0;
+    for (int i = 0; i < s->slot_count; i++)
+        if (&s->slots[i] != target && s->slots[i].busy) busy++;
+    if (busy == 0) return true;
+
+    const char *policy = getenv("DS4_ADMIT_CONCURRENT");
+    char reason[128];
+    bool ok = false;
+    reason[0] = '\0';
+    if (policy && !strcmp(policy, "always")) return true;
+    if (policy && !strcmp(policy, "never")) {
+        snprintf(reason, sizeof(reason), "concurrency disabled (DS4_ADMIT_CONCURRENT=never)");
+    } else if (server_mem_pressure_level() >= 2) {
+        snprintf(reason, sizeof(reason), "kernel memory pressure level %d",
+                 server_mem_pressure_level());
+    } else if (server_swap_used_frac() > 0.5) {
+        snprintf(reason, sizeof(reason), "swap %.0f%% used", server_swap_used_frac() * 100.0);
+    } else if (s->expert_universe <= 0 || s->expert_capacity <= 0) {
+        ok = true;      /* no expert bank: residency is fixed at startup */
+    } else if (score < 0 || !target->expert_known || !target->expert_bits) {
+        snprintf(reason, sizeof(reason), "incoming session's experts are unknown");
+    } else {
+        const int words = (s->expert_universe + 63) / 64;
+        int uni = 0;
+        bool known = true;
+        for (int w = 0; w < words && known; w++) {
+            uint64_t u = target->expert_bits[w];
+            for (int i = 0; i < s->slot_count; i++) {
+                const server_slot *o = &s->slots[i];
+                if (o == target || !o->busy) continue;
+                if (!o->expert_known || !o->expert_bits) { known = false; break; }
+                u |= o->expert_bits[w];
+            }
+            uni += __builtin_popcountll(u);
+        }
+        const char *fe = getenv("DS4_ADMIT_UNION_FRAC");
+        double frac = fe ? atof(fe) : 0.80;
+        if (frac <= 0.0 || frac > 1.0) frac = 0.80;
+        const int limit = (int)((double)s->expert_capacity * frac);
+        if (!known) {
+            snprintf(reason, sizeof(reason), "running session's experts are unknown");
+        } else if (uni > limit) {
+            snprintf(reason, sizeof(reason),
+                     "experts don't fit together: union %d > %d of %d bank slots "
+                     "(this session %d)", uni, limit, s->expert_capacity,
+                     target->expert_count);
+        } else {
+            ok = true;
+            snprintf(reason, sizeof(reason), "union %d <= %d of %d bank slots",
+                     uni, limit, s->expert_capacity);
+        }
+    }
+    if (j != s->admit_logged_job || strcmp(reason, s->admit_logged_reason)) {
+        s->admit_logged_job = j;
+        snprintf(s->admit_logged_reason, sizeof(s->admit_logged_reason), "%s", reason);
+        if (reason[0])
+            server_log(DS4_LOG_DEFAULT, "ds4-server: slot %d: %s concurrently: %s",
+                       target->id, ok ? "admitting" : "holding job, not running",
+                       reason);
+    }
+    return ok;
+}
+
 static void dispatch_jobs_locked(server *s) {
     if (!s || !s->batched_mode) return;
     const time_t now = time(NULL);
@@ -15594,6 +15713,9 @@ static void dispatch_jobs_locked(server *s) {
         }
         pthread_mutex_unlock(&s->tool_mu);
         if (!chosen || !chosen_slot) break;
+        /* FIFO: a held job also holds everything queued behind it. */
+        if (!admit_concurrent_locked(s, chosen, chosen_slot, chosen_score)) break;
+        if (chosen_score < 0) chosen_slot->expert_known = false;   /* new session */
 
         if (chosen_prev) chosen_prev->next = chosen->next;
         else s->head = chosen->next;
@@ -15689,7 +15811,26 @@ static void *slot_worker_main(void *arg) {
         slot_refresh_live_text(s, slot);
         slot->last_used = time(NULL);
 
+        uint64_t *fp = NULL;
+        int fp_count = 0;
+        if (slot->expert_decode_clock && s->expert_universe > 0) {
+            fp = xmalloc((size_t)((s->expert_universe + 63) / 64) * sizeof(*fp));
+            pthread_mutex_lock(&s->inference_mu);
+            fp_count = ds4_engine_expert_touched_since(s->engine, slot->expert_decode_clock,
+                                                       fp, s->expert_universe);
+            pthread_mutex_unlock(&s->inference_mu);
+            slot->expert_decode_clock = 0;
+        }
+
         pthread_mutex_lock(&s->mu);
+        if (fp && fp_count > 0) {
+            free(slot->expert_bits);
+            slot->expert_bits = fp;
+            slot->expert_count = fp_count;
+            slot->expert_known = true;
+            fp = NULL;
+        }
+        free(fp);
         slot->busy = false;
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
@@ -16208,6 +16349,90 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
                    (caches * (double)session_count + (double)m.scratch_bytes) / gib);
     }
 }
+#ifdef __APPLE__
+static uint64_t server_sys_wired_bytes(void) {
+    vm_statistics64_data_t vs;
+    mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vs, &n) != KERN_SUCCESS) return 0;
+    return (uint64_t)vs.wire_count * (uint64_t)vm_page_size;
+}
+
+static uint64_t server_self_footprint(void) {
+    task_vm_info_data_t vi;
+    mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS)
+        return 0;
+    return vi.phys_footprint;
+}
+#endif
+
+/* How many resident sessions fit, measured after the first one exists.
+ *
+ * The startup plan printed 80.89 GiB on 2026-09-21 while the server actually
+ * committed about 110: it counts one session's context buffers, not
+ * --batched-session of them, and leaves out the DSpark drafter; and nothing
+ * checked the total against RAM anyway.  This measures instead: system wired
+ * memory now (static weights, drafter, session 0) plus one more session's
+ * wired growth per extra slot, plus the expert bank at full size (page cache
+ * under the no-copy bank, so it is in no footprint), plus this process's
+ * pageable footprint, plus DS4_MEM_RESERVE_GB for macOS and everything else
+ * (default 16).  DS4_MEM_GUARD=warn logs without clamping, =off skips. */
+static int startup_session_budget(ds4_engine *e, int want, uint64_t wired_before,
+                                  uint64_t per_session_estimate) {
+#ifdef __APPLE__
+    const char *mode = getenv("DS4_MEM_GUARD");
+    if (mode && !strcmp(mode, "off")) return want;
+    uint64_t memsize = 0;
+    size_t len = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) != 0 || memsize == 0) return want;
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    const uint64_t wired = server_sys_wired_bytes();
+    uint64_t per = wired > wired_before ? wired - wired_before : 0;
+    if (per < per_session_estimate) per = per_session_estimate;
+    const uint64_t stream = ds4_engine_stream_cache_bytes(e);
+    const uint64_t fp = server_self_footprint();
+    const char *re = getenv("DS4_MEM_RESERVE_GB");
+    const double reserve_gib = re ? atof(re) : 16.0;
+    const uint64_t reserve = (uint64_t)((reserve_gib > 0 ? reserve_gib : 0) * gib);
+    int fit = want;
+    uint64_t need = 0;
+    for (;; fit--) {
+        need = wired + (uint64_t)(fit - 1) * per + stream + fp + reserve;
+        if (need <= memsize || fit == 1) break;
+    }
+    const uint64_t need_want = wired + (uint64_t)(want - 1) * per + stream + fp + reserve;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: memory guard: %.1f GiB RAM; wired now %.1f (+%.1f per extra "
+               "session) + expert bank %.1f + process %.1f + reserve %.1f -> %d session%s "
+               "need %.1f GiB",
+               memsize / gib, wired / gib, per / gib, stream / gib, fp / gib,
+               reserve / gib, want, want == 1 ? "" : "s", need_want / gib);
+    if (need > memsize) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: memory guard: WARNING one session alone overcommits by "
+                   "%.1f GiB -- lower --ssd-streaming-cache-experts or -c",
+                   (need - memsize) / gib);
+    }
+    if (fit < want) {
+        if (mode && !strcmp(mode, "warn")) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: memory guard: only %d of %d resident sessions fit; "
+                       "keeping %d (DS4_MEM_GUARD=warn)", fit, want, want);
+            return want;
+        }
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: memory guard: only %d of %d resident sessions fit; "
+                   "running %d (lower --ssd-streaming-cache-experts or -c to fit more, "
+                   "or DS4_MEM_GUARD=warn to override)", fit, want, fit);
+    }
+    return fit;
+#else
+    (void)e; (void)wired_before; (void)per_session_estimate;
+    return want;
+#endif
+}
+
 static void server_close_resources(server *s) {
     if (s->trace) {
         fclose(s->trace);
@@ -16222,6 +16447,7 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
         free(slot->live_text);
+        free(slot->expert_bits);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
@@ -16681,10 +16907,26 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
 
-    for (int i = 0; i < slot_count; i++) {
+#ifdef __APPLE__
+    const uint64_t wired_before_sessions = server_sys_wired_bytes();
+#else
+    const uint64_t wired_before_sessions = 0;
+#endif
+    for (int i = 0; i < s.slot_count; i++) {
         server_slot *slot = &s.slots[i];
         slot->srv = &s;
         slot->id = i;
+        if (i == 1 && slot_count > 1) {
+            const ds4_context_memory cm =
+                ds4_context_memory_estimate_with_prefill_mode(cfg.engine.backend,
+                                                              cfg.ctx_size,
+                                                              ds4_engine_prefill_chunk(engine),
+                                                              cfg.engine.ssd_streaming);
+            s.slot_count = startup_session_budget(engine, slot_count,
+                                                  wired_before_sessions, cm.total_bytes);
+            s.last_prefill_slot = s.slot_count - 1;
+            if (i >= s.slot_count) break;
+        }
         if (ds4_session_create(&slot->session, engine, cfg.ctx_size) != 0) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: failed to create %s session %d/%d",
@@ -16692,6 +16934,12 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+    }
+    {
+        int cap = 0;
+        (void)ds4_engine_expert_bank_count(engine, &cap);
+        s.expert_capacity = cap;
+        s.expert_universe = cap > 0 ? ds4_engine_expert_universe(engine) : 0;
     }
 
     if (cfg.kv_disk_dir) {
@@ -16917,6 +17165,33 @@ static void test_mixed_prefill_quantum_option(void) {
 /* Reuse-aware slot routing: the probe must recognize every way a request
  * can reuse a slot's live state, and the router must steer requests that can
  * reuse nothing away from resident checkpoints. */
+static void test_admit_concurrent_by_expert_union(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    uint64_t a[2] = {0}, b[2] = {0};
+    job j = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    s.expert_universe = 128;
+    s.expert_capacity = 100;          /* limit at 0.80 = 80 */
+    slots[0].id = 0; slots[1].id = 1;
+    TEST_ASSERT(admit_concurrent_locked(&s, &j, &slots[1], 0));   /* nothing running */
+    slots[0].busy = true;
+    TEST_ASSERT(!admit_concurrent_locked(&s, &j, &slots[1], 0));  /* both unknown */
+    a[0] = ~0ull;                     /* running: experts 0..63 */
+    b[0] = 0xffffull;                 /* incoming: 0..15, all shared */
+    slots[0].expert_bits = a; slots[0].expert_known = true; slots[0].expert_count = 64;
+    slots[1].expert_bits = b; slots[1].expert_known = true; slots[1].expert_count = 16;
+    if (server_mem_pressure_level() < 2 && server_swap_used_frac() <= 0.5 &&
+        !getenv("DS4_ADMIT_CONCURRENT")) {
+        TEST_ASSERT(admit_concurrent_locked(&s, &j, &slots[1], 0));   /* union 64 */
+        TEST_ASSERT(!admit_concurrent_locked(&s, &j, &slots[1], -1)); /* new session */
+        b[1] = 0xffffffull;           /* +24 disjoint: union 88 > 80 */
+        slots[1].expert_count = 40;
+        TEST_ASSERT(!admit_concurrent_locked(&s, &j, &slots[1], 0));
+    }
+}
+
 static void test_slot_probe_and_routing_scores(void) {
     server s = {0};
     server_slot slots[3] = {0};
@@ -23721,6 +23996,7 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_live_continuation_slot_binding();
     test_live_continuation_contract();
     test_slot_probe_and_routing_scores();
+    test_admit_concurrent_by_expert_union();
     test_slot_probe_live_state_tiers();
     test_slot_probe_v41_rewind_tiers();
     test_slot_probe_vision_tiers();

@@ -75210,6 +75210,53 @@ int ds4_engine_expert_snapshot(ds4_engine *e, ds4_expert_ref *out, int cap) {
 #endif
 }
 
+uint64_t ds4_engine_expert_clock(ds4_engine *e) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!e || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL) return 0;
+    return ds4_gpu_stream_expert_cache_clock_now();
+#else
+    (void)e;
+    return 0;
+#endif
+}
+
+int ds4_engine_expert_universe(ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_LAYER * DS4_N_EXPERT;
+}
+
+int ds4_engine_expert_touched_since(ds4_engine *e, uint64_t since,
+                                    uint64_t *bits, int nbits) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!e || !bits || nbits <= 0 || since == 0 || !e->ssd_streaming ||
+        e->backend != DS4_BACKEND_METAL) return 0;
+    memset(bits, 0, (size_t)((nbits + 63) / 64) * sizeof(*bits));
+    const uint32_t max = (uint32_t)DS4_N_LAYER * DS4_N_EXPERT;
+    uint16_t *layers = xmalloc(max * sizeof(*layers));
+    uint16_t *experts = xmalloc(max * sizeof(*experts));
+    uint32_t *hot = xmalloc(max * sizeof(*hot));
+    uint64_t *last = xmalloc(max * sizeof(*last));
+    const uint32_t n = ds4_gpu_stream_expert_cache_snapshot(layers, experts, hot, last, max);
+    int count = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (last[i] < since) continue;
+        const int bit = (int)layers[i] * DS4_N_EXPERT + (int)experts[i];
+        if (bit < 0 || bit >= nbits) continue;
+        bits[bit / 64] |= 1ull << (bit % 64);
+        count++;
+    }
+    free(layers); free(experts); free(hot); free(last);
+    return count;
+#else
+    (void)e; (void)since; (void)bits; (void)nbits;
+    return 0;
+#endif
+}
+
+uint64_t ds4_engine_stream_cache_bytes(ds4_engine *e) {
+    return ds4_engine_streaming_transient_guard_bytes(e);
+}
+
 int ds4_engine_expert_bank_count(ds4_engine *e, int *capacity) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (capacity) *capacity = e && e->ssd_streaming ?
