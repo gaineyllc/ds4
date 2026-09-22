@@ -16388,8 +16388,11 @@ static int startup_session_budget(ds4_engine *e, int want, uint64_t wired_before
     if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) != 0 || memsize == 0) return want;
     const double gib = 1024.0 * 1024.0 * 1024.0;
     const uint64_t wired = server_sys_wired_bytes();
-    uint64_t per = wired > wired_before ? wired - wired_before : 0;
-    if (per < per_session_estimate) per = per_session_estimate;
+    /* Session buffers are wired on first use, not at creation, so session 0
+     * may not show up in `wired` yet: charge whatever of it is missing. */
+    const uint64_t grew = wired > wired_before ? wired - wired_before : 0;
+    const uint64_t per = grew > per_session_estimate ? grew : per_session_estimate;
+    const uint64_t first_missing = per > grew ? per - grew : 0;
     const uint64_t stream = ds4_engine_stream_cache_bytes(e);
     const uint64_t fp = server_self_footprint();
     const char *re = getenv("DS4_MEM_RESERVE_GB");
@@ -16398,15 +16401,17 @@ static int startup_session_budget(ds4_engine *e, int want, uint64_t wired_before
     int fit = want;
     uint64_t need = 0;
     for (;; fit--) {
-        need = wired + (uint64_t)(fit - 1) * per + stream + fp + reserve;
+        need = wired + first_missing + (uint64_t)(fit - 1) * per + stream + fp + reserve;
         if (need <= memsize || fit == 1) break;
     }
-    const uint64_t need_want = wired + (uint64_t)(want - 1) * per + stream + fp + reserve;
+    const uint64_t need_want = wired + first_missing + (uint64_t)(want - 1) * per +
+                               stream + fp + reserve;
     server_log(DS4_LOG_DEFAULT,
-               "ds4-server: memory guard: %.1f GiB RAM; wired now %.1f (+%.1f per extra "
-               "session) + expert bank %.1f + process %.1f + reserve %.1f -> %d session%s "
-               "need %.1f GiB",
-               memsize / gib, wired / gib, per / gib, stream / gib, fp / gib,
+               "ds4-server: memory guard: %.1f GiB RAM; wired now %.1f (+%.1f not yet "
+               "wired, +%.1f per extra session) + expert bank %.1f + process %.1f + "
+               "reserve %.1f -> %d session%s need %.1f GiB",
+               memsize / gib, wired / gib, first_missing / gib, per / gib,
+               stream / gib, fp / gib,
                reserve / gib, want, want == 1 ? "" : "s", need_want / gib);
     if (need > memsize) {
         server_log(DS4_LOG_DEFAULT,
