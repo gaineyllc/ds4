@@ -367,6 +367,18 @@ typedef struct { uint16_t layer, expert; uint32_t hotness; } ds4_expert_ref;
 int ds4_engine_expert_snapshot(ds4_engine *e, ds4_expert_ref *out, int cap);
 int ds4_engine_expert_restore(ds4_engine *e, const ds4_expert_ref *refs, int n);
 int ds4_engine_expert_bank_count(ds4_engine *e, int *capacity);
+/* Expert footprints for concurrent-session admission.  expert_clock() reads
+ * the bank's access clock (0 when there is no bank); touched_since() sets bit
+ * layer * n_expert + expert in `bits` for every resident expert touched since
+ * that reading and returns how many.  expert_universe() is the bit count a
+ * footprint needs.  stream_cache_bytes() is the memory the bank and its
+ * prefill headroom want at full size -- page cache under the no-copy bank, so
+ * it never shows up as the process's own footprint. */
+uint64_t ds4_engine_expert_clock(ds4_engine *e);
+int ds4_engine_expert_touched_since(ds4_engine *e, uint64_t since,
+                                    uint64_t *bits, int nbits);
+int ds4_engine_expert_universe(ds4_engine *e);
+uint64_t ds4_engine_stream_cache_bytes(ds4_engine *e);
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
