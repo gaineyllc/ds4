@@ -445,6 +445,9 @@ int ds4_gpu_qwen4_batch_mm_q8_tensor(
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
+/* Bank access clock: bumped on every expert touch, so "last_used >= a
+ * reading" means "touched since then". */
+uint64_t ds4_gpu_stream_expert_cache_clock_now(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;

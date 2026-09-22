@@ -20980,6 +20980,10 @@ static int ds4_gpu_stream_expert_cache_seed_experts_impl(
     return 1;
 }
 
+uint64_t ds4_gpu_stream_expert_cache_clock_now(void) {
+    return __atomic_load_n(&g_stream_expert_cache_clock, __ATOMIC_RELAXED);
+}
+
 uint32_t ds4_gpu_stream_expert_cache_snapshot(uint16_t *layers,
                                               uint16_t *experts,
                                               uint32_t *hotness,
