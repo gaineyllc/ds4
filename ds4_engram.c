@@ -108,7 +108,20 @@ bool ds4_engram_table_open(ds4_engram_table *t, const char *path,
         goto fail;
     }
 #ifdef __APPLE__
-    if (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) goto fail;
+    /* Cached reads by default.  The engram tables live inside the weights
+     * file, which Metal also maps and wires pages of for the streaming expert
+     * bank; an uncached read has to evict any cached page in its range first,
+     * and twice in two days a reader wedged in pread on exactly this file and
+     * stayed there (every later read of the file blocked behind it, the server
+     * survived only a reboot).  No other file on the machine does both, and
+     * nothing in the kernel log pointed at the disk.  Cached reads share the
+     * page cache with those mappings instead of fighting them.
+     * DS4_ENGRAM_NOCACHE=1 restores the uncached reads. */
+    const char *nocache = getenv("DS4_ENGRAM_NOCACHE");
+    if (nocache && nocache[0] == '1') {
+        if (fcntl(fd, F_NOCACHE, 1) != 0) goto fail;
+    }
+    if (fcntl(fd, F_RDAHEAD, 0) != 0) goto fail;
 #elif defined(POSIX_FADV_RANDOM)
     /* Hashed rows are scattered across the table. Read-ahead fetches unused
      * pages and competes with the model's limited memory headroom. */
@@ -171,7 +184,7 @@ static int request_order(const void *a, const void *b) {
 /* ------------------------------------------------------------------------
  * I/O concurrency profile.
  *
- * Engram rows are 264 B and the table fd is F_NOCACHE, so every miss is a real
+ * Engram rows are 264 B and the table fd skips read-ahead, so a miss is a real
  * device round-trip and the reader is latency-bound, not CPU-bound: the threads
  * sit blocked in pread and burn nothing. That means useful width is set by how
  * many requests the NVMe queue will reward, NOT by core count -- on an M5 Max
@@ -773,6 +786,8 @@ void ds4_engram_reader_free(ds4_engram_reader *r) {
     pthread_cond_destroy(&r->work);
     pthread_mutex_destroy(&r->mutex);
     free(r);
+}
+
 /* ------------------------------------------------------------------------
  * Zero-copy Engram offload (spec 3.A / 3.B).
  *
