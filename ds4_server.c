@@ -10241,6 +10241,7 @@ static bool server_encode_image(server *s, const server_image_input *input,
 struct job {
     int fd;
     request req;
+    time_t held_since;              /* first admission refusal; 0 = never held */
     bool done;
     bool cancelled;
     pthread_mutex_t mu;
@@ -15605,7 +15606,7 @@ static double server_swap_used_frac(void) {
     return 0.0;
 }
 
-static bool admit_concurrent_locked(server *s, const job *j,
+static bool admit_concurrent_locked(server *s, job *j,
                                     const server_slot *target, int score) {
     int busy = 0;
     for (int i = 0; i < s->slot_count; i++)
@@ -15657,6 +15658,21 @@ static bool admit_concurrent_locked(server *s, const job *j,
             ok = true;
             snprintf(reason, sizeof(reason), "union %d <= %d of %d bank slots",
                      uni, limit, s->expert_capacity);
+        }
+    }
+    /* A held job waits for the running one to finish.  If that never happens
+     * -- the engine wedged, a request that will not end -- waiting forever is
+     * worse than the memory risk: run it. */
+    if (!ok) {
+        const time_t now = time(NULL);
+        const char *env = getenv("DS4_ADMIT_HOLD_MAX_SEC");
+        const long max_hold = env && env[0] ? atol(env) : 180;
+        if (!j->held_since) j->held_since = now;
+        if (max_hold > 0 && now - j->held_since >= max_hold) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: slot %d: held %lld s (%s); running it anyway",
+                       target->id, (long long)(now - j->held_since), reason);
+            return true;
         }
     }
     if (j != s->admit_logged_job || strcmp(reason, s->admit_logged_reason)) {
