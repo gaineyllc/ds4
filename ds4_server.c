@@ -16396,7 +16396,8 @@ static uint64_t server_self_footprint(void) {
  * (default 16).  DS4_MEM_GUARD=warn logs without clamping, =off skips. */
 static int startup_session_budget(ds4_engine *e, int want, uint64_t wired_before,
                                   uint64_t per_session_estimate,
-                                  uint64_t transient_once) {
+                                  uint64_t transient_once,
+                                  const char *vision_path) {
 #ifdef __APPLE__
     const char *mode = getenv("DS4_MEM_GUARD");
     if (mode && !strcmp(mode, "off")) return want;
@@ -16416,25 +16417,34 @@ static int startup_session_budget(ds4_engine *e, int want, uint64_t wired_before
     const uint64_t first_missing = first_full > grew ? first_full - grew : 0;
     const uint64_t stream = ds4_engine_stream_cache_bytes(e);
     const uint64_t fp = server_self_footprint();
+    /* The vision tower is mapped, not locked, so it is in neither `wired` nor
+     * the footprint until an image arrives and faults it in.  Charge its file
+     * size so an image request does not eat into the reserve unannounced. */
+    uint64_t vision = 0;
+    if (vision_path && vision_path[0]) {
+        struct stat vst;
+        if (stat(vision_path, &vst) == 0 && vst.st_size > 0) vision = (uint64_t)vst.st_size;
+    }
     const char *re = getenv("DS4_MEM_RESERVE_GB");
     const double reserve_gib = re ? atof(re) : 16.0;
     const uint64_t reserve = (uint64_t)((reserve_gib > 0 ? reserve_gib : 0) * gib);
     int fit = want;
     uint64_t need = 0;
     for (;; fit--) {
-        need = wired + first_missing + (uint64_t)(fit - 1) * per + stream + fp + reserve;
+        need = wired + first_missing + (uint64_t)(fit - 1) * per + stream + fp +
+               vision + reserve;
         if (need <= memsize || fit == 1) break;
     }
     const uint64_t need_want = wired + first_missing + (uint64_t)(want - 1) * per +
-                               stream + fp + reserve;
+                               stream + fp + vision + reserve;
     server_log(DS4_LOG_DEFAULT,
                "ds4-server: memory guard: %.1f GiB RAM; wired now %.1f (+%.1f not yet "
                "wired, incl. %.1f prefill workspace paid once; +%.1f per extra session) "
-               "+ expert bank %.1f + process %.1f + "
+               "+ expert bank %.1f + process %.1f + vision %.1f + "
                "reserve %.1f -> %d session%s need %.1f GiB",
                memsize / gib, wired / gib, first_missing / gib, transient_once / gib,
                per / gib,
-               stream / gib, fp / gib,
+               stream / gib, fp / gib, vision / gib,
                reserve / gib, want, want == 1 ? "" : "s", need_want / gib);
     if (need > memsize) {
         server_log(DS4_LOG_DEFAULT,
@@ -16457,6 +16467,7 @@ static int startup_session_budget(ds4_engine *e, int want, uint64_t wired_before
     return fit;
 #else
     (void)e; (void)wired_before; (void)per_session_estimate; (void)transient_once;
+    (void)vision_path;
     return want;
 #endif
 }
@@ -16954,7 +16965,8 @@ int main(int argc, char **argv) {
                                        cm.transient_bytes : 0;
             s.slot_count = startup_session_budget(engine, slot_count,
                                                   wired_before_sessions,
-                                                  cm.total_bytes - transient, transient);
+                                                  cm.total_bytes - transient, transient,
+                                                  cfg.engine.vision_path);
             s.last_prefill_slot = s.slot_count - 1;
             if (i >= s.slot_count) break;
         }
