@@ -83,6 +83,68 @@ kernel void kernel_dsv41_quantize(
     if (valid) x[index] = dsv41_bf16(result);
 }
 
+/* Pack rows of f32 activations into packed FP4 compressed-KV rows.  The
+ * arithmetic mirrors kernel_dsv41_quantize mode 3 exactly, so a packed row
+ * dequantizes to the values that path used to store. */
+kernel void kernel_dsv41_pack_comp_fp4(
+        constant ds4_metal_args_dsv41_quantize &args,
+        device const float *src,
+        device uchar *dst,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const uint col = group.x * 16u + lane;
+    const bool valid = lane < 16u && col < args.width;
+    const float value = valid ? dsv41_bf16(src[(ulong)group.y * args.width + col]) : 0.0f;
+    const float amax = simd_max(abs(value));
+    const float scale = dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f);
+    device uchar *row = dst + (ulong)group.y * DS4_V41_PACK_ROW_BYTES;
+    if (lane == 0u) ((device half *)row)[group.x] = (half)scale;
+    uint code = 0u;
+    if (valid) {
+        const float q = scale > 0.0f ? dsv4_e2m1fn_dequant(abs(value) / scale) : 0.0f;
+        code = (uint)dsv4_e2m1fn_code(q);
+        if (value < 0.0f) code |= 8u;
+    }
+    const uint partner = simd_shuffle_xor(code, 1u);
+    if (valid && (lane & 1u) == 0u)
+        (row + DS4_V41_PACK_SCALE_BYTES)[col / 2u] =
+            (uchar)((code & 0x0Fu) | ((partner & 0x0Fu) << 4));
+}
+
+/* Unpack a run of packed rows into f32 rows, for the paths that still want a
+ * dense f32 compressed cache (the small-context flash staging path). */
+kernel void kernel_dsv41_unpack_rows(
+        constant ds4_metal_args_dsv41_quantize &args,
+        device const uchar *src,
+        device float *dst,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (row >= args.rows || tid * 4u >= args.width) return;
+    device float4 *out = (device float4 *)(dst + (ulong)row * args.width);
+    out[tid] = (float4)dsv4_unpack_comp_h4(
+        (device const char *)src + (ulong)row * DS4_V41_PACK_ROW_BYTES, tid);
+}
+
+/* Gather selected packed rows into f32 rows, for the one-token decode path
+ * whose attention kernel takes a dense f32 buffer. */
+kernel void kernel_dsv41_unpack_gather(
+        constant ds4_metal_args_dsv41_quantize &args,
+        device const uchar *src,
+        device const int32_t *ids,
+        device float *dst,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (row >= args.rows || tid * 4u >= args.width) return;
+    device float4 *out = (device float4 *)(dst + (ulong)row * args.width);
+    const int32_t idx = ids[row];
+    if (idx < 0) {
+        out[tid] = float4(0.0f);
+        return;
+    }
+    out[tid] = (float4)dsv4_unpack_comp_h4(
+        (device const char *)src + (ulong)idx * DS4_V41_PACK_ROW_BYTES, tid);
+}
+
 struct ds4_metal_args_dsv41_engram {
     uint width;
     uint rows;
