@@ -168,4 +168,17 @@ int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
 #ifdef __cplusplus
 }
 #endif
+int ds4_gpu_dsv41_projection_rows_shared(ds4_gpu_tensor *out,
+                                 const void *model_map, uint64_t model_size,
+                                 uint64_t weight_offset, uint32_t width,
+                                 uint32_t outputs, uint32_t rows,
+                                 const ds4_gpu_tensor *in);
+int ds4_gpu_dspark_markov_gather(ds4_gpu_tensor *emb, const void *model_map,
+                                 uint64_t model_size, uint64_t w1_offset,
+                                 uint64_t w1_bytes, uint32_t rank,
+                                 const ds4_gpu_tensor *prev);
+int ds4_gpu_dspark_argmax_add(const ds4_gpu_tensor *logits, uint64_t row_offset,
+                              const ds4_gpu_tensor *bias, uint32_t vocab,
+                              ds4_gpu_tensor *partials, ds4_gpu_tensor *prev,
+                              ds4_gpu_tensor *tokens, uint32_t slot);
 #endif
