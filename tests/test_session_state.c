@@ -17,7 +17,7 @@ static void test_vision_prefix(void) {
     assert(!ds4_session_vision_state_matches(s, images, 1));
     images[0].token_start = 99;
     assert(!ds4_session_vision_prefix_matches(s, images, 1));
-    ds4_vision_identity old = {.token_start = 50, .token_count = 10, .fingerprint = {1}};
+    ds4_vision_span old = {.token_start = 50, .embedding = {.token_count = 10, .fingerprint = {1}}};
     s->checkpoint_images = &old;
     s->checkpoint_image_count = 1;
     images[0].token_start = 50;
@@ -47,9 +47,9 @@ static void test_vision_prefix(void) {
     images[0].token_start = 50;
     images[1].token_start = 99;
     assert(!ds4_session_vision_prefix_matches(s, images, 2));
-    ds4_vision_identity pair[2] = {
-        {.token_start = 50, .token_count = 10, .fingerprint = {1}},
-        {.token_start = 70, .token_count = 10, .fingerprint = {2}},
+    ds4_vision_span pair[2] = {
+        {.token_start = 50, .embedding = {.token_count = 10, .fingerprint = {1}}},
+        {.token_start = 70, .embedding = {.token_count = 10, .fingerprint = {2}}},
     };
     s->checkpoint_images = pair;
     s->checkpoint_image_count = 2;
@@ -80,8 +80,8 @@ static void test_vision_fingerprint_prefix(void) {
     assert(s);
     s->checkpoint_valid = true;
     s->checkpoint.len = 100;
-    ds4_vision_identity ckpt = {.token_start = 50, .token_count = 10,
-                                .fingerprint = {1}};
+    ds4_vision_span ckpt = {.token_start = 50,
+                            .embedding = {.token_count = 10, .fingerprint = {1}}};
     s->checkpoint_images = &ckpt;
     s->checkpoint_image_count = 1;
 
@@ -129,7 +129,7 @@ static void test_rewind(void) {
     s->checkpoint_images = calloc(1, sizeof(*s->checkpoint_images));
     assert(s->checkpoint_images);
     s->checkpoint_image_count = 1;
-    ds4_vision_identity *images = s->checkpoint_images;
+    ds4_vision_span *images = s->checkpoint_images;
 
     ds4_session_rewind(s, 260);
     assert(s->checkpoint_valid && s->mtp_draft_valid);
