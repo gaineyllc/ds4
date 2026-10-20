@@ -201,6 +201,11 @@ void ds4_gpu_stream_expert_nocopy_block(void);
  * layer ran without all of its experts resident, in which case the token must
  * be decoded again with the deferral off. */
 void ds4_gpu_stream_expert_defer_begin_token(int disabled);
+/* Multi-row routed batches normally drain the GPU after each layer's dispatch
+ * so the next layer's preparation may reuse cache slots. With the no-copy
+ * bank every entry is its own retained buffer, so a caller that drains at the
+ * end of its sweep can pipeline the layers instead. */
+void ds4_gpu_stream_expert_batch_pipeline(int on);
 
 /* Distinct-routed-expert accounting for a pass (handoff 5.5). Call
  * pass_begin with the row count at the head of a token or verify batch;
