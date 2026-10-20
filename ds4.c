@@ -41520,9 +41520,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
             (uint64_t)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap * sizeof(float)))) goto fail;
     DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
 #undef DS41_CARRY_ALLOC
-#ifndef __APPLE__
+    /* Metal too: on the Mac the n-gram rows otherwise come off the SSD at the
+     * head of every decode token, serialized with the GPU. */
     g->engram_reader = ds4_engram_reader_create();
-#endif
     ds41_graph_reset(g);
     if (getenv("DS4_V41_MEM_BREAKDOWN")) ds41_graph_breakdown(ctx);
     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
