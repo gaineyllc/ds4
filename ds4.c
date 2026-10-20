@@ -41544,6 +41544,13 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
 
+/* Rows of one DSpark draft block are a proposal, not anyone's committed state,
+ * so they may use the row-sharing kernels, which read each weight once for all
+ * rows instead of once per row. Target rows (batched sessions, verification)
+ * keep the exact per-row reductions. Set only around the drafter's forward;
+ * DS4_METAL_V41_ROWS_EXACT=1 keeps the per-row kernels there too. */
+static bool g_ds41_batch_rows_shared;
+
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
@@ -41551,7 +41558,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     bool ok;
     /* Small decode batches retain scalar reductions before BF16 and sparse
      * routing boundaries. Preserve Metal's separate vocabulary-head dispatch. */
-    if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS &&
+    if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && !g_ds41_batch_rows_shared &&
 #ifdef __APPLE__
         outputs != DS4_N_VOCAB &&
 #endif
@@ -41559,7 +41566,8 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
-        ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
+        ok = (g_ds41_batch_rows_shared ? ds4_gpu_dsv41_projection_rows_shared :
+                                         ds4_gpu_dsv41_projection_rows)(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32) {
         ok = true;
@@ -44137,6 +44145,72 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
     return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
 }
 
+/* Pooled n-gram reads for a short multi-row block (step_batch). */
+typedef struct {
+    const ds4_engram_table *table;      /* the rows' shared tables */
+    uint32_t n;
+    uint32_t ids[2][DS4_TP_BATCH_MAX_ROWS * DS4_ENGRAM_COLS];
+    float *dst[2][DS4_TP_BATCH_MAX_ROWS];
+    float *buf[2];
+    pthread_t thread;
+    bool started, threaded, ok[2], done[2];
+} ds41_batch_engram;
+
+static bool ds41_batch_engram_add(ds41_batch_engram *eb, const ds41_gpu_graph *first,
+        const ds41_gpu_graph *s, const uint32_t ids[2][DS4_ENGRAM_COLS],
+        float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM]) {
+    if (getenv("DS4_V41_BATCH_ENGRAM_SERIAL") || ds41_image_at(s, s->pos)) return false;
+    if (s->table[0].fd != first->table[0].fd || s->table[1].fd != first->table[1].fd) return false;
+    eb->table = first->table;
+    for (unsigned t = 0; t < 2; t++) {
+        memcpy(eb->ids[t] + eb->n * DS4_ENGRAM_COLS, ids[t], sizeof(ids[t]));
+        eb->dst[t][eb->n] = disk_rows[t];
+    }
+    eb->n++;
+    return true;
+}
+
+static bool ds41_batch_engram_read(ds41_batch_engram *eb, unsigned t) {
+    const size_t row = (size_t)DS4_ENGRAM_COLS * DS4_ENGRAM_DIM;
+    bool ok = ds4_engram_read(&eb->table[t], eb->ids[t], (size_t)eb->n * DS4_ENGRAM_COLS, eb->buf[t]);
+    for (uint32_t i = 0; ok && i < eb->n; i++)
+        memcpy(eb->dst[t][i], eb->buf[t] + i * row, row * sizeof(float));
+    return ok;
+}
+
+static void *ds41_batch_engram_thread(void *arg) {
+    ds41_batch_engram *eb = arg;
+    eb->ok[1] = ds41_batch_engram_read(eb, 1);
+    return NULL;
+}
+
+static bool ds41_batch_engram_start(ds41_batch_engram *eb) {
+    if (!eb->n) { eb->done[0] = eb->done[1] = true; return true; }
+    const size_t bytes = (size_t)eb->n * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(float);
+    eb->buf[0] = malloc(bytes);
+    eb->buf[1] = malloc(bytes);
+    if (!eb->buf[0] || !eb->buf[1]) return false;
+    eb->started = true;
+    eb->threaded = pthread_create(&eb->thread, NULL, ds41_batch_engram_thread, eb) == 0;
+    return true;
+}
+
+static bool ds41_batch_engram_wait(ds41_batch_engram *eb, unsigned t) {
+    if (!eb->started) return eb->n == 0 || t == 1;
+    if (!eb->done[t]) {
+        if (t == 0) eb->ok[0] = ds41_batch_engram_read(eb, 0);
+        else if (eb->threaded) { if (pthread_join(eb->thread, NULL)) ds4_die("cannot join V4.1 batch Engram reader"); }
+        else eb->ok[1] = ds41_batch_engram_read(eb, 1);
+        eb->done[t] = true;
+    }
+    if (t == 1 && eb->buf[0]) {
+        if (!eb->done[0]) { eb->ok[0] = ds41_batch_engram_read(eb, 0); eb->done[0] = true; }
+        free(eb->buf[0]); free(eb->buf[1]); eb->buf[0] = eb->buf[1] = NULL;
+        return eb->ok[0] && eb->ok[1];
+    }
+    return eb->ok[t];
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights) {
@@ -44172,6 +44246,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = queries[i] && heads[i];
     }
     const float initial_pre[] = {1, 0, 0, 0};
+    /* Every row's n-gram rows for a table go out as one sorted request, and
+     * the second table's -- not needed until layer 14 -- is read underneath
+     * the first fourteen layers instead of at the head of the block. Rows of
+     * different sessions read their own tables, so only rows sharing g's
+     * tables are pooled; the rest read inline as before. */
+    ds41_batch_engram eb = {.n = 0};
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         uint32_t ids[2][DS4_ENGRAM_COLS];
@@ -44181,18 +44261,24 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
         float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
             engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
-        for (unsigned table = 0; ok && table < 2; table++)
-            ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+        if (ok && ds41_batch_engram_add(&eb, graphs[0], s, ids, disk_rows)) {
+            /* queued */
+        } else {
+            for (unsigned table = 0; ok && table < 2; table++)
+                ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+        }
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+    if (ok) ok = ds41_batch_engram_start(&eb);
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
         if (ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
+            ok = ds41_batch_engram_wait(&eb, table);
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph *s = graphs[i];
                 ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
@@ -44279,6 +44365,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
     }
     ds4_gpu_tensor_free(batch_logits);
+    if (!ds41_batch_engram_wait(&eb, 1)) ok = false; /* never outlive this frame */
     if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u (%d rows)\n", il, count);
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
     DS41_PREFILL_ROWS(DS41_SESSION_FREE)
@@ -84655,8 +84742,13 @@ static bool ds41_session_draft(ds4_session *s, int token) {
     if (!d || (split && e->tp.rank == 0 &&
         !ds4_tp_send_dspark_draft(e->tp.ctx, s->tp_session_id, token,
                                   (int)g->pos, DS4_TP_DSPARK_DRAFT))) return false;
-    if (!ds41_dspark_forward(d, &e->model, &e->weights, &e->mtp_model, g->pos, token, g))
-        return false;
+    static int rows_exact = -1;
+    if (rows_exact < 0) rows_exact = getenv("DS4_METAL_V41_ROWS_EXACT") != NULL;
+    g_ds41_batch_rows_shared = !rows_exact && !e->tp.active;
+    const bool drafted =
+        ds41_dspark_forward(d, &e->model, &e->weights, &e->mtp_model, g->pos, token, g);
+    g_ds41_batch_rows_shared = false;
+    if (!drafted) return false;
     if (!split) return true;
     const uint32_t half = DS4_N_VOCAB / 2u;
     /* draft_probs is not live until Markov sampling; borrow it for the packed
@@ -84685,8 +84777,37 @@ static bool ds41_session_verify(ds4_session *s, const int *tokens, uint32_t coun
         !ds4_tp_send_verify(e->tp.ctx, s->tp_session_id, tokens, count)) return false;
     /* Scalar TP merges its head on the host. Preserve that complete frontier
      * for a zero-prefix rewind, not the stale other half on the device. */
-    if (!ds4_gpu_tensor_write(g->logits, 0, s->logits, (uint64_t)DS4_N_VOCAB * 4u) ||
-        !ds41_dspark_verify(d, g, &e->model, &e->weights, tokens, count)) return false;
+    if (!ds4_gpu_tensor_write(g->logits, 0, s->logits, (uint64_t)DS4_N_VOCAB * 4u)) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Run the verify block without stopping at every layer to check expert
+     * residency, as single-token decode does. Nothing is committed here; if
+     * the GPU reports a layer ran short, put back what the block overwrote and
+     * verify again with the stops in place, so a miss never reaches a token. */
+    static int defer_env = -1;
+    if (defer_env < 0) defer_env = getenv("DS4_METAL_V41_DISABLE_VERIFY_DEFER") == NULL;
+    const bool defer = defer_env && g->streaming && !e->tp.active && !g->imatrix && !e->quality;
+    if (g->streaming) {
+        ds4_gpu_stream_expert_hint_rows(tokens, count, DS4_N_VOCAB);
+        ds4_gpu_stream_expert_defer_begin_token(defer ? 0 : 1);
+        ds4_gpu_stream_expert_pass_begin(count);
+    }
+    if (defer) ds4_gpu_stream_expert_batch_pipeline(1);
+    bool verified = ds41_dspark_verify(d, g, &e->model, &e->weights, tokens, count);
+    if (defer) ds4_gpu_stream_expert_batch_pipeline(0);
+    if (verified && defer && ds4_gpu_stream_expert_defer_token_missed()) {
+        d->verify_misses++;
+        verified = ds41_dspark_verify_undo(d, g) &&
+            ds4_gpu_tensor_write(g->logits, 0, s->logits, (uint64_t)DS4_N_VOCAB * 4u);
+        if (verified) {
+            ds4_gpu_stream_expert_defer_begin_token(1);
+            ds4_gpu_stream_expert_pass_begin(count);
+            verified = ds41_dspark_verify(d, g, &e->model, &e->weights, tokens, count);
+        }
+    }
+    if (!verified) return false;
+#else
+    if (!ds41_dspark_verify(d, g, &e->model, &e->weights, tokens, count)) return false;
+#endif
     if (!e->tp.active || !e->tp.vocab_split) return true;
     const uint32_t half = DS4_N_VOCAB / 2u;
     for (uint32_t i = 0; i < count; i++) {
