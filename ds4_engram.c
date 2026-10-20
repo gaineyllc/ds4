@@ -503,7 +503,14 @@ static bool engram_pool_start(int width) {
     return ok;
 }
 
+/* The pool runs one job at a time: callers on different threads (the V4.1
+ * reader threads, a batch's background table read) queue here rather than
+ * overwrite each other's job, generation and completion count, which left a
+ * caller waiting for a completion that had already been consumed. */
+static pthread_mutex_t g_pool_run_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static void engram_pool_run(engram_batch *b) {
+    pthread_mutex_lock(&g_pool_run_mu);
     pthread_mutex_lock(&g_pool.mu);
     g_pool.job = b;
     g_pool.next_part = 0;
@@ -514,6 +521,7 @@ static void engram_pool_run(engram_batch *b) {
         pthread_cond_wait(&g_pool.done_cv, &g_pool.mu);
     g_pool.job = NULL;
     pthread_mutex_unlock(&g_pool.mu);
+    pthread_mutex_unlock(&g_pool_run_mu);
 }
 
 static size_t engram_min_parallel(void) {
