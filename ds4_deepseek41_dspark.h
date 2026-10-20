@@ -22,6 +22,7 @@ struct ds41_dspark {
     ds41_gpu_graph verified[DS41_VERIFY_ROWS + 1u];
     float *host_verified;
     uint32_t verify_start, verify_count, rewind_end;
+    uint64_t verify_misses; /* deferred verify blocks redone with stops */
 };
 
 static void ds41_dspark_reset(ds41_dspark *d) {
@@ -429,6 +430,31 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
             d->host_verified + (uint64_t)DS41_VERIFY_ROWS * DS4_N_VOCAB, DS4_N_VOCAB * 4u);
     if (ok) d->verify_count = count;
     else g->valid = false;
+    return ok;
+}
+
+/* Put back everything a verify block overwrote, as a commit of zero rows
+ * would, without moving the frontier: the raw-ring slots and drafter features
+ * it wrote. Cache appends beyond the frontier stay invisible. */
+static DS4_MAYBE_UNUSED bool ds41_dspark_verify_undo(ds41_dspark *d, ds41_gpu_graph *g) {
+    if (!d || !d->verify_count || g->pos != d->verify_start) return false;
+    const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
+    bool ok = ds4_gpu_begin_commands();
+    for (uint32_t i = 0; ok && i < d->verify_count; i++) {
+        const uint32_t slot = (d->verify_start + i) % DS41_DRAFT_WINDOW;
+        for (uint32_t il = 0; ok && il < 40; il++)
+            ok = ds4_gpu_tensor_copy(g->window[il], slot * kv,
+                d->old_raw, (il * DS41_VERIFY_ROWS + i) * kv, kv);
+        for (uint32_t stage = 0; ok && stage < 3; stage++) {
+            ok = ds4_gpu_tensor_copy(d->target[stage], slot * feature,
+                d->old_features, (stage * DS41_VERIFY_ROWS + i) * feature, feature);
+            d->positions[stage][slot] = d->old_positions[stage][i];
+        }
+    }
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    d->verify_count = 0;
+    d->rewind_end = 0;
+    if (!ok) g->valid = false;
     return ok;
 }
 
