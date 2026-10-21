@@ -75654,6 +75654,17 @@ int ds4_engine_expert_touched_since(ds4_engine *e, uint64_t since,
 #endif
 }
 
+int ds4_engine_expert_prestage(ds4_engine *e, const uint64_t *bits, int nbits, int max) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!e || !bits || nbits <= 0 || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL) return 0;
+    return (int)ds4_gpu_stream_expert_prestage_bits(bits, (uint32_t)nbits,
+                                                    (uint32_t)DS4_N_EXPERT, max > 0 ? (uint32_t)max : 0);
+#else
+    (void)e; (void)bits; (void)nbits; (void)max;
+    return 0;
+#endif
+}
+
 uint64_t ds4_engine_stream_cache_bytes(ds4_engine *e) {
     return ds4_engine_streaming_transient_guard_bytes(e);
 }

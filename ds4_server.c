@@ -10039,6 +10039,8 @@ struct server_slot {
     int expert_count;
     bool expert_known;
     uint64_t expert_decode_clock;   /* bank clock at prompt done; 0 = none */
+    uint64_t *slice_bits;           /* experts used in its last decode slice */
+    int slice_bits_count;
 
     bool decode_pending;
     bool decode_in_flight;
@@ -10193,6 +10195,14 @@ struct server {
     int active_generations;
     int mixed_prefill_quantum;
     int last_prefill_slot;
+    /* Time-sliced decode (DS4_DECODE_SLICE_TOKENS > 0): the slot currently
+     * holding the decode turn and how many steps it has run in it. */
+    int slice_owner;
+    int slice_steps;
+    uint64_t slice_clock;
+    bool slice_prestaged;
+    double slice_owner_done_at;     /* when the turn holder's last step returned */
+    uint64_t slice_prestage_calls, slice_prestage_experts;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -12961,6 +12971,9 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
 
+static int server_decode_slice_tokens(void);
+static int server_slice_prestage_lead(void);
+
 static int server_next_prefill_slot_locked(const server *s) {
     if (!s || s->slot_count <= 0) return -1;
     for (int n = 1; n <= s->slot_count; n++) {
@@ -12985,7 +12998,11 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     slot->prefill_waiting = true;
     pthread_cond_broadcast(&s->model_cv);
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
-           (s->model_busy || s->decode_pending > 0 ||
+           (s->model_busy ||
+            /* Sliced decode always leaves a session pending, so waiting for
+             * no pending decode would starve a new prompt for the length of
+             * every running answer; take the model between decode steps. */
+            (s->decode_pending > 0 && server_decode_slice_tokens() == 0) ||
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
@@ -13930,6 +13947,39 @@ static void timespec_add_us(struct timespec *ts, long us) {
     ts->tv_nsec %= 1000000000L;
 }
 
+/* Read ahead the experts slot `id` used in its last slice (bank misses only). */
+static void server_slice_prestage_locked(server *s, int id) {
+    if (id < 0 || id >= s->slot_count) return;
+    server_slot *slot = &s->slots[id];
+    if (!slot->slice_bits || slot->slice_bits_count <= 0 || s->expert_universe <= 0) return;
+    const int n = ds4_engine_expert_prestage(s->engine, slot->slice_bits, s->expert_universe, 0);
+    s->slice_prestage_calls++;
+    s->slice_prestage_experts += (uint64_t)n;
+    if (getenv("DS4_SERVER_BATCH_LOG"))
+        server_log(DS4_LOG_DEFAULT, "ds4-server: slice prestage slot %d: %d of %d experts not in bank",
+                   id, n, slot->slice_bits_count);
+}
+
+/* The turn moves from `from` to `to`: record what `from` touched during its
+ * slice, and pre-stage `to` now if the lead-in did not already. */
+static void server_slice_handoff_locked(server *s, int from, int to) {
+    const uint64_t now = ds4_engine_expert_clock(s->engine);
+    if (from >= 0 && from < s->slot_count && s->slice_clock && s->expert_universe > 0 &&
+        server_slice_prestage_lead() >= 0) {
+        server_slot *slot = &s->slots[from];
+        const size_t words = (size_t)(s->expert_universe + 63) / 64;
+        if (!slot->slice_bits) slot->slice_bits = calloc(words, sizeof(uint64_t));
+        if (slot->slice_bits)
+            slot->slice_bits_count = ds4_engine_expert_touched_since(
+                s->engine, s->slice_clock, slot->slice_bits, s->expert_universe);
+    }
+    if (!s->slice_prestaged && server_slice_prestage_lead() >= 0)
+        server_slice_prestage_locked(s, to);
+    s->slice_clock = now;
+    s->slice_prestaged = false;
+    s->slice_owner_done_at = 0.0;
+}
+
 static void *decode_worker_main(void *arg) {
     server *s = arg;
     ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
@@ -13947,7 +13997,10 @@ static void *decode_worker_main(void *arg) {
         }
         if (s->decode_pending == 0 && s->model_stopping) break;
 
-        if (coalesce_us > 0 && s->decode_pending < s->slot_count) {
+        /* A slice runs one session, so waiting for the others to join the
+         * batch only delays it. */
+        if (coalesce_us > 0 && server_decode_slice_tokens() == 0 &&
+            s->decode_pending < s->slot_count) {
             struct timespec deadline;
             clock_gettime(CLOCK_REALTIME, &deadline);
             timespec_add_us(&deadline, coalesce_us);
@@ -13968,10 +14021,76 @@ static void *decode_worker_main(void *arg) {
         if (s->model_stopping && s->decode_pending == 0) break;
 
         int count = 0, plain_count = 0;
+        /* Time slicing: run only the turn holder's token, and pass the turn on
+         * once it has had its slice and someone else is waiting. Other slots
+         * stay pending; their threads wait as they would for any batch. */
+        int only = -1;
+        const int slice = server_decode_slice_tokens();
+        if (slice > 0) {
+            int owner = s->slice_owner;
+            const bool owner_waiting = owner >= 0 && owner < s->slot_count &&
+                                       s->slots[owner].decode_pending;
+            bool other_waiting = false;
+            for (int i = 0; i < s->slot_count; i++)
+                if (i != owner && s->slots[i].decode_pending) other_waiting = true;
+            /* The holder's thread needs a moment between steps to sample and
+             * stream before it submits the next token. Without this grace the
+             * turn passed on every step whenever another slot was waiting,
+             * which is per-token interleaving, not slicing. */
+            if (!owner_waiting && other_waiting && owner >= 0 && s->slice_steps < slice &&
+                s->slice_owner_done_at > 0.0) {
+                static double grace = -1.0;
+                if (grace < 0.0) {
+                    const char *g = getenv("DS4_SLICE_GRACE_MS");
+                    grace = (g && g[0] ? atof(g) : 50.0) / 1000.0;
+                }
+                const double until = s->slice_owner_done_at + grace;
+                if (now_sec() < until) {
+                    struct timespec deadline;
+                    clock_gettime(CLOCK_REALTIME, &deadline);
+                    timespec_add_us(&deadline, (long)((until - now_sec()) * 1e6) + 1);
+                    while (!s->model_stopping && !s->slots[owner].decode_pending) {
+                        if (pthread_cond_timedwait(&s->model_cv, &s->model_mu, &deadline) == ETIMEDOUT) break;
+                    }
+                    if (s->slots[owner].decode_pending) continue;
+                    s->slice_owner_done_at = 0.0;   /* gone quiet: pass the turn */
+                    continue;
+                }
+            }
+            if (!owner_waiting || (other_waiting && s->slice_steps >= slice)) {
+                int next = -1;
+                for (int n = 1; n <= s->slot_count; n++) {
+                    const int id = ((owner < 0 ? -1 : owner) + n + s->slot_count) % s->slot_count;
+                    if (s->slots[id].decode_pending) { next = id; break; }
+                }
+                if (next >= 0 && next != owner) {
+                    if (log_batches)
+                        server_log(DS4_LOG_DEFAULT,
+                                   "ds4-server: decode slice -> slot %d (slot %d ran %d steps)",
+                                   next, owner, s->slice_steps);
+                    server_slice_handoff_locked(s, owner, next);
+                    s->slice_owner = owner = next;
+                    s->slice_steps = 0;
+                }
+            } else if (other_waiting && !s->slice_prestaged &&
+                       server_slice_prestage_lead() >= 0 &&
+                       s->slice_steps >= slice - server_slice_prestage_lead()) {
+                /* The turn passes in a few steps: start the next holder's
+                 * experts toward the page cache now, off the critical path. */
+                for (int n = 1; n < s->slot_count; n++) {
+                    const int id = (owner + n) % s->slot_count;
+                    if (s->slots[id].decode_pending) { server_slice_prestage_locked(s, id); break; }
+                }
+                s->slice_prestaged = true;
+            }
+            only = owner;
+            s->slice_steps++;
+        }
         /* Keep sampled/exact requests out of the greedy speculative group. */
         for (int speculative = 0; speculative <= 1; speculative++) {
             for (int i = 0; i < s->slot_count; i++) {
                 server_slot *slot = &s->slots[i];
+                if (only >= 0 && i != only) continue;
                 if (!slot->decode_pending || slot->decode_speculative != (bool)speculative) continue;
                 slot->decode_pending = false;
                 slot->decode_in_flight = true;
@@ -14024,6 +14143,7 @@ static void *decode_worker_main(void *arg) {
                          batch_err[0] ? batch_err : "batched decode failed");
             }
             slot->decode_done = true;
+            if (only >= 0 && slot == &s->slots[only]) s->slice_owner_done_at = now_sec();
         }
         pthread_cond_broadcast(&s->model_cv);
     }
@@ -15690,6 +15810,35 @@ static double server_swap_used_frac(void) {
     return 0.0;
 }
 
+/* Decode steps a session runs before the turn passes to the next session
+ * with a token waiting. Batching sessions into one decode step routes every
+ * row to its own experts, and on a streaming target the union outgrows the
+ * bank (measured: two concurrent 300-token requests 13.2 t/s aggregate vs
+ * 15.5 run back to back). A slice keeps one session's working set hot for a
+ * stretch, so every session progresses without that per-step thrash.
+ * DS4_DECODE_SLICE_TOKENS: 0 batches sessions together (old behaviour);
+ * default 64. */
+static int server_slice_prestage_lead(void) {
+    static int v = -2;
+    if (v == -2) {
+        const char *e = getenv("DS4_SLICE_PRESTAGE_LEAD");
+        v = e && e[0] ? atoi(e) : -1;  /* opt-in: measured no gain at 2 sessions (2026-10-21) */
+    }
+    return v;
+}
+
+static int g_decode_slice_override = -1;   /* unit tests */
+static int server_decode_slice_tokens(void) {
+    if (g_decode_slice_override >= 0) return g_decode_slice_override;
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_DECODE_SLICE_TOKENS");
+        v = e && e[0] ? atoi(e) : 64;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+
 static bool admit_concurrent_locked(server *s, job *j,
                                     const server_slot *target, int score) {
     int busy = 0;
@@ -15707,6 +15856,16 @@ static bool admit_concurrent_locked(server *s, job *j,
     } else if (server_mem_pressure_level() >= 2) {
         snprintf(reason, sizeof(reason), "kernel memory pressure level %d",
                  server_mem_pressure_level());
+    } else if (server_decode_slice_tokens() > 0) {
+        /* Time slicing is what makes a second session affordable: the expert
+         * union no longer has to fit the bank at once. Only real kernel memory
+         * pressure (above) holds a session now. Swap occupancy alone was a bad
+         * gate -- macOS keeps old swap allocated long after it stops paging,
+         * and 1.6 GB of idle swap read as "52% used" held every second
+         * request at memory pressure level 1. */
+        ok = true;
+        snprintf(reason, sizeof(reason), "time-sliced decode (%d-token slices)",
+                 server_decode_slice_tokens());
     } else if (server_swap_used_frac() > 0.5) {
         snprintf(reason, sizeof(reason), "swap %.0f%% used", server_swap_used_frac() * 100.0);
     } else if (s->expert_universe <= 0 || s->expert_capacity <= 0) {
@@ -16582,6 +16741,7 @@ static void server_close_resources(server *s) {
         visible_live_free(&slot->thinking_live);
         free(slot->live_text);
         free(slot->expert_bits);
+        free(slot->slice_bits);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
@@ -17016,6 +17176,7 @@ int main(int argc, char **argv) {
                        getenv("DS4_V41_DISABLE_SERVER_DSPARK") == NULL;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
+    s.slice_owner = -1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
@@ -17063,6 +17224,7 @@ int main(int argc, char **argv) {
                                                   cm.total_bytes - transient, transient,
                                                   cfg.engine.vision_path);
             s.last_prefill_slot = s.slot_count - 1;
+            s.slice_owner = -1;
             if (i >= s.slot_count) break;
         }
         if (ds4_session_create(&slot->session, engine, cfg.ctx_size) != 0) {
@@ -17313,9 +17475,17 @@ static void test_admit_concurrent_by_expert_union(void) {
     s.expert_universe = 128;
     s.expert_capacity = 100;          /* limit at 0.80 = 80 */
     slots[0].id = 0; slots[1].id = 1;
+    /* Time slicing admits regardless of the union; test the union gate with
+     * slicing off, then that slicing admits what the union would hold. */
+    g_decode_slice_override = 0;
     TEST_ASSERT(admit_concurrent_locked(&s, &j, &slots[1], 0));   /* nothing running */
     slots[0].busy = true;
     TEST_ASSERT(!admit_concurrent_locked(&s, &j, &slots[1], 0));  /* both unknown */
+    if (server_mem_pressure_level() < 2 && !getenv("DS4_ADMIT_CONCURRENT")) {
+        g_decode_slice_override = 64;
+        TEST_ASSERT(admit_concurrent_locked(&s, &j, &slots[1], 0)); /* sliced */
+        g_decode_slice_override = 0;
+    }
     a[0] = ~0ull;                     /* running: experts 0..63 */
     b[0] = 0xffffull;                 /* incoming: 0..15, all shared */
     slots[0].expert_bits = a; slots[0].expert_known = true; slots[0].expert_count = 64;
@@ -17328,6 +17498,7 @@ static void test_admit_concurrent_by_expert_union(void) {
         slots[1].expert_count = 40;
         TEST_ASSERT(!admit_concurrent_locked(&s, &j, &slots[1], 0));
     }
+    g_decode_slice_override = -1;
 }
 
 static void test_slot_probe_and_routing_scores(void) {
