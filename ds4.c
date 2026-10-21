@@ -88003,6 +88003,15 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             ready = ready && d->positions[stage][pos % 128u] == pos;
     if (!ready) {
         if (stats) s->dspark_stats.no_draft++;
+        static int nd_log = -1;
+        if (nd_log < 0) nd_log = getenv("DS4_DSPARK_NODRAFT_LOG") != NULL;
+        if (nd_log) {
+            const char *why = !d ? "no_drafter" : e->quality ? "quality" : e->dspark_strict ? "strict" :
+                cap <= 1 ? "cap" : first_token == eos ? "eos" :
+                (!g->pos || g->pos > 1048576u - DS41_DRAFT_ROWS) ? "pos" :
+                !ds41_tp_batch_enabled(g) ? "tp" : "warm";
+            fprintf(stderr, "ds4: nodraft reason=%s cap=%d pos=%u\n", why, cap, g->pos);
+        }
         if (ds4_session_eval(s, first_token, err, errlen)) return -1;
         accepted[0] = first_token;
         return 1;
