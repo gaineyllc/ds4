@@ -14228,10 +14228,26 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
         break;
     }
-    case REUSE_MEMORY_TOKEN:
+    case REUSE_MEMORY_TOKEN: {
+        /* Same rule as the rewind tier: a slot left holding a short stub (a
+         * failed rewind leaves 2 tokens of header) matches every prompt as a
+         * "token prefix", cached becomes 2, and the disk path -- which runs
+         * only when cached == 0 -- never looks. Measured 2026-10-21: a Hermes
+         * turn identical to one that had just loaded 29,522 tokens from disk
+         * re-prefilled all 29,521 (~110 s). Ask the disk first. */
+        const int disk = kv_cache_disk_best_tokens(s, slot, &j->req);
+        if (disk > reuse.reuse_tokens + s->kv.opt.min_tokens) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: live token prefix %d skipped; disk cache offers %d tokens",
+                       reuse.reuse_tokens, disk);
+            cached = 0;
+            cache_source = "none";
+            break;
+        }
         live_materialized = true;
         cache_source = "memory-token";
         break;
+    }
     case REUSE_THINKING_VISIBLE:
         if (!build_live_prompt_suffix(s, slot, &j->req,
             j->req.prompt_text + reuse.suffix_off, &effective_prompt)) {
