@@ -87982,7 +87982,20 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         ds41_tp_batch_enabled(g);
     /* Old session files contain target caches, not draft features. Warm the
      * window with ordinary decoding instead of inventing missing features. */
-    if (ready) for (uint32_t pos = g->pos > 128u ? g->pos - 128u : 0; pos < g->pos; pos++)
+    /* DS4_DSPARK_WARM_ROWS: how many of the most recent positions must hold
+     * captured draft features before drafting (default 16; was the full 128-row window). After
+     * a prefix-cache hit the ring still holds the previous reply's positions, so
+     * a full-window check refuses to draft for ~128 tokens of every turn. The
+     * target verifies every draft, so stale features cost acceptance, never
+     * correctness. */
+    static int warm_rows = -1;
+    if (warm_rows < 0) {
+        const char *w = getenv("DS4_DSPARK_WARM_ROWS");
+        warm_rows = w && w[0] ? atoi(w) : 16;
+        if (warm_rows < 1) warm_rows = 1;
+        if (warm_rows > 128) warm_rows = 128;
+    }
+    if (ready) for (uint32_t pos = g->pos > (uint32_t)warm_rows ? g->pos - (uint32_t)warm_rows : 0; pos < g->pos; pos++)
         for (unsigned stage = 0; stage < 3; stage++)
             ready = ready && d->positions[stage][pos % 128u] == pos;
     if (!ready) {
