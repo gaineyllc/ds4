@@ -44561,6 +44561,49 @@ void ds4_gpu_stream_expert_hint_rows(const int *tokens, uint32_t n, uint32_t n_v
     free(ranges);
 }
 
+/* Read ahead the experts in `bits` (bit = layer * n_expert + expert) that the
+ * bank does not hold.  The time-sliced server calls this for the session about
+ * to get the turn, with the experts it used in its last slice, so the pages are
+ * on their way while the current owner finishes. Returns experts issued. */
+uint32_t ds4_gpu_stream_expert_prestage_bits(const uint64_t *bits, uint32_t nbits,
+                                             uint32_t n_expert, uint32_t max_exp) {
+    if (!bits || nbits == 0 || n_expert == 0) return 0;
+    if (max_exp == 0) max_exp = 4096;
+    ds4_gpu_stream_expert_ra_range *ranges =
+        malloc((size_t)max_exp * 3u * sizeof(*ranges));
+    if (!ranges) return 0;
+    uint32_t n_ranges = 0, n_exp = 0;
+    for (uint32_t layer = 0; layer < DS4_PREFETCH_MAX_LAYERS && n_exp < max_exp; layer++) {
+        if ((uint64_t)layer * n_expert >= nbits) break;
+        pthread_mutex_lock(&g_prefetch_mu);
+        const ds4_expert_prefetch_layer pl = g_prefetch_layers[layer];
+        pthread_mutex_unlock(&g_prefetch_mu);
+        if (!pl.valid || pl.model_size == 0 || pl.gate_bytes == 0 ||
+            pl.down_bytes == 0 || pl.n_total_expert == 0 ||
+            pl.n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
+        const uint32_t ne = pl.n_total_expert < n_expert ? pl.n_total_expert : n_expert;
+        for (uint32_t e = 0; e < ne && n_exp < max_exp; e++) {
+            const uint64_t bit = (uint64_t)layer * n_expert + e;
+            if (bit >= nbits) break;
+            if (!(bits[bit >> 6] & (1ull << (bit & 63u)))) continue;
+            if (g_stream_expert_cache[layer][e].valid) continue;
+            const uint64_t gate = pl.base_gate + (uint64_t)e * pl.gate_bytes;
+            const uint64_t up   = pl.base_up   + (uint64_t)e * pl.gate_bytes;
+            const uint64_t down = pl.base_down + (uint64_t)e * pl.down_bytes;
+            if (gate >= pl.model_size || pl.gate_bytes > pl.model_size - gate ||
+                up   >= pl.model_size || pl.gate_bytes > pl.model_size - up ||
+                down >= pl.model_size || pl.down_bytes > pl.model_size - down) continue;
+            ranges[n_ranges].offset = gate; ranges[n_ranges].len = pl.gate_bytes; n_ranges++;
+            ranges[n_ranges].offset = up;   ranges[n_ranges].len = pl.gate_bytes; n_ranges++;
+            ranges[n_ranges].offset = down; ranges[n_ranges].len = pl.down_bytes; n_ranges++;
+            n_exp++;
+        }
+    }
+    if (n_ranges) ds4_gpu_stream_expert_readahead_ranges_async(ranges, n_ranges);
+    free(ranges);
+    return n_exp;
+}
+
 /*
  * Issue a REAL slab load for `layer` using the selection it made on the
  * previous token. No readback: the ids are already on the host, so this costs

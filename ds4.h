@@ -379,6 +379,7 @@ int ds4_engine_expert_bank_count(ds4_engine *e, int *capacity);
  * prefill headroom want at full size -- page cache under the no-copy bank, so
  * it never shows up as the process's own footprint. */
 uint64_t ds4_engine_expert_clock(ds4_engine *e);
+int ds4_engine_expert_prestage(ds4_engine *e, const uint64_t *bits, int nbits, int max);
 int ds4_engine_expert_touched_since(ds4_engine *e, uint64_t since,
                                     uint64_t *bits, int nbits);
 int ds4_engine_expert_universe(ds4_engine *e);
