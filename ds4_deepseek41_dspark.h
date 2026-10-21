@@ -164,7 +164,22 @@ static bool ds41_dspark_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
  * last window once; subsequent calls project only the newly accepted rows. */
 static bool ds41_dspark_seed(ds41_dspark *d, const ds4_model *m, uint32_t pos) {
     if (!pos) return false;
-    const uint32_t oldest = pos > DS41_DRAFT_WINDOW ? pos - DS41_DRAFT_WINDOW : 0;
+    uint32_t oldest = pos > DS41_DRAFT_WINDOW ? pos - DS41_DRAFT_WINDOW : 0;
+    /* After a prefix-cache hit the ring's older slots hold another turn's
+     * positions. Seed from the newest contiguous run of captured rows instead
+     * of failing; the target verifies every draft, so a shorter seed costs
+     * acceptance only. */
+    {
+        uint32_t valid_from = pos;
+        while (valid_from > oldest) {
+            const uint32_t q = valid_from - 1u, slot = q % DS41_DRAFT_WINDOW;
+            if (d->positions[0][slot] != q || d->positions[1][slot] != q ||
+                d->positions[2][slot] != q) break;
+            valid_from = q;
+        }
+        if (valid_from == pos) return false;
+        if (valid_from > oldest) oldest = valid_from;
+    }
     const uint32_t start = d->kv_valid && d->kv_end >= oldest && d->kv_end <= pos ? d->kv_end : oldest;
     const uint32_t count = pos - start;
     if (!count) return true;
