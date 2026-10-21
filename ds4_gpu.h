@@ -492,6 +492,8 @@ void ds4_gpu_stream_expert_prefetch_layer(uint32_t layer);
 /* Announce the row tokens of the token or verify batch about to run so the
  * draft-token hint table can read ahead the experts it predicts for them. */
 void ds4_gpu_stream_expert_hint_rows(const int *tokens, uint32_t n, uint32_t n_vocab);
+uint32_t ds4_gpu_stream_expert_prestage_bits(const uint64_t *bits, uint32_t nbits,
+                                             uint32_t n_expert, uint32_t max_exp);
 void ds4_gpu_stream_expert_hint_stats(uint64_t *calls, uint64_t *issued,
                                       uint64_t *issued_bytes,
                                       uint64_t *pred_total, uint64_t *pred_hit);
