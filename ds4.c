@@ -43013,9 +43013,17 @@ static int g_engram_decode_profile = -1;
 static int g_engram_decode_serial;
 static double g_engram_decode_ms;
 static uint64_t g_engram_decode_reads, g_engram_decode_tokens;
+/* Overlapped reads: time the decode thread still waited at layers 1 and 14. */
+static double g_engram_overlap_wait_ms[2];
+static uint64_t g_engram_overlap_tokens;
 
 static void ds41_engram_decode_report(void) {
     if (g_engram_decode_profile <= 0 || g_engram_decode_tokens == 0) return;
+    if (g_engram_overlap_tokens)
+        fprintf(stderr, "ds4: engram overlap tokens=%llu wait table0=%.3f ms/token table1=%.3f ms/token\n",
+                (unsigned long long)g_engram_overlap_tokens,
+                g_engram_overlap_wait_ms[0] / (double)g_engram_overlap_tokens,
+                g_engram_overlap_wait_ms[1] / (double)g_engram_overlap_tokens);
     fprintf(stderr,
             "ds4: engram decode reads=%llu tokens=%llu total=%.1f ms avg=%.3f ms/token\n",
             (unsigned long long)g_engram_decode_reads,
@@ -43137,8 +43145,13 @@ static bool ds41_graph_step_once(ds41_gpu_graph *g, const ds4_model *m,
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
-            ok = (!overlap_engram || ds4_engram_reader_wait(g->engram_reader, i)) &&
-                ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            const double t_w = (overlap_engram && g_engram_decode_profile) ? now_sec() : 0.0;
+            ok = (!overlap_engram || ds4_engram_reader_wait(g->engram_reader, i));
+            if (overlap_engram && g_engram_decode_profile) {
+                g_engram_overlap_wait_ms[i] += (now_sec() - t_w) * 1000.0;
+                if (i == 1) g_engram_overlap_tokens++;
+            }
+            ok = ok && ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
             /* Zero-copy path: gather straight from the mapped table into the
              * tensor, skipping the pread, the CPU dequantize and the upload.
              * Only when the table actually bound; otherwise the write above
