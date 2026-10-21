@@ -14418,13 +14418,81 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             kv_cache_slot_suppress_continued(s, slot, cold_store_len);
     }
 
+    /* The anchor checkpoint ends where the request's system prompt does, and
+     * agent clients put their volatile lines last (Hermes: the working
+     * directory and session date at the end of the runtime-environment block).
+     * A request from another directory then shares all but the last ~100
+     * tokens with that checkpoint, yet cannot use it: an entry is reused only
+     * when it is a prefix of the request. Store a second, stable checkpoint at
+     * the boundary alignment below the anchor first, so such a request
+     * re-reads the tail instead of the whole prompt (measured: a 29,369-token
+     * Hermes prefix re-prefilled from 0 in 106 s because only the cwd line
+     * changed). DS4_KV_DISABLE_STABLE_COLD=1 turns it off. */
+    {
+        /* Any request that has to read past the boundary pays for it here:
+         * not only a cold one (cached == 0) but also one a live slot rewound
+         * to a short shared prefix, which is the usual shape of a new agent
+         * session started from a different directory. */
+        const int align = s->kv.opt.boundary_align_tokens > 0 ?
+            s->kv.opt.boundary_align_tokens : 2048;
+        int anchor_len = cold_store_len;
+        if (!anchor_len && !multimodal && s->kv.enabled &&
+            prompt_for_sync->len >= s->kv.opt.min_tokens &&
+            s->kv.opt.cold_max_tokens > 0 &&
+            prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
+            anchor_len = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
+                                                  ds4_token_user(s->engine),
+                                                  ds4_token_assistant(s->engine));
+        const int stable_len = anchor_len > 0 ? (anchor_len / align) * align : 0;
+        if (s->kv.enabled && stable_len >= s->kv.opt.min_tokens &&
+            stable_len > cached && stable_len < anchor_len &&
+            anchor_len < prompt_for_sync->len &&
+            !getenv("DS4_KV_DISABLE_STABLE_COLD"))
+        {
+            /* Agent prompts also vary inside, a few thousand tokens before
+             * the end: Hermes swaps in a coding-agent block when the cwd is a
+             * codebase, and project context files follow it. Within an
+             * agent-sized prompt also keep a checkpoint every 8192 tokens, so
+             * such a change re-reads at most one step. Long documents keep
+             * only the continued checkpoints. */
+            enum { STABLE_STEP = 8192, STABLE_STEPPED_MAX = 131072 };
+            int marks[STABLE_STEPPED_MAX / STABLE_STEP + 2], n_marks = 0;
+            if (anchor_len <= STABLE_STEPPED_MAX)
+                for (int b = STABLE_STEP; b < stable_len; b += STABLE_STEP)
+                    if (b > cached && b >= s->kv.opt.min_tokens) marks[n_marks++] = b;
+            marks[n_marks++] = stable_len;
+            for (int m = 0; m < n_marks; m++) {
+                ds4_tokens stable = {0};
+                tokens_copy_prefix(&stable, prompt_for_sync, marks[m]);
+                const bool synced = server_session_sync(s, slot, &stable, err, sizeof(err)) == 0;
+                ds4_tokens_free(&stable);
+                if (!synced) {
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: stable cold checkpoint at %d skipped: %s",
+                               marks[m], err);
+                    err[0] = '\0';
+                    break;
+                }
+                if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
+                                               marks[m], "cold-stable"))
+                    kv_cache_slot_note_store(slot, marks[m]);
+            }
+        }
+    }
     if (s->kv.enabled &&
         cold_store_len >= s->kv.opt.min_tokens &&
         cold_store_len < prompt_for_sync->len)
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+        /* The read up to the anchor is the long one on a cold request, so it
+         * is where continued checkpoints must land; syncing straight to the
+         * anchor skipped every boundary below it (a 40,788-token cold read at
+         * an 8,192 interval left only 16,384 and 32,768, so an edit at ~27.7k
+         * re-read from 16,384). */
+        if ((!multimodal &&
+             kv_cache_segment_long_prefill(s, slot, &prefix, err, sizeof(err)) != 0) ||
+            server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);

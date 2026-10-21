@@ -174,6 +174,8 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
 uint8_t ds4_kvstore_reason_code(const char *reason) {
     if (!reason) return DS4_KVSTORE_REASON_UNKNOWN;
     if (!strcmp(reason, "cold")) return DS4_KVSTORE_REASON_COLD;
+    /* Stable checkpoints below a cold anchor are anchors too. */
+    if (!strcmp(reason, "cold-stable")) return DS4_KVSTORE_REASON_COLD;
     if (!strcmp(reason, "continued")) return DS4_KVSTORE_REASON_CONTINUED;
     if (!strcmp(reason, "evict")) return DS4_KVSTORE_REASON_EVICT;
     if (!strcmp(reason, "shutdown")) return DS4_KVSTORE_REASON_SHUTDOWN;
