@@ -78666,6 +78666,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
         const long tail_total = (long)(prompt->len - s->checkpoint.len);
         const bool warm_tail = s->checkpoint.len > 0;
+        const uint32_t prefill_start = (uint32_t)s->checkpoint.len;
         for (int i = s->checkpoint.len; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
                 interrupted = true;
@@ -78700,8 +78701,21 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             }
             /* The bank sweep replaces the warm-append rule in ds41_prefill_count
              * (token-major below 1024 tokens: 17 t/s against 36-57 t/s). */
+            /* The last piece of a long prefill also sweeps against the bank: the
+             * layer sweep before it just streamed every layer, so a small
+             * remainder re-streaming them costs ~30 s for a few hundred rows
+             * (13229-token append at 493k: 12288 rows 37.7 s, then 941 rows
+             * 31 s). DS4_METAL_V41_BANK_PREFILL_TAIL, default 4096; 0 disables. */
+            static long bank_tail = -1;
+            if (bank_tail < 0) {
+                const char *env = getenv("DS4_METAL_V41_BANK_PREFILL_TAIL");
+                bank_tail = env ? atol(env) : 4096;
+            }
+            const bool tail_after_sweep = bank_tail > 0 && i > (int)prefill_start &&
+                (long)remaining <= bank_tail;
             const bool bank_eligible = e->ssd_streaming && !short_count && remaining > 1u &&
-                !decoder_pending && warm_tail && bank_max > 0 && tail_total <= bank_total &&
+                !decoder_pending && (warm_tail || tail_after_sweep) && bank_max > 0 &&
+                (tail_total <= bank_total || tail_after_sweep) &&
                 !g->encoder_resident &&
                 ds4_gpu_stream_expert_bank_prefill_begin(
                     remaining < (uint32_t)bank_max ? remaining : (uint32_t)bank_max);
