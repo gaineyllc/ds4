@@ -10013,6 +10013,8 @@ typedef struct {
 struct server_slot {
     server *srv;
     int id;
+    FILE *live_fp;                  /* DS4_LIVE_DIR tap of the text being generated */
+    const void *live_job;
     ds4_session *session;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
@@ -14167,6 +14169,38 @@ static void *decode_worker_main(void *arg) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+/* DS4_LIVE_DIR=<dir>: mirror each slot's generation, reasoning included, into
+ * <dir>/slot<N>.txt as it is produced, so a long turn can be watched while it
+ * runs. Each request truncates its slot's file. */
+static void slot_live_tap(server_slot *slot, const void *job_id, int prompt_tokens,
+                          const char *piece, size_t len) {
+    static int enabled = -1;
+    static char dir[512];
+    if (enabled < 0) {
+        const char *d = getenv("DS4_LIVE_DIR");
+        enabled = d && d[0];
+        if (enabled) snprintf(dir, sizeof(dir), "%s", d);
+    }
+    if (!enabled || !slot) return;
+    if (slot->live_job != job_id || !slot->live_fp) {
+        if (slot->live_fp) fclose(slot->live_fp);
+        char path[600];
+        snprintf(path, sizeof(path), "%s/slot%d.txt", dir, slot->id);
+        slot->live_fp = fopen(path, "w");
+        slot->live_job = job_id;
+        if (slot->live_fp) {
+            time_t now = time(NULL);
+            char ts[32];
+            strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
+            fprintf(slot->live_fp, "=== %s  prompt %d tokens ===\n", ts, prompt_tokens);
+        }
+    }
+    if (slot->live_fp && piece && len) {
+        fwrite(piece, 1, len, slot->live_fp);
+        fflush(slot->live_fp);
+    }
+}
+
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
@@ -14962,6 +14996,7 @@ decode_again:
             kept++;
 
             trace_piece(s, trace_id, piece, piece_len);
+            slot_live_tap(slot, j, prompt_tokens, piece, piece_len);
             buf_append(&text, piece, piece_len);
             const bool was_thinking = thinking.inside;
             if (!dsml_decode_state_is_tool(dsml_tracker.decode))
