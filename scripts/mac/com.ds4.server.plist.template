@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Replace __REPO__ with the absolute path of this checkout, save as
+     ~/Library/LaunchAgents/com.ds4.server.plist, then:
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ds4.server.plist -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.ds4.server</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/zsh</string><string>__REPO__/scripts/mac/ds4-mac-serve.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ExitTimeOut</key><integer>90</integer>
+  <key>ProcessType</key><string>Interactive</string>
+</dict></plist>
