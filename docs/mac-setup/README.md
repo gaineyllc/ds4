@@ -1,6 +1,6 @@
 # Running this ds4 fork on a Mac: setup guide
 
-This guide sets up the `gaineyllc/ds4` fork (branch `rank/1017`) on an Apple Silicon Mac to serve DeepSeek V4.1 Flash 1017. The server takes text and images, uses DSpark speculative decoding, and has a 1M-token context. It exposes an OpenAI-compatible API on `http://127.0.0.1:8031/v1`.
+This guide sets up the `gaineyllc/ds4` fork (release tag `mac-1017-r2`, from branch `rank/1017`) on an Apple Silicon Mac to serve DeepSeek V4.1 Flash 1017. The server takes text and images, uses DSpark speculative decoding, and has a 1M-token context. It exposes an OpenAI-compatible API on `http://127.0.0.1:8031/v1`.
 
 It is written so an AI coding agent can follow it step by step on the target Mac. Each step ends with a check. Do not continue past a failed check; see Troubleshooting. The model files are described in [MODEL.md](MODEL.md).
 
@@ -27,7 +27,7 @@ Expected: 128 GB RAM, at least 420 GB available, and a developer-tools path.
 Build on the Mac that will run it. The Makefile compiles with `-mcpu=native`, so binaries built on another Mac model may not run here.
 
 ```sh
-git clone -b rank/1017 https://github.com/gaineyllc/ds4.git ~/ds4
+git clone -b mac-1017-r2 https://github.com/gaineyllc/ds4.git ~/ds4
 cd ~/ds4
 make -j"$(sysctl -n hw.ncpu)" ds4 ds4-server
 ```
@@ -99,6 +99,8 @@ Recommended request settings:
 
 Images: send OpenAI-style `image_url` content parts. The vision encoder is loaded by default.
 
+**Hermes Agent users:** run the setup script in [HERMES.md](HERMES.md). It applies all of the above, plus fixes for Hermes behaviors that would otherwise keep throwing away ds4's prompt cache.
+
 ## Settings (`~/.ds4/mac.env`, optional)
 | Variable | Default | Meaning |
 |---|---|---|
@@ -119,7 +121,8 @@ Restart the service after changing them.
 - **Logs:** `~/.ds4/ds4-server.log`. `prefill chunk` lines show prompt reading speed; `decoding chunk` lines show generation speed.
 
 ## Updating
+Releases are git tags named `mac-1017-rN`. To move to a newer one:
 ```sh
-cd ~/ds4 && git pull && make -j"$(sysctl -n hw.ncpu)" ds4 ds4-server
+cd ~/ds4 && git fetch --tags && git checkout <new tag> && make -j"$(sysctl -n hw.ncpu)" ds4 ds4-server
 launchctl kickstart -k gui/$(id -u)/com.ds4.server
 ```
