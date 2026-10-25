@@ -7388,6 +7388,10 @@ static uint64_t deepseek4_vision_required_offset(
             m, name, type, ndim, dims)->abs_offset;
 }
 
+/* Set only by ds4_deepseek4_vision_bench(): the bench loads the encoder alone, with no
+ * language GGUF to match its source revision against. */
+static bool g_deepseek4_vision_bench_any_revision;
+
 static void deepseek4_vision_weights_bind(
         ds4_deepseek4_vision_weights *w,
         const ds4_model *m,
@@ -7422,7 +7426,8 @@ static void deepseek4_vision_weights_bind(
                 "convert it with gguf-tools/deepseek41_vision.py --source-revision "
                 "matching the language GGUF");
     }
-    if ((!language_has_revision && !ds4_streq(source_revision, revision)) ||
+    if ((!language_has_revision && !ds4_streq(source_revision, revision) &&
+         !g_deepseek4_vision_bench_any_revision) ||
         !model_get_string(m, "deepseek4-vision.checkpoint_variant", &variant) ||
         !ds4_streq(variant, v41 ? "v4.1-flash" : "vision-exp")) {
         ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
@@ -75318,6 +75323,82 @@ static int ds4_engine_vision_encode_image_budget(
     if (nondefault_grid)
         ds4_image_fingerprint_with_grid(out->fingerprint, fp_grid_h, fp_grid_w);
     return 1;
+}
+
+/* Vision-encoder-only benchmark: loads just the DeepSeek vision GGUF, encodes one image
+ * at a budget `iters` times, prints per-iteration milliseconds, and optionally dumps the
+ * embedding (u32 tokens, u32 dim, then f32 rows) for numerical comparison. */
+int ds4_deepseek4_vision_bench(const char *vision_path, const char *image_path,
+                               uint32_t max_tokens, int iters, const char *dump_path) {
+#ifdef DS4_NO_GPU
+    (void)vision_path; (void)image_path; (void)max_tokens; (void)iters; (void)dump_path;
+    fprintf(stderr, "ds4: this build has no GPU vision backend\n");
+    return 0;
+#else
+    ds4_model vm;
+    static ds4_deepseek4_vision_weights w;
+    model_open(&vm, vision_path, true, false);
+    /* No language GGUF selects the family here; take it from the encoder's own variant. */
+    {
+        ds4_str variant = {0};
+        if (model_get_string(&vm, "deepseek4-vision.checkpoint_variant", &variant) &&
+            ds4_streq(variant, "v4.1-flash"))
+            g_ds4_shape = DS4_SHAPE_FLASH41;
+        else
+            g_ds4_shape = DS4_SHAPE_FLASH;
+    }
+    g_deepseek4_vision_bench_any_revision = true;
+    deepseek4_vision_weights_bind(&w, &vm, NULL);
+    g_deepseek4_vision_bench_any_revision = false;
+    ds4_image image = {0};
+    char err[256] = {0};
+    if (!ds4_image_decode_file(&image, image_path, err, sizeof(err))) {
+        fprintf(stderr, "ds4: %s\n", err);
+        return 0;
+    }
+    const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
+    ds4_deepseek4_image_patches patches = {0};
+    const uint32_t budget = max_tokens ? max_tokens : w.image_max_tokens;
+    if (!(v41 ? ds4_image_preprocess_deepseek41_budget(&patches, &image, budget, err, sizeof(err))
+              : ds4_image_preprocess_deepseek4_budget(&patches, &image, budget, err, sizeof(err)))) {
+        fprintf(stderr, "ds4: %s\n", err);
+        ds4_image_free(&image);
+        return 0;
+    }
+    int ok = ds4_gpu_init() != 0;
+#if defined(__APPLE__)
+    if (ok) ok = ds4_gpu_set_model_map_range(vm.map, vm.size, vm.tensor_data_pos,
+                                             vm.size - vm.tensor_data_pos, vm.max_tensor_bytes) != 0;
+#else
+    if (ok) ok = ds4_gpu_set_aux_model_map_range(vm.map, vm.size, vm.tensor_data_pos,
+                                                 vm.size - vm.tensor_data_pos) != 0;
+#endif
+    const uint32_t tokens = patches.llm_grid_height * patches.llm_grid_width;
+    const uint32_t dim = w.projection_dim ? w.projection_dim : DS4_N_EMBD;
+    float *emb = ok ? malloc((size_t)tokens * dim * sizeof(float)) : NULL;
+    printf("image %ux%u -> patches %ux%u (%u rows), llm grid %ux%u = %u tokens (budget %u)\n",
+           image.width, image.height, patches.grid_width, patches.grid_height,
+           patches.grid_width * patches.grid_height, patches.llm_grid_width,
+           patches.llm_grid_height, patches.llm_grid_height * (patches.llm_grid_width + 1) + 2,
+           budget);
+    for (int it = 0; ok && emb && it < (iters > 0 ? iters : 1); it++) {
+        const double t0 = now_sec();
+        ok = ds4_gpu_deepseek4_vision_encode(emb, patches.patches, patches.grid_height,
+                                             patches.grid_width, vm.map, vm.size, &w);
+        printf("iter %d: %.1f ms%s\n", it, (now_sec() - t0) * 1000.0, ok ? "" : " FAILED");
+    }
+    if (ok && emb && dump_path) {
+        FILE *fp = fopen(dump_path, "wb");
+        const uint32_t hdr[2] = { tokens, dim };
+        ok = fp && fwrite(hdr, sizeof(hdr), 1, fp) == 1 &&
+             fwrite(emb, sizeof(float), (size_t)tokens * dim, fp) == (size_t)tokens * dim;
+        if (fp) fclose(fp);
+    }
+    free(emb);
+    ds4_deepseek4_image_patches_free(&patches);
+    ds4_image_free(&image);
+    return ok;
+#endif
 }
 
 int ds4_qwen4_vision_dump(const char *vision_path, const char *image_path, const char *out_path,

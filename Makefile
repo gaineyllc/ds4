@@ -934,6 +934,16 @@ $(QWEN4_KERNEL_TEST): tests/test_qwen4_kernels.o ds4_metal.o ds4_image.o
 
 endif
 
+tests/bench_deepseek4_vision.o: tests/bench_deepseek4_vision.c
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/bench_deepseek4_vision.c
+
+tests/bench_deepseek4_vision: tests/bench_deepseek4_vision.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+endif
+
 tests/test_qwen4_vision.o: tests/test_qwen4_vision.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen4_vision.c
 

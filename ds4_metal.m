@@ -51550,6 +51550,54 @@ static int glm53_vision_dispatch_attention(
     return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision attention");
 }
 
+typedef struct {
+    uint32_t rows;
+    float scale;
+} vision_flash_attn_args;
+
+/* DeepSeek ViT attention: tiled flash kernel (kernel_vision_flash_attn_d64). The scalar
+ * kernel streams every key and value from device memory for each (row, head) and was
+ * ~94% of encoder time (10 of 10.6 s for an 8.4k-patch image). DS4_VISION_NAIVE_ATTN=1
+ * selects the scalar kernel for comparison. */
+static int deepseek4_vision_dispatch_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows) {
+    static int naive = -1;
+    if (naive < 0) naive = getenv("DS4_VISION_NAIVE_ATTN") != NULL;
+    if (naive) return glm53_vision_dispatch_attention(out, q, k, v, rows);
+    static int variant = -1;   /* DS4_VISION_FLASH_BR=32 selects the v1 kernel */
+    if (variant < 0) {
+        const char *e = getenv("DS4_VISION_FLASH_BR");
+        variant = e ? (atoi(e) == 32 ? 32 : atoi(e) == 64 ? 64 : 128) : 128;
+    }
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+            variant == 128 ? "kernel_vision_flash_attn_d64_br128" :
+            variant == 64 ? "kernel_vision_flash_attn_d64_br64" : "kernel_vision_flash_attn_d64");
+    if (!pipeline) {
+        static int warned;
+        if (!warned++) fprintf(stderr, "ds4: vision flash attention kernel unavailable; using the scalar kernel\n");
+        return glm53_vision_dispatch_attention(out, q, k, v, rows);
+    }
+    vision_flash_attn_args args = { rows, 0.125f };   /* 1/sqrt(64) */
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(k) offset:ds4_gpu_tensor_offset(k) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(v) offset:ds4_gpu_tensor_offset(v) atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake((rows + variant - 1u) / variant, 16u, 1)
+         threadsPerThreadgroup:MTLSizeMake(variant == 128 ? 512u : variant == 64 ? 256u : 128u, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek vision flash attention");
+}
+
 static int glm53_vision_dispatch_swiglu_bias(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *gate,
@@ -52086,7 +52134,29 @@ int ds4_gpu_deepseek4_vision_encode(
                 "block0_k", k, row1024);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_v", v, row1024);
-        if (ok) ok = glm53_vision_dispatch_attention(attn, q, k, v, rows);
+        if (ok) ok = deepseek4_vision_dispatch_attention(attn, q, k, v, rows);
+        if (ok && il == 0 && getenv("DS4_VISION_ATTN_CHECK")) {
+            /* Debug: layer-0 flash vs scalar attention on identical q/k/v. */
+            ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc((uint64_t)rows * 1024u * sizeof(float));
+            ok = ref && glm53_vision_dispatch_attention(ref, q, k, v, rows) && ds4_gpu_end_commands();
+            float *fa = ok ? malloc((size_t)rows * 1024u * sizeof(float)) : NULL;
+            float *fb = ok ? malloc((size_t)rows * 1024u * sizeof(float)) : NULL;
+            if (fa && fb && ds4_gpu_tensor_read(attn, 0, fa, (uint64_t)rows * 1024u * sizeof(float)) &&
+                ds4_gpu_tensor_read(ref, 0, fb, (uint64_t)rows * 1024u * sizeof(float))) {
+                double maxd = 0, maxref = 0, sse = 0, ssr = 0; uint64_t worst = 0;
+                for (uint64_t i = 0; i < (uint64_t)rows * 1024u; i++) {
+                    const double d = fabs((double)fa[i] - fb[i]);
+                    if (d > maxd) { maxd = d; worst = i; }
+                    if (fabs(fb[i]) > maxref) maxref = fabs(fb[i]);
+                    sse += d * d; ssr += (double)fb[i] * fb[i];
+                }
+                fprintf(stderr, "ds4: attn check rows=%u max_abs=%.3g (at row %llu head %llu) max_ref=%.3g rel_rms=%.3g\n",
+                        rows, maxd, (unsigned long long)(worst / 1024u), (unsigned long long)((worst % 1024u) / 64u),
+                        maxref, sqrt(sse / (ssr > 0 ? ssr : 1)));
+            }
+            free(fa); free(fb); ds4_gpu_tensor_free(ref);
+            if (ok) ok = ds4_gpu_begin_commands();
+        }
         if (ok) ok = deepseek4_vision_dispatch_round(attn, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_attention", attn, row1024);
