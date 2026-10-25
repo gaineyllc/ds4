@@ -64818,7 +64818,7 @@ static uint8_t ds41_comp_code(float v, float scale) {
         const float diff = fabsf(a - ds41_e2m1_values[i]);
         if (diff < best_diff) { best = i; best_diff = diff; }
     }
-    return (uint8_t)(best | (v < 0.0f ? 8 : 0));
+    return (uint8_t)(best | (signbit(v) ? 8 : 0));
 }
 
 static void ds41_comp_row_convert(uint8_t *dst, uint32_t dst_format,

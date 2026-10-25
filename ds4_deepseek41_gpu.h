@@ -144,7 +144,9 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
 /* Gather 512-wide F32 KV rows; IDs must come from top-k over source_rows. */
 /* Packed FP4 compressed-KV rows: 320 B each (32 fp16 block scales, then 256 B
  * of 4-bit codes), exact for the FP4-with-E4M3-scale values V4.1 stores.
- * pack_comp writes `rows` of 512 f32 activations as packed rows; unpack_comp
+ * pack_comp writes `rows` of 512 f32 values that DS4_V41_FP4_E4M3 quantization
+ * already produced (it recovers each block's scale; it does not re-quantize,
+ * which is not idempotent for subnormal E4M3 scales) as packed rows; unpack_comp
  * expands a run back to f32; gather_kv_packed expands selected rows. */
 #define DS4_V41_PACKED_ROW_BYTES 320u
 #define DS4_V41_PACKED_SCALE_BYTES 64u
