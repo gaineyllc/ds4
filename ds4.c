@@ -41107,6 +41107,7 @@ typedef struct {
 typedef struct ds41_dspark ds41_dspark;
 static void ds41_dspark_free(ds41_dspark *d);
 static void ds41_dspark_reset(ds41_dspark *d);
+static void ds41_dspark_truncate(ds41_dspark *d, uint32_t pos);
 static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
                                 const ds4_gpu_tensor *residual, uint32_t rows);
 
@@ -41190,9 +41191,11 @@ typedef struct {
      * position, so a session can be rewound (ds41_graph_rewind) with the
      * decode window rebuilt from it: the window itself only keeps 128 rows.
      * raw_log_from is the first position the ring has held since the last
-     * reset or snapshot load. */
+     * reset or snapshot load; raw_log_hi is the highest position the graph
+     * stood at before a ds41_graph_rewind (rows past the current position
+     * may still have been written and so may have overwritten older slots). */
     ds4_gpu_tensor *raw_log[40];
-    uint32_t raw_log_rows, raw_log_from;
+    uint32_t raw_log_rows, raw_log_from, raw_log_hi;
     ds4_gpu_tensor *compressed[4], *index_cache[4];
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *verify_previous_kv[4], *verify_previous_score[4];
@@ -41413,7 +41416,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
     g->valid = true;
-    g->raw_log_from = 0;
+    g->raw_log_from = g->raw_log_hi = 0;
     ds4_engram_history_reset(&g->history);
     ds41_dspark_reset(g->dspark);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
@@ -41996,14 +41999,28 @@ static bool ds41_raw_log_write(ds41_gpu_graph *g, uint32_t il, const ds4_gpu_ten
  * are addressed by valid length, so the rows past `pos` are simply never read
  * again, and the odd-row pair state is rewritten by the next even token; the
  * decode windows are rebuilt from the rewind ring, which must still hold the
- * rows before `pos`. `tokens` is the session's full token history. */
-static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos) {
+ * rows before `pos`. `tokens` is the session's full token history; bit i of
+ * `image_tail` marks position pos-1-i as an image row, which the Engram
+ * history records as dead (as ds41_hash_tokens' text mask did), not as the
+ * placeholder token stored there.
+ *
+ * A ring slot is reused by the position raw_log_rows above it. Rows may have
+ * been written past the current position: DSpark verification writes up to
+ * DS41_VERIFY_ROWS rows ahead before committing a prefix, and an earlier
+ * rewind left the rows of the abandoned tail behind.
+ * raw_log_hi plus the slack bounds every position written so far. */
+#define DS41_RAW_LOG_SLACK 8u
+static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos,
+                              uint32_t image_tail) {
     if (!g->valid || pos > g->pos || (pos & 1u)) return false;
     if (pos < g->pos) {
         const uint32_t need = pos < 128u ? pos : 128u;
         const uint32_t from = pos - need;
+        const uint32_t hi = (g->raw_log_hi > g->pos ? g->raw_log_hi : g->pos) +
+                            DS41_RAW_LOG_SLACK;
         if (need && (!g->raw_log_rows || from < g->raw_log_from ||
-                     g->pos - from >= g->raw_log_rows)) return false;
+                     hi - from > g->raw_log_rows)) return false;
+        g->raw_log_hi = hi - DS41_RAW_LOG_SLACK;
         const uint64_t rb = 512u * sizeof(float);
         bool ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < 40 && need; il++) {
@@ -42023,9 +42040,11 @@ static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos
     g->pos = pos;
     ds4_engram_history_reset(&g->history);
     for (uint32_t i = 0; i < 3 && i < pos; i++)
-        g->history.tail[i] = (int32_t)g->token_map[tokens[pos - 1u - i]];
-    /* Drafter captures past the new position no longer describe the session. */
-    ds41_dspark_reset(g->dspark);
+        g->history.tail[i] = (image_tail >> i) & 1u ? DS4_ENGRAM_DEAD :
+            (int32_t)g->token_map[tokens[pos - 1u - i]];
+    /* Drafter captures and KV rows past the new position no longer describe
+     * the session; the ones before it still do. */
+    ds41_dspark_truncate(g->dspark, pos);
     g->defer_carry_ready = false;
     return true;
 }
@@ -62491,22 +62510,6 @@ typedef struct ds4_dspark_spec_stats {
 
 #endif
 
-typedef struct {
-    uint32_t token_start;
-    uint32_t token_count;
-    uint8_t fingerprint[32];
-    /* The projected image rows themselves (token_count * DS4_N_EMBD floats),
-     * owned by the session.  Kept because the identity alone cannot rebuild
-     * anything: at an image position checkpoint.v holds a placeholder token
-     * whose KV came from these rows, so any path that re-derives state from
-     * token ids (graph rewind, a disk restore) would treat the image as text.
-     * ~7.3 MB for a 256-token image at n_embd 7168, against ~3.8 MB of MLA KV
-     * for the same rows -- cheap enough to keep, and it means a restore never
-     * needs the vision tower.  NULL when the source span carried no data (test
-     * checkpoints). */
-    float *data;
-} ds4_vision_identity;
-
 static void ds4_session_free_vision_identities(ds4_vision_span *v, size_t n);
 
 struct ds4_session {
@@ -62564,8 +62567,13 @@ struct ds4_session {
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
-    /* Owned deep copies of the session's image spans, embedding rows
-     * included. The graph points at these for the life of the session. */
+    /* The session's image identities: token_start, row count and fingerprint
+     * per image, embedding.data always NULL. The projected rows are not kept:
+     * once prefilled, an image lives in the KV like any other row, a rewind
+     * marks image rows dead in the Engram history (ds41_graph_rewind), and a
+     * disk restore brings the KV back. The V4.1 graph's image view
+     * (ds41_graph.images) is scoped to a multimodal sync and never points
+     * here, so the text fast paths gated on its image_count stay on. */
     ds4_vision_span *checkpoint_images;
     size_t checkpoint_image_count;
     const ds4_vision_span *sync_images;
@@ -64998,7 +65006,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             for (uint32_t i = 0; i < 3 && i < pos; i++)
                 g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
             g->pos = pos;
-            g->raw_log_from = pos;
+            g->raw_log_from = g->raw_log_hi = pos;
             ds4_tokens_copy(&s->checkpoint, &tokens);
             s->checkpoint_valid = true;
         }
@@ -78296,11 +78304,46 @@ size_t ds4_session_vision_spans(const ds4_session *s, const ds4_vision_span **ou
     return s ? s->checkpoint_image_count : 0;
 }
 
-bool ds4_session_vision_projections_retained(const ds4_session *s) {
-    if (!s || s->sync_image_count != 0 || s->checkpoint_image_count == 0) return false;
-    for (size_t i = 0; i < s->checkpoint_image_count; i++)
-        if (!s->checkpoint_images[i].embedding.data) return false;
-    return true;
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+static bool ds4_session_image_at(const ds4_session *s, int pos) {
+    for (size_t i = 0; pos >= 0 && i < s->checkpoint_image_count; i++) {
+        const ds4_vision_span *v = &s->checkpoint_images[i];
+        if ((uint32_t)pos < v->token_start) break;
+        if ((uint64_t)(uint32_t)pos - v->token_start < v->embedding.token_count) return true;
+    }
+    return false;
+}
+
+/* Bit i set: position pos-1-i is an image row (see ds41_graph_rewind). */
+static uint32_t ds41_session_image_tail(const ds4_session *s, int pos) {
+    uint32_t bits = 0;
+    for (int i = 0; i < 3 && i < pos; i++)
+        if (ds4_session_image_at(s, pos - 1 - i)) bits |= 1u << i;
+    return bits;
+}
+
+/* Forget images the rewind dropped entirely. A span that straddles `pos`
+ * stays: its rows before `pos` are in the state, and keeping its identity
+ * means only the same image can continue it (ds4_session_sync invalidates on
+ * any other). */
+static void ds41_session_drop_images_from(ds4_session *s, int pos) {
+    size_t n = s->checkpoint_image_count;
+    while (n && s->checkpoint_images[n - 1].token_start >= (uint32_t)pos) {
+        n--;
+        free(s->checkpoint_images[n].embedding.data);
+        s->checkpoint_images[n].embedding.data = NULL;
+    }
+    s->checkpoint_image_count = n;
+    if (!n) {
+        free(s->checkpoint_images);
+        s->checkpoint_images = NULL;
+    }
+}
+#endif
+
+bool ds4_session_vision_state_storable(const ds4_session *s) {
+    return s && s->checkpoint_valid && s->sync_image_count == 0 &&
+           s->checkpoint_image_count != 0;
 }
 
 int ds4_session_restore_vision_spans(ds4_session *s, const ds4_vision_span *spans,
@@ -78314,7 +78357,7 @@ int ds4_session_restore_vision_spans(ds4_session *s, const ds4_vision_span *span
     for (size_t i = 0; i < n; i++) {
         const uint64_t start = spans[i].token_start;
         const uint64_t end = start + spans[i].embedding.token_count;
-        if (!spans[i].embedding.data || spans[i].embedding.token_count == 0 ||
+        if (spans[i].embedding.token_count == 0 ||
             start < prev_end || end > (uint64_t)s->checkpoint.len) {
             if (err && errlen) snprintf(err, errlen, "image span %zu outside the checkpoint", i);
             return 1;
@@ -78337,23 +78380,22 @@ int ds4_session_restore_vision_spans(ds4_session *s, const ds4_vision_span *span
         if (!copy) return 1;
         for (size_t i = 0; i < n; i++) {
             copy[i] = spans[i];
-            const size_t bytes = (size_t)spans[i].embedding.token_count *
-                                 (size_t)DS4_N_EMBD * sizeof(float);
-            copy[i].embedding.data = malloc(bytes);
-            if (!copy[i].embedding.data) {
-                ds4_session_free_vision_identities(copy, i);
-                return 1;
-            }
-            memcpy(copy[i].embedding.data, spans[i].embedding.data, bytes);
+            copy[i].embedding.data = NULL; /* identities only */
         }
     }
     ds4_session_free_vision_identities(s->checkpoint_images, s->checkpoint_image_count);
     s->checkpoint_images = copy;
     s->checkpoint_image_count = n;
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) {
-        s->ds41_graph.images = s->checkpoint_images;
-        s->ds41_graph.image_count = s->checkpoint_image_count;
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    /* The snapshot load rebuilt the Engram history tail from token ids; the
+     * original prefill recorded image rows there as dead (ds41_hash_tokens'
+     * text mask). Now that the images are known, do the same. */
+    if (ds4_session_is_ds41(s) && s->ds41_graph_ready &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len) {
+        const uint32_t pos = s->ds41_graph.pos;
+        for (uint32_t i = 0; i < 3 && i < pos; i++)
+            if (ds4_session_image_at(s, (int)(pos - 1u - i)))
+                s->ds41_graph.history.tail[i] = DS4_ENGRAM_DEAD;
     }
 #endif
     return 0;
@@ -78388,31 +78430,13 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
         if (!copy) return false;
         for (size_t i = 0; i < s->sync_image_count; i++) {
             copy[i] = s->sync_images[i];
-            copy[i].embedding.data = NULL;
-            const float *src = s->sync_images[i].embedding.data;
-            const uint64_t values =
-                (uint64_t)copy[i].embedding.token_count * (uint64_t)DS4_N_EMBD;
-            if (src && values != 0 && values <= SIZE_MAX / sizeof(float)) {
-                copy[i].embedding.data = malloc((size_t)values * sizeof(float));
-                if (!copy[i].embedding.data) {
-                    ds4_session_free_vision_identities(copy, i + 1);
-                    return false;
-                }
-                memcpy(copy[i].embedding.data, src,
-                       (size_t)values * sizeof(float));
-            }
+            copy[i].embedding.data = NULL; /* identities only */
         }
     }
     ds4_session_free_vision_identities(s->checkpoint_images,
                                        s->checkpoint_image_count);
     s->checkpoint_images = copy;
     s->checkpoint_image_count = s->sync_image_count;
-#ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) {
-        s->ds41_graph.images = s->checkpoint_images;
-        s->ds41_graph.image_count = s->checkpoint_image_count;
-    }
-#endif
     return true;
 }
 
@@ -78660,12 +78684,13 @@ int ds4_session_sync_multimodal(
     const int rc = ds4_session_sync(s, prompt, err, errlen);
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
-        /* Point at the session's own copies rather than dropping the view:
-         * ds41_image_at and ds41_text_mask must still know where the image
-         * rows are long after the caller's spans are gone, or a later rewind
-         * hashes image positions as text. */
-        s->ds41_graph.images = s->checkpoint_images;
-        s->ds41_graph.image_count = s->checkpoint_image_count;
+        /* The view borrows the caller's spans and ends with the sync. Keeping
+         * it would disable every fast path gated on image_count (session
+         * batching, TP decode islands, CUDA row batch, text prefill variants)
+         * for the rest of the session. A rewind needs only the identities
+         * (ds41_session_image_tail). */
+        s->ds41_graph.images = NULL;
+        s->ds41_graph.image_count = 0;
     }
 #endif
 #ifndef DS4_NO_GPU
@@ -89515,9 +89540,12 @@ void ds4_session_rewind(ds4_session *s, int pos) {
      * work at agent-sized contexts, hit by about half of all speculative
      * boundaries and live-prefix reuses.  Rewind to the even position below
      * and replay the single kept token: one decode step instead of a rebuild,
-     * and the caller gets exactly the state (and fresh logits) at pos. */
+     * and the caller gets exactly the state (and fresh logits) at pos.  The
+     * replay is a text decode, so the kept token must not be an image row
+     * (the session keeps image identities, not projections); otherwise fall
+     * through, and the even-only graph rewind below invalidates. */
     if ((pos & 1) && s->checkpoint_valid && ds4_session_is_ds41(s) &&
-        s->ds41_graph_ready) {
+        s->ds41_graph_ready && !ds4_session_image_at(s, pos - 1)) {
         const int keep = s->checkpoint.v[pos - 1];
         ds4_session_rewind(s, pos - 1);
         if (s->checkpoint_valid) {
@@ -89573,12 +89601,14 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    /* Image positions are handled, not excluded: the graph still points at the
-     * session's retained spans, so ds41_text_mask keeps them out of the
-     * rebuilt Engram history instead of hashing placeholder ids as text. */
+    /* Image rows in the kept prefix are fine: their raw rows are in the ring
+     * like any other, and the rebuilt Engram history marks them dead. */
     if (s->checkpoint_valid && ds4_session_is_ds41(s) && s->ds41_graph_ready &&
-        s->ds41_graph.pos == (uint32_t)s->checkpoint.len && ds4_gpu_synchronize())
-        state_ok = ds41_graph_rewind(&s->ds41_graph, s->checkpoint.v, (uint32_t)pos);
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len && ds4_gpu_synchronize()) {
+        state_ok = ds41_graph_rewind(&s->ds41_graph, s->checkpoint.v, (uint32_t)pos,
+                                     ds41_session_image_tail(s, pos));
+        if (state_ok) ds41_session_drop_images_from(s, pos);
+    }
 #endif
 #endif
     s->checkpoint.len = pos;
