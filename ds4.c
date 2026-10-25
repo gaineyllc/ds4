@@ -31032,6 +31032,20 @@ static const int32_t *metal_graph_visual_tokens_for_batch(
         uint32_t             n_tokens) {
     if (!g || !g->deepseek4_vision_weights || !g->prefill_has_visual ||
         !g->prefill_host_tokens || pos0 < g->prefill_host_pos0) return NULL;
+    /* Bidirectional image spans are DeepSeek V4 Vision-Exp semantics. V4.1's reference
+     * (inference/model.py: get_window_topk_idxs, no image mask in Attention.forward)
+     * keeps every token causal, image or text; image tokens differ only in MoE routing
+     * (bias_vl) and Engram masking, which are handled elsewhere. Returning NULL here
+     * selects the ordinary causal masks. DS4_V41_IMAGE_ATTENTION=bidirectional restores
+     * the old V4-style behavior for A/B comparison. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        static int v41_bidirectional = -1;
+        if (v41_bidirectional < 0) {
+            const char *mode = getenv("DS4_V41_IMAGE_ATTENTION");
+            v41_bidirectional = mode && !strcmp(mode, "bidirectional");
+        }
+        if (!v41_bidirectional) return NULL;
+    }
     const uint32_t off = pos0 - g->prefill_host_pos0;
     if (off > g->prefill_host_count ||
         n_tokens > g->prefill_host_count - off) return NULL;
