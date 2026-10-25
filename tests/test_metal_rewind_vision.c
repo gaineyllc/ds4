@@ -3,13 +3,15 @@
  *
  * The text case (test_metal_rewind) proves a rewound session matches one that
  * reached the same position directly. This is the same proof with an image in
- * the kept prefix: the rebuilt Engram history must mask the image rows instead
- * of hashing their placeholder token ids as text, which is only possible
- * because the session now retains its image spans (f054767, 7842db8).
+ * the kept prefix: the image's raw rows come back from the rewind ring like
+ * any other, and the rebuilt Engram history must record image rows as dead
+ * instead of hashing their placeholder token ids as text.
  *
- * Layout: [image message][long text tail]. The rewind target sits past the
- * 128-row raw window so the raw-log ring is exercised, and after the image so
- * the image is inside the state being kept.
+ * Layout: [image message][long text tail]. The rewind targets sit past the
+ * 128-row raw window so the ring is exercised, and after the image so the
+ * image is inside the state being kept: one well into the text tail, one
+ * right after the image, where the Engram history tail still covers image
+ * rows.
  *
  *   DS4_TEST_MODEL=... DS4_TEST_VISION=... DS4_TEST_IMAGE=... \
  *   DS4_TEST_SSD_STREAMING=1 ./tests/test_metal_rewind_vision
@@ -238,6 +240,15 @@ int main(void) {
     fprintf(stderr, "prompt %d tokens, image at %u..%d\n", full.len, span.token_start, img_end);
 
     const float d_even = compare_at(e, ctx, vocab, &full, &span, at, "even");
+    /* Even target one or two rows past the image: of the three history
+     * positions before it, at least one is an image row. */
+    const int after = (img_end + 1) & ~1;
+    /* With dynamic image budgets a small image can end inside the first 128
+     * rows; the window is then rebuilt from ring rows 0..after, still valid. */
+    if (after < 128)
+        fprintf(stderr, "note: image ends at %d, inside the first 128-row window\n", after);
+    const float d_after = compare_at(e, ctx, vocab, &full, &span, after,
+                                     "even, right after the image");
     const float d_odd = compare_at(e, ctx, vocab, &full, &span, at + 1, "odd (info)");
     const int odd_ok = odd_greedy_image(e, ctx, vocab, &full, &span, at + 1);
 
@@ -254,6 +265,7 @@ int main(void) {
     ds4_engine_close(e);
 
     if (d_even > 1e-4f) fail("even rewind with an image in the prefix differs from staged");
+    if (d_after > 1e-4f) fail("even rewind right after the image differs from staged");
     if (!odd_ok) fail("odd rewind with an image in the prefix changed greedy tokens");
     fprintf(stderr, "V4.1 image-prefix rewind PASS\n");
     return 0;
