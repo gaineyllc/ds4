@@ -24592,13 +24592,13 @@ static void test_responses_tool_image_output(void) {
 
 static void test_server_image_embedding_cache(void) {
     server_image_cache cache = {0};
-    uint8_t key = 1;
+    uint16_t key = 1;   /* wider than SERVER_IMAGE_CACHE_ENTRIES + 1 */
     float data[2] = {1.25f, -2.5f};
-    server_image_input input = {.encoded = &key, .encoded_len = 1};
+    server_image_input input = {.encoded = (uint8_t *)&key, .encoded_len = sizeof(key)};
     ds4_vision_embedding src = {.data = data, .token_count = 1,
                                .width = 42, .fingerprint = {7}};
     ds4_vision_embedding out = {0};
-    const size_t budget = 2 * (sizeof(data) + 1);
+    const size_t budget = 2 * (sizeof(data) + sizeof(key));
     TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
     server_image_cache_put(&cache, &input, &src, 2, budget);
     TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
@@ -24624,8 +24624,8 @@ static void test_server_image_embedding_cache(void) {
     server_image_cache_clear(&cache);
     TEST_ASSERT(cache.bytes == 0 && cache.clock == 0);
     for (key = 1; key <= SERVER_IMAGE_CACHE_ENTRIES + 1; key++)
-        server_image_cache_put(&cache, &input, &src, 2, 4096);
-    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + 1));
+        server_image_cache_put(&cache, &input, &src, 2, SERVER_IMAGE_CACHE_ENTRIES * 64);
+    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + sizeof(key)));
     key = 1;
     TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
     server_image_cache_clear(&cache);
