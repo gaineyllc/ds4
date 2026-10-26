@@ -12,7 +12,11 @@ REPO=${DS4_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 : ${DS4_KVDIR:=$HOME/.ds4/kv}    # on-disk prompt cache
 : ${DS4_KVMB:=40000}             # prompt-cache disk budget, MB
 : ${DS4_LOG:=$HOME/.ds4/ds4-server.log}
-export DS4_METAL_STREAM_EXPERT_NOCOPY=1      # bank points at the model's own pages
+# Expert bank: copied by default. Measured 2026-10-26 on an M5 Max (128 GB), production config
+# (2 sessions, 1M ctx, DSpark, vision, 56 GB bank): warm decode 16.7 t/s copied vs 15.0 no-copy
+# (ds4-bench, 1 session: 18.0 vs 14.2 at 54k-131k). No-copy is only faster on a cold bank.
+# DS4_NOCOPY=1 makes the bank point at the model's own pages instead.
+[ "${DS4_NOCOPY:-0}" = 1 ] && export DS4_METAL_STREAM_EXPERT_NOCOPY=1
 export DS4_SSD_CACHE_AUTO_PCT=${DS4_SSD_CACHE_AUTO_PCT:-80}
 export DS4_ENGRAM_TOKEN_READERS=${DS4_ENGRAM_TOKEN_READERS:-8}
 export DS4_DECODE_SLICE_TOKENS=${DS4_DECODE_SLICE_TOKENS:-64}   # time-sliced concurrent sessions
