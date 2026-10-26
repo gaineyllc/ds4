@@ -204,12 +204,47 @@ int main(void) {
         greedy(rewound, &full, 4, vocab, g_d);
         fprintf(stderr, "odd rewind to %d: greedy %d %d %d %d vs %d %d %d %d\n", odd,
                 g_c[0], g_c[1], g_c[2], g_c[3], g_d[0], g_d[1], g_d[2], g_d[3]);
-        if (memcmp(g_c, g_d, sizeof(g_c)) != 0) fail("odd rewind changed greedy tokens");
+        /* The reference above computed row deep inside the tail sweep, the
+         * odd rewind computes it as one decode step: agreement there is
+         * expected, not exact (see the exact check below). */
+        if (memcmp(g_c, g_d, sizeof(g_c)) != 0)
+            fprintf(stderr, "note: odd greedy differs from the swept reference (batch shape)\n");
     }
 
-    fprintf(stderr, "V4.1 rewind PASS n=%d deep=%d\n", n, deep);
     free(l_fresh); free(l_staged); free(l_rewound); free(l_div); free(l_rw2);
     ds4_session_free(fresh); ds4_session_free(staged); ds4_session_free(rewound); ds4_session_free(diverged);
+
+    /* The odd target, exactly: the rewind replays row `base` as a decode step,
+     * so the reference does too. Same prefix sweep, same decode row, same
+     * extension: a correct odd path (position, Engram history, compressor
+     * pair state, raw window) is bit-exact against it. */
+    {
+        const int base = deep & ~1;
+        ds4_tokens bpre = {0};
+        slice(&bpre, &all, 0, base);
+        ds4_session *ostaged = NULL, *orw = NULL;
+        if (ds4_session_create(&ostaged, engine, ctx) ||
+            ds4_session_create(&orw, engine, ctx)) fail("odd exact sessions");
+        char err[160];
+        sync_or_fail(ostaged, &bpre, "odd staged prefix");
+        if (ds4_session_eval(ostaged, full.v[base], err, sizeof(err)) != 0)
+            fail("odd staged decode");
+        sync_or_fail(ostaged, &full, "odd staged tail");
+        float *la = logits_of(ostaged, vocab);
+        sync_or_fail(orw, &bpre, "odd rewound prefix");
+        sync_or_fail(orw, &full, "odd rewound full");
+        ds4_session_rewind(orw, base + 1);
+        if (ds4_session_pos(orw) != base + 1 ||
+            ds4_session_common_prefix(orw, &full) != base + 1) fail("odd exact rewind kept no state");
+        sync_or_fail(orw, &full, "odd rewound tail");
+        float *lb = logits_of(orw, vocab);
+        const float d = max_abs_diff(la, lb, vocab);
+        fprintf(stderr, "odd rewind to %d: rewound-vs-staged-decode %g\n", base + 1, d);
+        if (d > 1e-4f) fail("odd rewind differs from staged decode");
+        free(la); free(lb); ds4_tokens_free(&bpre);
+        ds4_session_free(ostaged); ds4_session_free(orw);
+    }
+    fprintf(stderr, "V4.1 rewind PASS n=%d deep=%d\n", n, deep);
     /* A 10000-token prompt is prefilled as an 8192-token decoder-suffix sweep
      * plus a tail; in that sweep layers 20-39 compute only its end (layer 39
      * the last 128 rows).  A rewind to 6000 lands where those layers never

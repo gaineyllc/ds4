@@ -136,12 +136,62 @@ static void greedy_n(ds4_session *s, int n, int vocab, int *out) {
     }
 }
 
-/* The text test's odd-target check, with the image in the prefix: an odd
- * target is reached by rewinding to the even position below and replaying one
- * token as a decode step, so the row at the odd position is computed in a
- * different batch shape than the sweep computed it. The shipped text test
- * therefore judges the odd case by greedy agreement, not logits; so does
- * this one. */
+/* The exact check for an odd target. ds4_session_rewind reaches pos = at+1
+ * (at even) by rewinding to `at` and replaying token `at` as one decode step.
+ * The matching reference therefore computes row `at` the same way:
+ *
+ *   staged:  sync(prefix[0..at]), eval(full[at]), sync(full)
+ *   rewound: sync(prefix[0..at]), sync(full), rewind to at+1, sync(full)
+ *
+ * Rows 0..at-1 come from the same sweep, row `at` from a decode step whose
+ * Engram history, compressor pair state and raw window the rewind rebuilt, and
+ * rows at+1.. from the same extension, so a correct odd path is bit-exact. The
+ * "odd (info)" delta and the greedy check below compare against routes that
+ * compute row `at` inside a batched sweep instead; their distance is the
+ * decode-vs-sweep arithmetic (the text test measures ~1.3 logits between a
+ * single sweep and prefix-then-tail on its own), not a rewind error. */
+static float compare_odd_exact(ds4_engine *e, int ctx, int vocab,
+                               const ds4_tokens *full, const ds4_vision_span *span,
+                               int at, const char *label) {
+    if (at & 1) fail("compare_odd_exact needs an even base");
+    ds4_tokens prefix = {0};
+    slice(&prefix, full, at);
+    ds4_session *staged = NULL, *rewound = NULL;
+    if (ds4_session_create(&staged, e, ctx) ||
+        ds4_session_create(&rewound, e, ctx)) fail("odd exact sessions");
+    char err[160];
+
+    sync_mm(staged, &prefix, span, "odd staged prefix");
+    if (ds4_session_eval(staged, full->v[at], err, sizeof(err)) != 0)
+        fail("odd staged decode");
+    sync_mm(staged, full, span, "odd staged tail");
+    float *l_staged = logits_of(staged, vocab);
+
+    sync_mm(rewound, &prefix, span, "odd rewound prefix");
+    sync_mm(rewound, full, span, "odd rewound full");
+    ds4_session_rewind(rewound, at + 1);
+    if (ds4_session_pos(rewound) != at + 1) fail("odd exact rewind position");
+    if (ds4_session_common_prefix(rewound, full) != at + 1) {
+        fprintf(stderr, "FAIL: %s: odd rewind dropped state\n", label);
+        exit(1);
+    }
+    sync_mm(rewound, full, span, "odd rewound tail");
+    float *l_rewound = logits_of(rewound, vocab);
+
+    const float d = max_abs_diff(l_staged, l_rewound, vocab);
+    fprintf(stderr, "%s: rewind to %d (replay row %d as decode), tail to %d: "
+                    "rewound-vs-staged-decode %g\n", label, at + 1, at, full->len, d);
+    free(l_staged); free(l_rewound);
+    ds4_session_free(staged); ds4_session_free(rewound);
+    free(prefix.v);
+    return d;
+}
+
+/* Informational: greedy tokens after an odd rewind against a single sweep
+ * over the whole prompt. That reference computes row at and the tail in
+ * different batch shapes, so a token can flip at a near-tie without any
+ * error in the rewind (it did at 1201 on the upstream image run: 588 2413 201
+ * vs 588 2413 9365). Not a pass criterion. */
 static int odd_greedy_image(ds4_engine *e, int ctx, int vocab,
                             const ds4_tokens *full, const ds4_vision_span *span,
                             int odd) {
@@ -246,6 +296,11 @@ int main(void) {
     if (after < 128) fail("image ends inside the raw window; need a longer image");
     const float d_after = compare_at(e, ctx, vocab, &full, &span, after,
                                      "even, right after the image");
+    const float d_odd_exact = compare_odd_exact(e, ctx, vocab, &full, &span, at, "odd");
+    /* Odd target right after the image: the replayed decode row's Engram
+     * history tail is image rows (dead). */
+    const float d_odd_after = compare_odd_exact(e, ctx, vocab, &full, &span, after,
+                                                "odd, right after the image");
     const float d_odd = compare_at(e, ctx, vocab, &full, &span, at + 1, "odd (info)");
     const int odd_ok = odd_greedy_image(e, ctx, vocab, &full, &span, at + 1);
 
@@ -263,7 +318,11 @@ int main(void) {
 
     if (d_even > 1e-4f) fail("even rewind with an image in the prefix differs from staged");
     if (d_after > 1e-4f) fail("even rewind right after the image differs from staged");
-    if (!odd_ok) fail("odd rewind with an image in the prefix changed greedy tokens");
+    if (d_odd_exact > 1e-4f) fail("odd rewind with an image in the prefix differs from staged decode");
+    if (d_odd_after > 1e-4f) fail("odd rewind right after the image differs from staged decode");
+    if (!odd_ok)
+        fprintf(stderr, "note: odd greedy differs from the single-sweep reference "
+                        "(batch-shape noise; the exact check above passed)\n");
     fprintf(stderr, "V4.1 image-prefix rewind PASS\n");
     return 0;
 }
