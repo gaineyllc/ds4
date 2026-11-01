@@ -89,6 +89,11 @@ void ds4_engram_table_unmap(ds4_engram_table *table);
 
 /* Byte range of one row inside the mapping, for the Metal buffer's inner
  * offset. Returns false if the table is not mapped or the row is out of range. */
+/* Number of engram reads abandoned after DS4_ENGRAM_READ_TIMEOUT_MS because a
+ * device read wedged. Nonzero means the SSD stalled and the server kept serving
+ * by failing those reads instead of hanging. */
+uint64_t ds4_engram_wedge_count(void);
+
 bool ds4_engram_row_span(const ds4_engram_table *table, uint32_t row,
                          uint64_t *inner_offset, uint64_t *bytes);
 
