@@ -299,7 +299,56 @@ static void test_reader(void) {
     assert(close(fd) == 0);
 }
 
+static void test_wedge(void) {
+    /* A device read that never returns must not hang the server. The pool now
+     * bounds its wait (DS4_ENGRAM_READ_TIMEOUT_MS) and abandons a stuck worker,
+     * so the read fails fast, the process stays alive, and later reads recover
+     * once the pool has spare workers again. */
+    setenv("DS4_ENGRAM_READERS", "4", 1);
+    setenv("DS4_ENGRAM_MIN_PARALLEL", "2", 1);
+    setenv("DS4_ENGRAM_READ_TIMEOUT_MS", "500", 1);
+
+    char path[] = "/tmp/ds4-engram-wedge-XXXXXX";
+    const int fd = mkstemp(path);
+    assert(fd >= 0 && unlink(path) == 0);
+    uint8_t raw[4][DS4_ENGRAM_ROW_BYTES];
+    for (unsigned r = 0; r < 4; r++) {
+        for (unsigned i = 0; i < DS4_ENGRAM_DIM; i++) raw[r][i] = (i + r * 7u) % 127u;
+        memset(raw[r] + DS4_ENGRAM_DIM, 127 + r, DS4_ENGRAM_ROW_BYTES - DS4_ENGRAM_DIM);
+    }
+    assert(pwrite(fd, raw, sizeof(raw), 0) == sizeof(raw));
+    ds4_engram_table table = {.fd = fd, .offset = 0, .rows = 4};
+
+    enum { N = 48 };
+    uint32_t ids[N];
+    for (unsigned i = 0; i < N; i++) ids[i] = i % 4;
+    float *out = malloc((size_t)N * DS4_ENGRAM_DIM * sizeof(float));
+    assert(out);
+
+    /* Inject a 1.5 s stall on part 0; the 500 ms bound must fire. */
+    const uint64_t wedges_before = ds4_engram_wedge_count();
+    setenv("DS4_ENGRAM_TEST_STALL_MS", "1500", 1);
+    errno = 0;
+    const bool r = ds4_engram_read(&table, ids, N, out);
+    assert(!r && errno == ETIMEDOUT);
+    assert(ds4_engram_wedge_count() == wedges_before + 1);
+
+    /* The process is still alive and the pool recovers: clear the stall, let the
+     * abandoned worker drain, and read again. */
+    unsetenv("DS4_ENGRAM_TEST_STALL_MS");
+    usleep(1800 * 1000);
+    assert(ds4_engram_read(&table, ids, N, out));
+    assert(ds4_engram_wedge_count() == wedges_before + 1);
+
+    free(out);
+    assert(close(fd) == 0);
+    unsetenv("DS4_ENGRAM_READ_TIMEOUT_MS");
+    unsetenv("DS4_ENGRAM_MIN_PARALLEL");
+    unsetenv("DS4_ENGRAM_READERS");
+}
+
 int main(void) {
+    test_wedge();
     test_hash();
     test_rows();
     test_all_scaled_values();

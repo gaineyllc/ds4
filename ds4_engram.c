@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
@@ -352,6 +353,17 @@ typedef struct {
     float *out;
     size_t count;
     uint32_t parts;
+    /* Per-job work-stealing + completion, so a worker wedged in an
+     * uninterruptible device pread can be abandoned without racing the next
+     * run or touching the caller's freed stack. A pooled job lives on the heap
+     * and is freed by whichever owner (submitter or worker) drops the last ref;
+     * a wedged worker never drops its ref, so it leaks one job + one thread
+     * instead of hanging the whole server. */
+    _Atomic uint32_t next_part;
+    _Atomic uint32_t done_parts;
+    _Atomic uint32_t refs;
+    ds4_engram_table tbl;   /* job-owned copy; a wedged worker must not read the
+                             * caller's table after the caller has returned */
     int error[DS4_ENGRAM_MAX_READERS];
 } engram_batch;
 
@@ -407,6 +419,13 @@ static bool engram_window_fetch(int fd, engram_window *w,
 
 static void read_batch_part(void *context, size_t part) {
     engram_batch *batch = context;
+    /* Test-only wedge injector: make part 0 stall like an unresponsive device,
+     * so the pool's read-timeout path can be exercised. Off unless the env var
+     * is set (production never sets it). */
+    if (part == 0) {
+        const char *stall = getenv("DS4_ENGRAM_TEST_STALL_MS");
+        if (stall && stall[0]) usleep((useconds_t)strtoul(stall, NULL, 10) * 1000u);
+    }
     const engram_request *request = batch->request;
     const size_t begin = batch->count * part / batch->parts;
     const size_t end = batch->count * (part + 1) / batch->parts;
@@ -440,7 +459,7 @@ static struct {
     pthread_t       th[DS4_ENGRAM_MAX_READERS];
     pthread_mutex_t mu;
     pthread_cond_t  start_cv, done_cv;
-    uint32_t        nthreads, next_part, remaining;
+    uint32_t        nthreads;
     uint64_t        generation;
     engram_batch   *job;
     int             stopping, started;
@@ -449,6 +468,18 @@ static struct {
     .start_cv = PTHREAD_COND_INITIALIZER,
     .done_cv = PTHREAD_COND_INITIALIZER,
 };
+
+/* Drop one reference to a pooled job; the last owner frees it. A submitter that
+ * timed out and a worker still wedged in pread both hold refs -- whichever
+ * finishes last frees, so a wedged worker leaks exactly one job and never
+ * writes through a dangling pointer. */
+static void engram_job_release(engram_batch *job) {
+    if (atomic_fetch_sub(&job->refs, 1u) == 1u) {
+        free((void *)job->request);
+        free(job->out);
+        free(job);
+    }
+}
 
 static void *engram_pool_worker(void *arg) {
     (void)arg;
@@ -460,14 +491,22 @@ static void *engram_pool_worker(void *arg) {
         if (g_pool.stopping) break;
         seen = g_pool.generation;
         engram_batch *job = g_pool.job;
-        while (job && g_pool.next_part < job->parts) {
-            const uint32_t part = g_pool.next_part++;
-            pthread_mutex_unlock(&g_pool.mu);
-            read_batch_part(job, part);
-            pthread_mutex_lock(&g_pool.mu);
+        if (job) atomic_fetch_add(&job->refs, 1u);
+        pthread_mutex_unlock(&g_pool.mu);
+        if (job) {
+            for (;;) {
+                const uint32_t part = atomic_fetch_add(&job->next_part, 1u);
+                if (part >= job->parts) break;
+                read_batch_part(job, part);
+                if (atomic_fetch_add(&job->done_parts, 1u) + 1u == job->parts) {
+                    pthread_mutex_lock(&g_pool.mu);
+                    pthread_cond_broadcast(&g_pool.done_cv);
+                    pthread_mutex_unlock(&g_pool.mu);
+                }
+            }
+            engram_job_release(job);
         }
-        if (g_pool.remaining > 0 && --g_pool.remaining == 0)
-            pthread_cond_signal(&g_pool.done_cv);
+        pthread_mutex_lock(&g_pool.mu);
     }
     pthread_mutex_unlock(&g_pool.mu);
     return NULL;
@@ -509,19 +548,79 @@ static bool engram_pool_start(int width) {
  * caller waiting for a completion that had already been consumed. */
 static pthread_mutex_t g_pool_run_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static void engram_pool_run(engram_batch *b) {
+/* Give up on a device read after this many ms rather than block forever. A
+ * real engram read is sub-millisecond; a stall this long is a wedged
+ * uninterruptible pread (seen twice: the file shares pages with Metal's wired
+ * expert bank). 0 disables the bound (old behaviour). */
+static uint32_t engram_read_timeout_ms(void) {
+    static uint32_t v; static int init;
+    if (!init) {
+        const char *e = getenv("DS4_ENGRAM_READ_TIMEOUT_MS");
+        v = (e && e[0]) ? (uint32_t)strtoul(e, NULL, 10) : 15000u;
+        init = 1;
+    }
+    return v;
+}
+
+static _Atomic uint64_t g_engram_wedge_count;
+
+uint64_t ds4_engram_wedge_count(void) { return atomic_load(&g_engram_wedge_count); }
+
+/* Run `b`'s reads through the pool and wait, bounded. Returns true when every
+ * part completed (b->out and b->error are filled); false when the device
+ * wedged past the timeout -- the job is abandoned (a stuck worker keeps it
+ * alive and frees it if it ever returns), the server stays up, and the caller
+ * fails this one read. */
+static bool engram_pool_run(engram_batch *b) {
+    engram_batch *job = malloc(sizeof *job);
+    if (!job) { read_batch_part(b, 0); return true; }   /* OOM: best-effort serial */
+    *job = *b;
+    const size_t out_floats = b->count * (size_t)DS4_ENGRAM_DIM;
+    job->out = malloc((out_floats ? out_floats : 1) * sizeof(float));
+    if (!job->out) { free(job); read_batch_part(b, 0); return true; }
+    engram_request *rq = malloc((b->count ? b->count : 1) * sizeof *rq);
+    if (!rq) { free(job->out); free(job); read_batch_part(b, 0); return true; }
+    memcpy(rq, b->request, b->count * sizeof *rq);
+    job->request = rq;              /* owned: outlives a timed-out caller */
+    job->tbl = *b->table;
+    job->table = &job->tbl;
+    atomic_store(&job->next_part, 0u);
+    atomic_store(&job->done_parts, 0u);
+    atomic_store(&job->refs, 1u);                        /* the submitter's ref */
+
     pthread_mutex_lock(&g_pool_run_mu);
     pthread_mutex_lock(&g_pool.mu);
-    g_pool.job = b;
-    g_pool.next_part = 0;
-    g_pool.remaining = g_pool.nthreads;
+    g_pool.job = job;
     g_pool.generation++;
     pthread_cond_broadcast(&g_pool.start_cv);
-    while (g_pool.remaining != 0)
-        pthread_cond_wait(&g_pool.done_cv, &g_pool.mu);
+
+    const uint32_t tmo = engram_read_timeout_ms();
+    struct timespec deadline;
+    if (tmo) {
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec  += tmo / 1000u;
+        deadline.tv_nsec += (long)(tmo % 1000u) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    }
+    bool ok = true;
+    while (atomic_load(&job->done_parts) < job->parts) {
+        const int rc = tmo ? pthread_cond_timedwait(&g_pool.done_cv, &g_pool.mu, &deadline)
+                           : pthread_cond_wait(&g_pool.done_cv, &g_pool.mu);
+        if (rc == ETIMEDOUT && atomic_load(&job->done_parts) < job->parts) { ok = false; break; }
+    }
     g_pool.job = NULL;
     pthread_mutex_unlock(&g_pool.mu);
     pthread_mutex_unlock(&g_pool_run_mu);
+
+    if (ok) {
+        memcpy(b->out, job->out, out_floats * sizeof(float));
+        memcpy(b->error, job->error, sizeof job->error);
+        engram_job_release(job);
+        return true;
+    }
+    atomic_fetch_add(&g_engram_wedge_count, 1u);
+    engram_job_release(job);          /* drop submitter ref; a stuck worker frees it later */
+    return false;
 }
 
 static size_t engram_min_parallel(void) {
@@ -559,7 +658,7 @@ static bool engram_run_requests(const ds4_engram_table *t,
             if (parts > DS4_ENGRAM_MAX_READERS) parts = DS4_ENGRAM_MAX_READERS;
             if ((size_t)parts > count) parts = (uint32_t)count;
             batch.parts = parts ? parts : 1;
-            engram_pool_run(&batch);
+            if (!engram_pool_run(&batch)) { errno = ETIMEDOUT; return false; }
             for (uint32_t i = 0; i < batch.parts; i++) {
                 if (batch.error[i]) { errno = batch.error[i]; return false; }
             }
