@@ -1111,6 +1111,18 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
 static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
+    /* DeepSeek V4.1 Flash takes a 0-100 reasoning dial. Accept it as a bare JSON
+     * number (reasoning_effort: 50) as well as the OpenAI-style named buckets
+     * and numeric strings, so the full range is reachable, not just the few
+     * named levels. */
+    if ((**p >= '0' && **p <= '9')) {
+        char num[8]; size_t n = 0;
+        while (**p >= '0' && **p <= '9' && n < sizeof(num) - 1) num[n++] = *(*p)++;
+        /* reject a fractional/exponent reasoning level */
+        if (**p == '.' || **p == 'e' || **p == 'E') return false;
+        num[n] = '\0';
+        return ds4_think_mode_parse_level(num, out);
+    }
     char *effort = NULL;
     if (!json_string(p, &effort)) return false;
     bool ok = parse_reasoning_effort_name(effort, out) ||
